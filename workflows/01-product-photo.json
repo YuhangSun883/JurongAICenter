@@ -1,0 +1,16 @@
+{
+  "1": {
+    "class_type": "JurongTextToImage",
+    "inputs": {
+      "prompt": "{{prompt}}",
+      "size": "1024x1024"
+    }
+  },
+  "2": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["1", 0],
+      "filename_prefix": "jurong_product"
+    }
+  }
+}
