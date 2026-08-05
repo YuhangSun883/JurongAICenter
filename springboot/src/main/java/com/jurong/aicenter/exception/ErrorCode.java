@@ -49,7 +49,18 @@ public enum ErrorCode {
     WORKFLOW_ACCESS_DENIED(4002, "无权访问此工作流"),
 
     // Billing (5xxx) — Phase 8
-    BILLING_NOT_ENABLED(5001, "计费模块未启用");
+    BILLING_NOT_ENABLED(5001, "计费模块未启用"),
+
+    // Admin (6xxx) — Phase 9 模块
+    ADMIN_OPERATION_DENIED(6001, "管理员操作被拒绝"),                     // 通用兜底
+    ADMIN_CANNOT_CHANGE_OWN_ROLE(6002, "不能修改自己的角色"),              // 禁改自己
+    ADMIN_CANNOT_DISABLE_SELF(6003, "不能禁用自己的账号"),                  // 禁禁自己
+    GROUP_NAME_DUPLICATE(6004, "分组名称已存在"),
+    GROUP_IS_DEFAULT_CANNOT_DELETE(6005, "默认分组不可删除"),
+    GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "默认分组的 is_default 不可关闭"),
+    USER_ALREADY_IN_GROUP(6007, "用户已在该分组中"),
+    USER_NOT_IN_GROUP(6008, "用户不在该分组中"),
+    INVALID_ROLE_VALUE(6009, "角色取值必须是 USER 或 ADMIN");
 
     private final int code;
     private final String message;

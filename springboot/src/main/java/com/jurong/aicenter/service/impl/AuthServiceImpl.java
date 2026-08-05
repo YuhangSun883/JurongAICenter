@@ -53,6 +53,7 @@ public class AuthServiceImpl implements AuthService {
 
         // 3. 设置默认字段
         user.setRole("USER");
+        user.setDisabled(0);
         user.setCredits(0);
         user.setMonthlyQuota(50);
         user.setQuotaUsed(0);
@@ -79,12 +80,17 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(ErrorCode.INVALID_CREDENTIALS, "邮箱或密码错误");
         }
 
-        // 2. 校验密码
+        // 2. 校验禁用状态
+        if (user.getDisabled() != null && user.getDisabled() == 1) {
+            throw new BusinessException(ErrorCode.USER_DISABLED, "账号已被禁用，请联系管理员");
+        }
+
+        // 3. 校验密码
         if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
             throw new BusinessException(ErrorCode.INVALID_CREDENTIALS, "邮箱或密码错误");
         }
 
-        // 3. 返回响应
+        // 4. 返回响应
         return buildAuthResponse(user);
     }
 
@@ -104,10 +110,18 @@ public class AuthServiceImpl implements AuthService {
                 throw new BusinessException(ErrorCode.USER_NOT_FOUND, "用户不存在");
             }
 
-            // 3. 生成新的 Access Token（Refresh Token 保持不变）
-            String newAccessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail());
+            // 3. 检查禁用（refresh 后也不能用）
+            if (user.getDisabled() != null && user.getDisabled() == 1) {
+                throw new BusinessException(ErrorCode.USER_DISABLED, "账号已被禁用");
+            }
 
-            // 4. 返回响应（使用 5 参数构造器）
+            // 4. 生成新的 Access Token
+            // 关键：role 用数据库最新的 —— 这样管理员调整角色后，
+            // 用户只要调用 /api/auth/refresh 拿新 access，新 access 立刻有新 role。
+            // 注意：access token 有效期 2h 内即便不 refresh 也能用，但 2h 后强制再 refresh，权限自然变更。
+            String newAccessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail(), user.getRole());
+
+            // 5. 返回响应（Refresh Token 保持不变）
             return new AuthResponse(
                     newAccessToken,
                     request.getRefreshToken(),
@@ -123,12 +137,12 @@ public class AuthServiceImpl implements AuthService {
     // ========== 私有辅助方法 ==========
 
     /**
-     * 根据 User 生成 JWT 并组装 AuthResponse
+     * 根据 User 生成 JWT 并组装 AuthResponse。
+     * 注意：role 写入 token claim，前端可解析（仅展示用，权限校验由后端 filter 处理）。
      */
     private AuthResponse buildAuthResponse(User user) {
-        // 关键修正：按你项目实际方法，必须传入 userId 和 email
-        String accessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail());
-        String refreshToken = jwtTokenProvider.generateRefreshToken(user.getId(), user.getEmail());
+        String accessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail(), user.getRole());
+        String refreshToken = jwtTokenProvider.generateRefreshToken(user.getId(), user.getEmail(), user.getRole());
 
         return new AuthResponse(
                 accessToken,

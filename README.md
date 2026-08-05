@@ -384,9 +384,10 @@ Actuator：
   GET    /api/health
 ```
 
-### 5.4 客户分组模块（Phase 9 准备）
+### 5.4 客户分组模块 + Admin 后台 ✅（Phase 9 已落地，2026-08-05）
 
-> **当前状态**：实体类 + Mapper 已建好，**controller / service 暂未实现**，等 Phase 9 启动时再补。
+> **当前状态**（2026-08-05）：Admin 模块已完整实现 — `/api/admin/users` 与 `/api/admin/groups` 全部接口落地。
+> 见 [API.md §8](API.md) 与 [DEVELOPER_B.md](DEVELOPER_B.md)。
 
 **模块位置**：`com.jurong.aicenter.customer.*`（子包，避免污染主包）
 
@@ -411,21 +412,41 @@ com.jurong.aicenter.customer/
 | `user_groups.is_default` | 是否默认分组，1 个；新用户注册时自动加入              |
 | `user_group_members`     | `UNIQUE(user_id, group_id)` 防止重复加入 |
 
-**待实现 API（Phase 9 规划）**：
+**已实现 API（Phase 9 后实际路径）**：
 
 ```
-需 JWT + ADMIN 角色：
-  GET    /api/customer/groups              # 分组列表
-  POST   /api/customer/groups              # 新建分组
-  PATCH  /api/customer/groups/{id}         # 修改分组
-  DELETE /api/customer/groups/{id}         # 删除分组（软删）
-  GET    /api/customer/groups/{id}/members # 查看组成员
-  POST   /api/customer/groups/{id}/members # 添加成员
-  DELETE /api/customer/groups/{id}/members/{userId}  # 移除成员
+需 JWT + ROLE_ADMIN：
+  GET    /api/admin/groups                              # 分组列表
+  POST   /api/admin/groups                              # 新建分组
+  GET    /api/admin/groups/{id}                         # 分组详情
+  PATCH  /api/admin/groups/{id}                         # 修改分组
+  DELETE /api/admin/groups/{id}                         # 删除分组（软删；Default 不可删）
+  GET    /api/admin/groups/{id}/members                 # 组成员
+  POST   /api/admin/groups/{id}/members                 # 加成员
+  DELETE /api/admin/groups/{id}/members/{userId}        # 移除成员
+
+需 JWT + ROLE_ADMIN：
+  GET    /api/admin/users                               # 搜索用户（displayName + 分页）
+  GET    /api/admin/users/{id}                          # 单个用户
+  PATCH  /api/admin/users/{id}/role                     # 改角色（禁改自己）
+  PATCH  /api/admin/users/{id}/disabled                 # 启停账号（禁禁自己）
 
 任何登录用户：
-  GET    /api/users/me/groups              # 我的分组
+  GET    /api/users/me/groups                           # 我的分组
 ```
+
+**重要约束**（给前端开发）：
+- **角色变更**：管理员调 `PATCH /api/admin/users/{id}/role` 后，**被改用户必须重新登录**（或调 `/api/auth/refresh`）才能拿到新 role — 旧 access token 在 2h 内仍带旧 role。前端需要给管理员 UI 显示提示「角色已变更，请通知用户重新登录」。
+- **启停账号**：`disabled=true` 时 login 返 2002 USER_DISABLED，refresh 也拒；但**已签发的 access token 在 2h 内仍可使用**（不立即踢出），等 2h 过期或用户主动 logout。前端如需"立刻踢人"应引导用户重新登录或等过期。
+
+**关键安全规则**：
+- 严禁管理员修改**自己**的角色 → 6002 ADMIN_CANNOT_CHANGE_OWN_ROLE
+- 严禁管理员禁用**自己**的账号 → 6003 ADMIN_CANNOT_DISABLE_SELF
+- 严禁删除 Default 分组 → 6005 GROUP_IS_DEFAULT_CANNOT_DELETE
+- 严禁关闭 Default 分组的 `is_default` 标志 → 6006 GROUP_IS_DEFAULT_CANNOT_UNSET
+- 新建 `is_default=true` 的分组会自动"独占"默认身份（其他分组 `is_default` 重置为 0）
+
+详细错误码见 [API.md §10 错误码分段](API.md#10-错误码分段)。
 
 **初始化**：V2 迁移脚本会自动创建一个名为 `Default` 的默认分组，所有新用户可在 Phase 9 注册流程中加入。
 
@@ -469,7 +490,8 @@ com.jurong.aicenter.customer/
 - Auth 模块（注册/登录/JWT/refresh）— 完整
 - User 模块（个人信息/修改）
 - 配额查询端点 — **当前不关联"使用一次扣费多少"**，**仅读 quota 字段**（Phase 8 才写完整扣费）
-- V2 客户分组（**只读**：GET /api/users/me/groups，Phase 9 之前）
+- V2 客户分组（**只读**：GET /api/users/me/groups）
+- **Phase 9（已完成 2026-08-05）**：Admin 模块 — `/api/admin/users` 与 `/api/admin/groups` 全套接口 + 审计日志
 
 ***
 
@@ -541,6 +563,7 @@ com.jurong.aicenter.customer/
 | **6** | 前端联调（前端团队）                   | 外部            | (前端项目独立) | ⚪                   |
 | **7** | Nginx + 收尾 + 试用              | A             | 1-2 天    | ⚪                   |
 | **8** | 计费模块（最后）                     | B 主导 + A/C 协助 | 1 周      | ⚪ 未来                |
+| **9** | Admin 模块（用户管理 + 客户分组后台）  | B             | 1-2 天    | 🟢 完成 (2026-08-05) |
 
 ### Phase 0-1 部署状态（2026-08-02）
 

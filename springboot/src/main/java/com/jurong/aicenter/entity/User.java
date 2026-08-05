@@ -26,6 +26,9 @@ public class User {
     /** USER / ADMIN */
     private String role;
 
+    /** 是否禁用：1=禁用（不可登录/不可生成），0=启用。Phase 9 admin 模块新增，V5 migration 加列 */
+    private Integer disabled;
+
     private Integer credits;
 
     private Integer monthlyQuota;
