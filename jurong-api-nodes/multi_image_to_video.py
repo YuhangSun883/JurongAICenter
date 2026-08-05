@@ -45,6 +45,10 @@ class JurongMultiImageToVideo:
                 "audio": ("AUDIO", {
                     "tooltip": "可选：参考音频"
                 }),
+                "enable_prompt_optimize": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "True=自动在 prompt 末尾追加保首帧引导（保持构图/主体/色调/风格）；False=原样传"
+                }),
             }
         }
 
@@ -58,12 +62,18 @@ class JurongMultiImageToVideo:
                  image_2=None, image_3=None, image_4=None,
                  model: str = "doubao-seedance-2.0",
                  duration: str = "4", resolution: str = "480P",
-                 audio=None) -> tuple:
+                 audio=None,
+                 enable_prompt_optimize: bool = True) -> tuple:
         if not prompt.strip():
             raise ValueError("prompt 不能为空")
 
+        # 0. 智能优化 prompt：保持首帧主体/构图/色调/风格
+        if enable_prompt_optimize:
+            prompt = self._enhance_prompt(prompt)
+
         # 1. 收集所有非空图片
-        input_images = [img for img in [image_1, image_2, image_3, image_4] if img is not None]
+        input_images = [img for img in [image_1, image_2, image_3, image_4]
+                        if img is not None]
         if not input_images:
             raise ValueError("至少需要 1 张参考图")
 
@@ -105,3 +115,34 @@ class JurongMultiImageToVideo:
         video_path = api_client.save_video_file(video_url, output_dir, filename_prefix="jurong_mi2v")
         first_frame = _extract_first_frame(video_path)
         return (first_frame, video_path)
+
+    @staticmethod
+    def _enhance_prompt(prompt: str) -> str:
+        """智能优化 prompt，强制锁定参考图主体。
+
+        关键约束：模型必须复刻参考图里的人物/物体外观，
+        禁止改变性别/年龄/服装/发型/体型/肤色，
+        只动画作和镜头运动。
+        """
+        lower = prompt.lower()
+        existing_keywords = [
+            "same as reference", "保持原图", "保持", "preserve",
+            "consistent", "exact same", "identical",
+            "same person", "same face", "maintain",
+            "锁定", "不要改变", "do not change",
+        ]
+        if any(k in lower for k in existing_keywords):
+            return prompt
+
+        enhancer = (
+            "CRITICAL: The subject(s) shown in the reference images MUST appear "
+            "EXACTLY as in the references — same face, same gender, same age, "
+            "same hairstyle and hair color, same clothing, same body type, "
+            "same skin tone, same accessories. Do NOT replace, swap, gender-swap, "
+            "or alter the subject's identity in any way. "
+            "Only animate the actions, expressions, and camera movement described above. "
+            "Preserve the exact composition, color palette, lighting, and visual style "
+            "of the reference images throughout the entire video. "
+            "Lock the first frame as the visual anchor."
+        )
+        return f"{prompt.rstrip('. ')}. {enhancer}"

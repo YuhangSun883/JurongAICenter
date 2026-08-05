@@ -441,10 +441,13 @@ public class GenerationServiceImpl implements GenerationService {
             collectStringPaths(job, node, urls);
 
             // 3. ui 字典（Jurong 节点返回 {"ui": {"newapi_task_id":[...], "video_path":[...]}, "result":(...)}）
-            collectUiPaths(job, node.get("ui"), urls);
-        }
-        return urls;
+        collectUiPaths(job, node.get("ui"), urls);
+
+        // 4. 顶层 video_path 数组（JurongImageToVideo 实际格式：outputs[nodeId].video_path=[...]）
+        collectTopLevelVideoPath(job, node, urls);
     }
+    return urls;
+}
 
     /** 处理字符串类型的文件路径输出（如 JurongImageToVideo 的 video_path）
      * 视频保存在 ComfyUI 容器内 /app/output/jurong_videos/，需通过 ComfyUI /view 接口下载
@@ -538,6 +541,44 @@ public class GenerationServiceImpl implements GenerationService {
                 }
             } catch (Exception e) {
                 log.warn("job {} download/upload video failed for {}: {}", job.getId(), path, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * 处理 outputs[nodeId].video_path 顶层数组（JurongImageToVideo 实际输出格式）。
+     * 历史背景：image_to_video.py 节点把 video_path 放在 outputs 顶层数组而不是 ui.video_path，
+     * 旧 collectStringPaths 只看字符串值、collectUiPaths 只看 ui 包装，都会跳过此格式，
+     * 导致 MinIO 一直没收到视频。
+     */
+    private void collectTopLevelVideoPath(Job job, JsonNode node, List<String> urls) {
+        JsonNode videoPath = node.get("video_path");
+        if (videoPath == null || !videoPath.isArray()) return;
+        for (JsonNode p : videoPath) {
+            if (!p.isTextual()) continue;
+            String path = p.asText();
+            if (path == null || path.isEmpty()) continue;
+            try {
+                String filename = path.contains("/") ?
+                    path.substring(path.lastIndexOf('/') + 1) : path;
+                String subfolder = "";
+                if (path.contains("/output/")) {
+                    String afterOutput = path.substring(path.indexOf("/output/") + 8);
+                    int lastSlash = afterOutput.lastIndexOf('/');
+                    if (lastSlash > 0) {
+                        subfolder = afterOutput.substring(0, lastSlash);
+                    }
+                }
+                log.info("job {} downloading video (top-level): filename={}, subfolder={}", job.getId(), filename, subfolder);
+                try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, "output")) {
+                    String contentType = inferContentType(filename, "video");
+                    String url = storageService.uploadFile(
+                        job.getUserId(), job.getId(), filename, is, contentType);
+                    urls.add(url);
+                    log.info("job {} uploaded video (top-level) {}", job.getId(), url);
+                }
+            } catch (Exception e) {
+                log.warn("job {} download/upload video (top-level) failed for {}: {}", job.getId(), path, e.getMessage());
             }
         }
     }
