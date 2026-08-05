@@ -44,6 +44,12 @@ export function listTasks(q?: { type?: CreationType }): Promise<CreationTask[]> 
   return Promise.resolve(list);
 }
 
+export function cancelTask(id: string): Promise<void> {
+  const t = tasks.find((x) => x.taskId === id);
+  if (t) t.status = 'failed';
+  return Promise.resolve();
+}
+
 /** Agent 对话：返回固定 mock 回复（真实回复由后端 Agent 服务生成） */
 export function agentChat(req: AgentChatRequest): Promise<AgentChatResponse> {
   return Promise.resolve({

@@ -22,4 +22,14 @@ public interface AuthService {
     AuthResponse login(LoginRequest request);
 
     AuthResponse refresh(RefreshRequest request);
+
+    /**
+     * 登出 — 撤销 refresh token。
+     *
+     * <p>access token 由于是无状态 JWT，无法主动失效；
+     * 但只要 refresh 被撤销，access 在 2h 自然过期后用户就必须重新登录。</p>
+     *
+     * @param refreshToken 待撤销的 refresh token（可为 null，此时仅返回成功，不做任何操作）
+     */
+    void logout(String refreshToken);
 }
