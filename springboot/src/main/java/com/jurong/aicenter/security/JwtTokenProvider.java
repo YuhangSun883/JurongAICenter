@@ -34,25 +34,40 @@ public class JwtTokenProvider {
         this.issuer = issuer;
     }
 
+    public String generateAccessToken(Long userId, String email, String role) {
+        return generate(userId, email, role, "access", accessExpiry);
+    }
+
+    public String generateRefreshToken(Long userId, String email, String role) {
+        return generate(userId, email, role, "refresh", refreshExpiry);
+    }
+
+    // 兼容旧调用：role 缺失时按 USER 处理
     public String generateAccessToken(Long userId, String email) {
-        return generate(userId, email, "access", accessExpiry);
+        return generateAccessToken(userId, email, "USER");
     }
 
     public String generateRefreshToken(Long userId, String email) {
-        return generate(userId, email, "refresh", refreshExpiry);
+        return generateRefreshToken(userId, email, "USER");
     }
 
-    private String generate(Long userId, String email, String type, Duration expiry) {
+    private String generate(Long userId, String email, String role, String type, Duration expiry) {
         Instant now = Instant.now();
         return Jwts.builder()
             .subject(String.valueOf(userId))
             .issuer(issuer)
             .claim("email", email)
+            .claim("role", role == null ? "USER" : role)
             .claim("type", type)
             .issuedAt(Date.from(now))
             .expiration(Date.from(now.plus(expiry)))
             .signWith(key)
             .compact();
+    }
+
+    // 兼容旧签名（不传 role = 视为 USER）
+    private String generate(Long userId, String email, String type, Duration expiry) {
+        return generate(userId, email, "USER", type, expiry);
     }
 
     public Claims parse(String token) {

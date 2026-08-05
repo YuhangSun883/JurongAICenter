@@ -1,6 +1,6 @@
 # DEVELOPER\_B.md — B 任务文档
 
-> 你的任务范围：**用户管理 + 客户分组（V2 实体已建） + 配额查询（预留**，不关联扣费）。
+> 你的任务范围：**用户管理 + 客户分组（V2 实体已建） + 配额查询（预留**,不关联扣费**）+ Admin 模块（Phase 9 提前）。
 > 与 A 一起维护 [API.md](API.md)，**编写/测试请求示例**。
 
 ## 0. 你是谁
@@ -44,6 +44,47 @@
 - 扣费逻辑
 - 流水记账
 - **不** 在 v1 任务清单里
+
+### Phase 9 — Admin 模块 ✅ 已完成（2026-08-05，B 实现）
+
+> Phase 9 提前实现：用户需求要求"管理员后台 + 客户分组管理"，于是 B 把 §8.2/§8.3 全部做完。
+> 关键决策：把原计划的 `/api/customer/groups/**` 路径**整合到 `/api/admin/groups/**`**（一个 controller），避免双份路径模糊。
+
+| #       | 任务                                                | 端点前缀                                              | 状态                |
+| ------- | ------------------------------------------------- | ------------------------------------------------ | ----------------- |
+| **B11** | Admin 搜索用户（displayName LIKE + 分页）             | `GET /api/admin/users`                            | ✅                |
+| **B12** | Admin 取单用户                                          | `GET /api/admin/users/{id}`                      | ✅                |
+| **B13** | Admin 改角色（USER↔ADMIN，禁改自己）                     | `PATCH /api/admin/users/{id}/role`               | ✅                |
+| **B14** | Admin 启停账号（禁禁自己）                                 | `PATCH /api/admin/users/{id}/disabled`           | ✅                |
+| **B15** | Admin 列出/创建/修改/删除分组                                  | `/api/admin/groups[/{id}]`（GET/POST/PATCH/DELETE） | ✅                |
+| **B16** | Admin 列出/加/移分组员                                     | `/api/admin/groups/{id}/members[/{userId}]`      | ✅                |
+| **B17** | 审计日志写入（fail-open）                                | admin_audit_logs 表                                 | ✅                |
+
+**额外改动（涉及 B 之外的 bug fix，请 A 关注 review）**：
+- [JwtTokenProvider.java](springboot/src/main/java/com/jurong/aicenter/security/JwtTokenProvider.java) 加 `role` claim（之前 token 不带 role，前端无法做页面分流；这一改让前端可解码 role 直接判断展示）
+- [JwtAuthenticationFilter.java](springboot/src/main/java/com/jurong/aicenter/security/JwtAuthenticationFilter.java) null role fallback 注释强化（防止后续误改）
+- [AuthServiceImpl.java](springboot/src/main/java/com/jurong/aicenter/service/impl/AuthServiceImpl.java) login/refresh 路径加 disabled 校验
+- [V5 migration](springboot/src/main/resources/db/migration/V5__admin_module.sql) `users.disabled` 列 + `admin_audit_logs` 表
+
+#### 角色变更的 token 失效策略
+
+管理员把 USER 升 ADMIN（或反过来）后，**被改用户的现有 access token 在 2h 内仍带旧 role**。这是当前设计：
+- `PATCH /api/admin/users/{id}/role` 成功后，调用方（前端）**必须**提示被改用户重新登录（或调 `/api/auth/refresh`，refresh 路径会用 DB 最新 role 重签 access）
+- 实现简单、不依赖 Redis 黑名单；缺点：2h 内"角色变更及时性"差
+- Phase 8 升级 Billing 时可以一并引入"role 黑名单"，但**当前不做**
+
+#### 禁用账号的生效策略
+
+`disabled=true` 在 **login 路径生效**（refresh 也校验）；但**已签发的 access token 在 2h 内仍可使用**。
+- 前端如果想立刻"踢人"，可以让用户重新登录或等 2h
+- 是否需要"即时踢出全端"（强制 token 失效）是 Phase 8 的事 —— 当前不做
+
+#### Default 分组的不可变性
+
+V2 migration 自动建了 `Default` 分组（is_default=1）。Admin 模块对此加硬约束：
+- 不可删除（6005）
+- 不可关闭 is_default 标志（6006）
+- 新建 is_default=true 的分组会自动"独占"这个身份（其他分组 is_default 重置为 0）
 
 ### V2 客户分组（Phase 9 之前）— 实体已建，**API 你做只读**
 
@@ -106,6 +147,9 @@
 - ❌ *不要修改 application*.yml / pom.xml / Dockerfile / docker-compose\*（这些是配置，**配置改动和A商量**）
 - ❌ **不要动 Generation / Workflow / Storage** 的代码（C 的活）
 - ❌ **不要写 ComfyUI 节点包代码**（节点包在另一个仓库 `jurong-api-nodes/`）
+- ❌ **不要修改 SecurityConfig.java 路径规则**（B 已使用 `.hasRole("ADMIN")` 拦截 `/api/admin/**`，
+     改它会让 admin 端点对外暴露）
+- ❌ **不要给现有 V1/V2/V4 迁移改名 / 删除**（数据库里已经应用，动了会触发 Flyway checksum mismatch）
 
 ## 5. 上手 checklist
 
@@ -130,4 +174,4 @@
 
 ***
 
-**最后更新**：2026-08-02&#x20;
+**最后更新**：2026-08-05（新增 Phase 9 admin 模块）&#x20;

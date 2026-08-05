@@ -39,11 +39,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                 Long userId = Long.valueOf(claims.getSubject());
                 String email = claims.get("email", String.class);
                 String role = claims.get("role", String.class);
+                // 安全降级：role 为 null 时按 USER 处理（绝不能因为 token 损坏就放空角色，
+                // 更不能默认 ADMIN，这会绕开 SecurityConfig 的 hasRole("ADMIN") 拦截）
+                String effectiveRole = (role != null && !role.isBlank()) ? role : "USER";
 
                 UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
-                    new AuthenticatedUser(userId, email, role),
+                    new AuthenticatedUser(userId, email, effectiveRole),
                     null,
-                    List.of(new SimpleGrantedAuthority("ROLE_" + (role != null ? role : "USER")))
+                    List.of(new SimpleGrantedAuthority("ROLE_" + effectiveRole))
                 );
                 auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
                 SecurityContextHolder.getContext().setAuthentication(auth);

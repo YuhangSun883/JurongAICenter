@@ -1,0 +1,661 @@
+{
+  "info": {
+    "name": "Admin Module E2E Test",
+    "description": "管理员模块端到端测试 — 23 个用例,覆盖登录鉴权、RBAC、用户管理、用户分组全链路。\n\n## 前置条件\n1. 启动 Spring Boot 服务(默认 http://localhost:8080)\n2. 数据库里已存在管理员账号 `displayName='rootadmin'`,邮箱和密码通过下方变量 `adminEmail` / `adminPassword` 配置\n3. 数据库已存在至少一个 `is_default=true` 的分组(Default 分组)\n\n## 运行方式\nPostman → Collection Runner → 选中本 collection → 顺序运行全部 23 个请求。\n\n## 响应结构说明(关键!)\n本项目两种响应结构并存:\n- **成功**:Controller 直接返回 DTO,字段扁平在响应根级,例如 `{accessToken, refreshToken, userId, email, role}`\n- **业务错误**:走 GlobalExceptionHandler,包成 `{code, message, data: null}`,例如 `{code: 6002, message: '自我角色修改被拒绝', data: null}`\n\n所有脚本都用 `const data = json.data ?? json` 同时兼容两种结构。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_postman_id": "8a3f5c9e-1b2d-4e7f-9a8c-5d6e7f8a9b0c"
+  },
+  "variable": [
+    {"key": "baseUrl", "value": "http://localhost:8080"},
+    {"key": "adminEmail", "value": "rootadmin@jurong.local"},
+    {"key": "adminPassword", "value": "Admin123!"},
+    {"key": "testPassword", "value": "Test123456"}
+  ],
+  "item": [
+    {
+      "name": "1. 管理员登录",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\":\"{{adminEmail}}\",\"password\":\"{{adminPassword}}\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/auth/login", "host": ["{{baseUrl}}"], "path": ["api", "auth", "login"]},
+        "description": "管理员登录,获取 token 用于后续 admin 接口"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "// 兼容:成功时扁平,业务错误时有 data 包装",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.collectionVariables.set('token', data.accessToken);",
+            "pm.collectionVariables.set('adminRefreshToken', data.refreshToken);",
+            "pm.collectionVariables.set('adminId', data.userId);",
+            "console.log('[Step 1] 管理员登录成功,adminId=' + data.userId);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "2. 管理员搜索自己",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {
+          "raw": "{{baseUrl}}/api/admin/users?displayName=rootadmin&page=1&pageSize=5",
+          "host": ["{{baseUrl}}"], "path": ["api", "admin", "users"],
+          "query": [
+            {"key": "displayName", "value": "rootadmin"},
+            {"key": "page", "value": "1"},
+            {"key": "pageSize", "value": "5"}
+          ]
+        },
+        "description": "管理员用 displayName=rootadmin 搜索自己,验证搜索功能"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.expect(data.items.length).to.be.greaterThan(0);",
+            "pm.expect(data.items[0].displayName).to.eql('rootadmin');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "3. 注册普通测试用户",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const email = 'test-' + Date.now() + '@example.com';",
+              "pm.collectionVariables.set('testEmail', email);",
+              "console.log('[Step 3] 生成测试邮箱:' + email);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.expect(pm.response.code).to.eql(201);",
+              "const json = pm.response.json();",
+              "const data = json.data !== undefined ? json.data : json;",
+              "const code = json.code !== undefined ? json.code : 0;",
+              "pm.expect(code).to.eql(0);",
+              "pm.collectionVariables.set('testUserId', data.userId);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\":\"{{testEmail}}\",\"password\":\"{{testPassword}}\",\"displayName\":\"Test\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/auth/register", "host": ["{{baseUrl}}"], "path": ["api", "auth", "register"]},
+        "description": "注册 displayName=Test 的普通用户,用于后续升级、降级、禁用等测试"
+      }
+    },
+    {
+      "name": "4. 普通用户登录",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\":\"{{testEmail}}\",\"password\":\"{{testPassword}}\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/auth/login", "host": ["{{baseUrl}}"], "path": ["api", "auth", "login"]},
+        "description": "Test 用户登录,拿到 userToken 用于验证 RBAC 拦截"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.collectionVariables.set('userToken', data.accessToken);",
+            "pm.collectionVariables.set('userRefreshToken', data.refreshToken);",
+            "console.log('[Step 4] Test 用户登录成功');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "5. RBAC 拦截 — userToken 访问 admin 接口",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{userToken}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/users", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users"]},
+        "description": "普通 USER 用 userToken 访问 /api/admin/users,预期被 Spring Security RBAC 拦截 → HTTP 403"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.expect(pm.response.code).to.eql(403);",
+            "console.log('[Step 5] ✓ RBAC 拦截成功');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "6. 搜索 Test 用户,记录 targetUserId",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {
+          "raw": "{{baseUrl}}/api/admin/users?displayName=Test&page=1&pageSize=20",
+          "host": ["{{baseUrl}}"], "path": ["api", "admin", "users"],
+          "query": [
+            {"key": "displayName", "value": "Test"},
+            {"key": "page", "value": "1"},
+            {"key": "pageSize", "value": "20"}
+          ]
+        },
+        "description": "管理员搜索 displayName=Test 的用户,提取 id 存为 targetUserId"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "const found = data.items.find(u => u.displayName === 'Test');",
+            "pm.expect(found, '未找到 displayName=Test 的用户').to.not.be.undefined;",
+            "pm.collectionVariables.set('targetUserId', found.id);",
+            "console.log('[Step 6] targetUserId=' + found.id);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "7. 升级 Test 用户为 ADMIN",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"role\":\"ADMIN\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/users/{{targetUserId}}/role", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users", "{{targetUserId}}", "role"]},
+        "description": "管理员把 targetUserId 提升为 ADMIN"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.expect(data.role).to.eql('ADMIN');",
+            "console.log('[Step 7] ✓ id=' + pm.collectionVariables.get('targetUserId') + ' 已升级为 ADMIN');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "8. 旧 userToken 仍被 RBAC 拦截(角色未立即生效)",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{userToken}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/users", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users"]},
+        "description": "用 step 4 拿到的旧 userToken 访问 admin,JWT 里还是 USER,预期 403"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.expect(pm.response.code).to.eql(403);",
+            "console.log('[Step 8] ✓ 旧 token 仍 403');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "9. refresh token,获取带 ADMIN 角色的新 token",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"refreshToken\":\"{{userRefreshToken}}\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/auth/refresh", "host": ["{{baseUrl}}"], "path": ["api", "auth", "refresh"]},
+        "description": "用 refresh token 换新的 access token,这次 JWT 里会是 ADMIN"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.collectionVariables.set('userToken', data.accessToken);",
+            "console.log('[Step 9] ✓ 已 refresh,新 token 含 ADMIN role');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "10. 新 userToken 已能访问 admin",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{userToken}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/users", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users"]},
+        "description": "用 step 9 refresh 后拿到的新 token 访问 admin,预期 200"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "pm.expect(pm.response.code).to.eql(200);",
+            "const json = pm.response.json();",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "console.log('[Step 10] ✓ RBAC 放行,JWT 角色实时反映');"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "11. 管理员改自己角色 → 拒绝 6002",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"role\":\"USER\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/users/{{adminId}}/role", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users", "{{adminId}}", "role"]},
+        "description": "管理员尝试把自己降级,业务规则应拒绝(code=6002)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6002);",
+            "console.log('[Step 11] ✓ 自我角色修改被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "12. 管理员禁自己 → 拒绝 6003",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"disabled\":true}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/users/{{adminId}}/disabled", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users", "{{adminId}}", "disabled"]},
+        "description": "管理员尝试禁用自己,业务规则应拒绝(code=6003)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6003);",
+            "console.log('[Step 12] ✓ 自我禁用被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "13. 禁用 targetUserId 用户",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"disabled\":true}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/users/{{targetUserId}}/disabled", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users", "{{targetUserId}}", "disabled"]},
+        "description": "管理员禁用 targetUserId"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.expect(data.disabled).to.eql(true);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "14. 被禁用户登录 → 拒绝 2002",
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\":\"{{testEmail}}\",\"password\":\"{{testPassword}}\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/auth/login", "host": ["{{baseUrl}}"], "path": ["api", "auth", "login"]},
+        "description": "被禁用的 Test 用户尝试登录,业务规则拒绝(code=2002 = USER_DISABLED)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(2002);",
+            "console.log('[Step 14] ✓ 被禁用户登录被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "15. 重新启用 targetUserId",
+      "request": {
+        "method": "PATCH",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"disabled\":false}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/users/{{targetUserId}}/disabled", "host": ["{{baseUrl}}"], "path": ["api", "admin", "users", "{{targetUserId}}", "disabled"]},
+        "description": "管理员重新启用 targetUserId"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "pm.expect(data.disabled).to.eql(false);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "16. 列出分组,记录 defaultGroupId",
+      "request": {
+        "method": "GET",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {
+          "raw": "{{baseUrl}}/api/admin/groups?page=1&pageSize=20",
+          "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups"],
+          "query": [
+            {"key": "page", "value": "1"},
+            {"key": "pageSize", "value": "20"}
+          ]
+        },
+        "description": "管理员列出所有分组,找到 is_default=true 的分组存为 defaultGroupId"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const data = json.data !== undefined ? json.data : json;",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);",
+            "const def = data.items.find(g => g.isDefault === true);",
+            "pm.expect(def, '未找到 is_default=true 的分组').to.not.be.undefined;",
+            "pm.collectionVariables.set('defaultGroupId', def.id);",
+            "console.log('[Step 16] defaultGroupId=' + def.id);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "17. 创建新分组",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const name = '测试分组-' + Date.now();",
+              "pm.collectionVariables.set('testGroupName', name);",
+              "console.log('[Step 17] 分组名:' + name);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "const data = json.data !== undefined ? json.data : json;",
+              "const code = json.code !== undefined ? json.code : 0;",
+              "pm.expect(code).to.eql(0);",
+              "pm.collectionVariables.set('groupId', data.id);",
+              "console.log('[Step 17] ✓ 新建分组 id=' + data.id);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\":\"{{testGroupName}}\",\"description\":\"E2E 测试创建\",\"color\":\"#ff5722\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/groups", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups"]},
+        "description": "管理员创建一个新分组,记 groupId"
+      }
+    },
+    {
+      "name": "18. 同名分组重复创建 → 拒绝 6004",
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"name\":\"{{testGroupName}}\",\"description\":\"重复创建测试\",\"color\":\"#ff5722\"}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/groups", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups"]},
+        "description": "用 step 17 同名再创建一个,预期被业务规则拒绝(code=6004)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6004);",
+            "console.log('[Step 18] ✓ 同名分组被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "19. 删除 Default 分组 → 拒绝 6005",
+      "request": {
+        "method": "DELETE",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/groups/{{defaultGroupId}}", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups", "{{defaultGroupId}}"]},
+        "description": "尝试删除 Default 分组,业务规则应拒绝(code=6005)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6005);",
+            "console.log('[Step 19] ✓ Default 分组不可删除:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "20. 向新分组添加 targetUserId 成员",
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"userId\":{{targetUserId}}}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/groups/{{groupId}}/members", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups", "{{groupId}}", "members"]},
+        "description": "把 targetUserId 加为新分组成员"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "21. 重复加同一成员 → 拒绝 6007",
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Authorization", "value": "Bearer {{token}}"},
+          {"key": "Content-Type", "value": "application/json"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"userId\":{{targetUserId}}}",
+          "options": {"raw": {"language": "json"}}
+        },
+        "url": {"raw": "{{baseUrl}}/api/admin/groups/{{groupId}}/members", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups", "{{groupId}}", "members"]},
+        "description": "同一个 userId 再加一次,预期拒绝(code=6007)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6007);",
+            "console.log('[Step 21] ✓ 重复成员被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "22. 移除 targetUserId 成员",
+      "request": {
+        "method": "DELETE",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/groups/{{groupId}}/members/{{targetUserId}}", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups", "{{groupId}}", "members", "{{targetUserId}}"]},
+        "description": "从新分组移除 targetUserId"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "const code = json.code !== undefined ? json.code : 0;",
+            "pm.expect(code).to.eql(0);"
+          ]
+        }
+      }]
+    },
+    {
+      "name": "23. 再移除一次(已不在)→ 拒绝 6008",
+      "request": {
+        "method": "DELETE",
+        "header": [{"key": "Authorization", "value": "Bearer {{token}}"}],
+        "url": {"raw": "{{baseUrl}}/api/admin/groups/{{groupId}}/members/{{targetUserId}}", "host": ["{{baseUrl}}"], "path": ["api", "admin", "groups", "{{groupId}}", "members", "{{targetUserId}}"]},
+        "description": "再移除一次已不在的成员,业务规则应拒绝(code=6008)"
+      },
+      "event": [{
+        "listen": "test",
+        "script": {
+          "type": "text/javascript",
+          "exec": [
+            "const json = pm.response.json();",
+            "pm.expect(json.code).to.eql(6008);",
+            "console.log('[Step 23] ✓ 重复移除被拒绝:' + json.message);"
+          ]
+        }
+      }]
+    }
+  ]
+}

@@ -28,7 +28,9 @@
 {
   "accessToken": "eyJ...",
   "refreshToken": "eyJ...",
-  "user": { "id": 1, "email": "user@example.com", "displayName": "...", "role": "USER" }
+  "userId": 1,
+  "email": "user@example.com",
+  "role": "USER"
 }
 ```
 
@@ -164,20 +166,182 @@
 
 ---
 
-## 8. Customer 客户分组（Phase 9）
+## 8. Customer 客户分组（Phase 9）— 管理员后台
 
-> **计划中**（Phase 9）。实体在 `customer/entity/` 已建好（`UserGroup` / `UserGroupMember`），**API 暂不实现**。
+> **已实现**（V5 migration + AdminController 一起落地）。本节描述的是**管理员视角**的分组管理 API；
+> 普通用户自己的"我的分组"接口见 §2 User（`GET /api/users/me/groups`）。
 
-| 方法 | 路径 | 请求 | 响应 | 状态 |
+### 8.1 通用规则
+
+- 所有 `/api/admin/**` 端点需 `ROLE_ADMIN` —— 无 ADMIN 角色返 403
+- 角色变更（USER ↔ ADMIN）后，**被改用户必须重新登录**（或调 `/api/auth/refresh`）才能获得新 role，
+  旧的 access token 在 2h 内仍带旧 role —— 文档约束下游前端须在 UI 提示用户「角色已变更，请重新登录」
+- 账号启停（disabled）变更**即时**生效，下一次 login/refresh 校验数据库
+- 所有写操作记录到 `admin_audit_logs` 表
+- Default 分组的不可变性：`isDefault=true` 的分组不可删除、不可关闭 `isDefault` 标志
+- 创建/将一个分组设为 `isDefault=true` 时，自动把其他分组的 `isDefault` 重置为 false
+
+> 📌 **前端对接速查（必读）**
+>
+> | 易错点 | 正确 | 错误 |
+> |--------|------|------|
+> | 搜索用户字段 | `?displayName=xxx` | ❌ `?keyword=` `?name=` `?email=` |
+> | 分页大小 | `?pageSize=20` | ❌ `?size=20` |
+> | 页码 | `?page=1` | - |
+> | 改角色接口 | `PATCH /users/{id}/role` | ❌ `PUT` |
+> | 启停账号接口 | `PATCH /users/{id}/disabled` | ❌ `PUT` |
+> | 修改分组 | `PATCH /groups/{id}` | ❌ `PUT` |
+> | 角色变更生效方式 | 用户**重新登录**或调用 `/api/auth/refresh` | - |
+
+### 8.2 用户管理（Admin → User）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/admin/users` | 搜索用户（分页） |
+| GET | `/api/admin/users/{id}` | 获取单个用户完整信息 |
+| PATCH | `/api/admin/users/{id}/role` | 修改角色 USER↔ADMIN（**严禁改自己**） |
+| PATCH | `/api/admin/users/{id}/disabled` | 启停账号（**严禁禁自己**） |
+
+#### 8.2.1 `GET /api/admin/users`
+
+搜索参数（全部可选）：
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| GET | `/api/customer/groups` | — | `{code, message, data: Group[]}` | 📋 Phase 9 |
-| POST | `/api/customer/groups` | `{name, description?, color?}` | `{code, message, data: Group}` | 📋 Phase 9 |
-| PATCH | `/api/customer/groups/{id}` | `{name?, description?, color?}` | `{code, message, data: Group}` | 📋 Phase 9 |
-| DELETE | `/api/customer/groups/{id}` | — | `{code, message}` | 📋 Phase 9 |
-| GET | `/api/customer/groups/{id}/members` | — | `{code, message, data: UserResponse[]}` | 📋 Phase 9 |
-| POST | `/api/customer/groups/{id}/members` | `{userId}` | `{code, message}` | 📋 Phase 9 |
-| DELETE | `/api/customer/groups/{id}/members/{userId}` | — | `{code, message}` | 📋 Phase 9 |
-| GET | `/api/users/me/groups` | — | `{code, message, data: GroupResponse[]}` | ✅ 已实现（B10）|
+| `displayName` | string | 否 | - | `display_name` **模糊匹配**（SQL `LIKE '%xxx%'`），不是 email |
+| `role` | string | 否 | - | `USER` / `ADMIN` 精确匹配 |
+| `disabled` | boolean | 否 | - | `true` / `false` |
+| `page` | int | 否 | 1 | 页码，从 1 开始 |
+| `pageSize` | int | 否 | 20 | 每页条数，上限 100 |
+
+> ⚠️ **易踩坑点（前端必读）**
+>
+> 1. 搜索字段是 `displayName`，**不是** `keyword`、不是 `name`、不是 `email`。
+>    错误示例：`?keyword=张三` 会被 Spring 直接忽略，等同于「不传 displayName」查全部。
+> 2. 分页参数是 `pageSize`，**不是** `size`。
+>    错误示例：`?size=5` 会被 Spring 直接忽略，按默认 20 条返回。
+>    如果你看到「明明传了 size=5 却返回 20 条」，就是这个原因。
+> 3. **任何拼写错误的参数都会被静默忽略**，Spring 不会返回 400，所以查不出来时请先检查参数名拼写。
+> 4. 不传任何参数 = 查全部用户，按 id 倒序（最新注册在前）。
+
+**正确用法示例**：
+
+```http
+GET /api/admin/users?displayName=张三&page=1&pageSize=20
+```
+
+```http
+GET /api/admin/users?role=ADMIN&disabled=false&page=1&pageSize=50
+```
+
+**错误用法（静默失败，不要这样写）**：
+
+```http
+# ❌ keyword 不会被识别
+GET /api/admin/users?keyword=张三
+
+# ❌ size 不会被识别，按 20 条返回
+GET /api/admin/users?displayName=张三&size=5
+
+# ❌ 搜 email 后端不会返回结果（displayName 只匹配 display_name 字段）
+GET /api/admin/users?displayName=user@example.com
+```
+
+返回 `data`：`{items: AdminUserListItem[], total: int, page: int, pageSize: int}`
+
+`AdminUserListItem`:
+
+```json
+{
+  "id": 1,
+  "email": "user@example.com",
+  "displayName": "昵称",
+  "role": "USER",
+  "disabled": 0,
+  "credits": 0,
+  "monthlyQuota": 50,
+  "quotaUsed": 0,
+  "plan": "FREE",
+  "createdAt": "2026-08-05T10:00:00",
+  "groupIds": [1],
+  "groupNames": ["Default"]
+}
+```
+
+#### 8.2.2 `PATCH /api/admin/users/{id}/role`
+
+请求体：
+```json
+{ "role": "ADMIN" }
+```
+
+返回：`data` 为新角色字符串（`"USER"` 或 `"ADMIN"`）。
+
+错误码：
+- `6002 ADMIN_CANNOT_CHANGE_OWN_ROLE` — 严禁改自己
+- `6009 INVALID_ROLE_VALUE` — role 不是 USER / ADMIN
+- `2001 USER_NOT_FOUND` — 用户 id 不存在
+
+**注意**：被改用户的现有 token 在 2h 内仍带旧 role。前端需提示用户重新登录。
+
+#### 8.2.3 `PATCH /api/admin/users/{id}/disabled`
+
+请求体：
+```json
+{ "disabled": true }
+```
+
+返回：`data` 为新 disabled 值（0 或 1）。
+
+错误码：
+- `6003 ADMIN_CANNOT_DISABLE_SELF`
+- `2001 USER_NOT_FOUND`
+- `9001 INVALID_PARAM` — disabled 字段为空
+
+**注意**：禁用的用户**仍可 refresh token 直到 2h 后过期**，但 login 路径返回 2002 USER_DISABLED。
+如果要立即生效（不只是 login 路径），需要让后端每次请求都查库重 role — 留 Phase 8 升级。
+
+### 8.3 客户分组管理（Admin → Group）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/admin/groups` | 列出全部分组（分页，含成员数） |
+| GET | `/api/admin/groups/{id}` | 分组详情 |
+| POST | `/api/admin/groups` | 创建分组 |
+| PATCH | `/api/admin/groups/{id}` | 修改分组（PATCH） |
+| DELETE | `/api/admin/groups/{id}` | 删除分组（软删，Default 不可删） |
+| GET | `/api/admin/groups/{id}/members` | 列出分组成员（分页） |
+| POST | `/api/admin/groups/{id}/members` | 加成员（`{userId}`） |
+| DELETE | `/api/admin/groups/{id}/members/{userId}` | 移除成员 |
+
+`AdminGroupResponse`:
+```json
+{
+  "id": 1,
+  "name": "Default",
+  "description": "默认分组，所有新用户自动加入",
+  "color": "#909399",
+  "isDefault": true,
+  "memberCount": 5,
+  "createdAt": "...",
+  "updatedAt": "..."
+}
+```
+
+错误码：
+- `6004 GROUP_NAME_DUPLICATE` — name 已存在
+- `6005 GROUP_IS_DEFAULT_CANNOT_DELETE`
+- `6006 GROUP_IS_DEFAULT_CANNOT_UNSET`
+- `6007 USER_ALREADY_IN_GROUP`
+- `6008 USER_NOT_IN_GROUP`
+- `9404 NOT_FOUND` — 分组或用户不存在
+
+---
+
+## 9. Customer 客户分组（已合并到 §8.3）
+
+> 旧版 §8 的 `/api/customer/**` 管理员 API 已**整合到 §8.3 的 `/api/admin/groups`**，保持向后兼容只到 v1；下版本移除 `/api/customer/groups/*`。
+> 普通用户的 `GET /api/users/me/groups` 仍保留（见 §2）。
 
 ---
 
@@ -210,6 +374,7 @@
 | 3xxx | Generation | `3001=WORKFLOW_INVALID / 3002=COMFYUI_UNREACHABLE / 3003=COMFYUI_REJECTED / 3004=QUOTA_INSUFFICIENT` |
 | 4xxx | Workflow | `4001=WORKFLOW_NOT_FOUND / 4002=WORKFLOW_ACCESS_DENIED` |
 | 5xxx | Billing | `5001=BILLING_NOT_ENABLED`（Phase 8）|
+| 6xxx | Admin | `6001=ADMIN_OPERATION_DENIED / 6002=ADMIN_CANNOT_CHANGE_OWN_ROLE / 6003=ADMIN_CANNOT_DISABLE_SELF / 6004=GROUP_NAME_DUPLICATE / 6005=GROUP_IS_DEFAULT_CANNOT_DELETE / 6006=GROUP_IS_DEFAULT_CANNOT_UNSET / 6007=USER_ALREADY_IN_GROUP / 6008=USER_NOT_IN_GROUP / 6009=INVALID_ROLE_VALUE` |
 
 返回格式：
 ```json
@@ -352,6 +517,75 @@ curl -X POST http://localhost:8080/api/generate \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"workflowId": 5, "inputs": {"prompt": "transform to watercolor painting"}}'
+
+# ===== 19. 管理员搜索用户（按 displayName 模糊） =====
+# 注：必须用 ROLE_ADMIN 的 token（用 ADMIN 账户登录拿）
+ADMIN_TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@jurong.local","password":"admin123"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['accessToken'])")
+
+curl "http://localhost:8080/api/admin/users?displayName=%E4%BA%A7%E5%93%81&page=1&pageSize=20" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# → {"code":0,"data":{"items":[{...AdminUserListItem...}],"total":1,"page":1,"pageSize":20}}
+
+# ===== 20. 管理员修改用户角色（USER → ADMIN） =====
+curl -X PATCH http://localhost:8080/api/admin/users/2/role \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"ADMIN"}'
+# → {"code":0,"data":"ADMIN"}
+# 期望前端提示："角色已变更，请重新登录后生效"
+
+# 改自己返 6002（用 ADMIN 自己的 userId 替换 {ADMIN_ID}）：
+ADMIN_ID=$(curl -s -X POST http://localhost:8080/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin@jurong.local","password":"admin123"}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['userId'])")
+curl -X PATCH "http://localhost:8080/api/admin/users/$ADMIN_ID/role" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"USER"}'
+# → {"code":6002,"message":"不能修改自己的角色","data":null}
+
+# ===== 21. 管理员启停账号 =====
+curl -X PATCH http://localhost:8080/api/admin/users/2/disabled \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"disabled":true}'
+# → {"code":0,"data":1}
+# 禁自己返 6003：
+# curl -X PATCH .../users/<自己id>/disabled -d '{"disabled":true}'
+# → {"code":6003,"message":"不能禁用自己的账号","data":null}
+
+# ===== 22. 管理员创建分组 =====
+curl -X POST http://localhost:8080/api/admin/groups \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"VIP","description":"付费用户","color":"#F56C6C","isDefault":false}'
+# → {"code":0,"data":{"id":2,"name":"VIP",...}}
+
+# 创建 name 重名返 6004：
+# curl ... -d '{"name":"Default"}'
+# → {"code":6004,"message":"分组名称已存在：Default","data":null}
+
+# ===== 23. 管理员往分组加成员 =====
+curl -X POST http://localhost:8080/api/admin/groups/2/members \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":3}'
+# → {"code":0,"message":"success","data":null}
+# 用户已在返 6007
+
+# ===== 24. 删除 Default 分组（应被拒） =====
+curl -X DELETE http://localhost:8080/api/admin/groups/1 \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# → {"code":6005,"message":"默认分组不可删除...","data":null}
+
+# ===== 25. 普通 USER token 访问 admin 端点（返 403） =====
+curl "http://localhost:8080/api/admin/users" \
+  -H "Authorization: Bearer $TOKEN"
+# HTTP 403（Spring Security 在 filter 链直接拒绝；不走 BusinessException）
 ```
 
 ---
