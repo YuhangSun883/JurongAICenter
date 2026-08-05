@@ -1,0 +1,88 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  html, body {
+    height: 100%;
+  }
+  body {
+    @apply bg-bg text-fg antialiased;
+    /* 单方向光晕：更克制、更"聚融" */
+    background-image:
+      radial-gradient(1100px 600px at 50% -10%, rgba(59, 107, 255, 0.10), transparent 65%);
+  }
+  ::selection {
+    background: rgba(59, 107, 255, 0.20);
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-bg-line bg-bg-card shadow-soft;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-brand px-4 py-2 text-sm font-medium text-white shadow-glow transition hover:brightness-110 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-bg-line bg-bg-card px-3 py-1.5 text-sm text-fg-muted transition hover:text-fg hover:border-brand/40;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-bg-line bg-bg-soft px-2.5 py-1 text-xs text-fg-muted;
+  }
+  .label {
+    @apply text-xs font-medium text-fg-muted;
+  }
+  .shimmer {
+    background: linear-gradient(90deg, transparent, rgba(0,0,0,0.04), transparent);
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+  /* 主题文字渐变：蓝 → 蓝紫，对应 logo 风格 */
+  .text-gradient {
+    @apply bg-gradient-to-r from-brand to-[#8b8cff] bg-clip-text text-transparent;
+  }
+}
+
+/* Tiptap placeholder */
+.ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: rgb(148 163 184);
+  pointer-events: none;
+  height: 0;
+}
+.ProseMirror {
+  @apply min-h-[140px] outline-none text-sm leading-6;
+}
+.ProseMirror .mention {
+  @apply rounded-md bg-brand/15 px-1.5 py-0.5 text-brand-700;
+}
+
+/* 弹窗可缩放：右下角显示 ↘ 拖拽手柄 */
+.resizable-dialog {
+  resize: both;
+  overflow: auto;
+  min-width: 480px;
+  min-height: 360px;
+}
+
+/* 自定义滚动条：隐形，但保留滚动功能 */
+.scrollbar-hidden {
+  scrollbar-width: none;           /* Firefox */
+  -ms-overflow-style: none;        /* IE / Edge legacy */
+}
+.scrollbar-hidden::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  background: transparent;
+}
+.scrollbar-hidden::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+.scrollbar-hidden::-webkit-scrollbar-track {
+  background: transparent;
+}
