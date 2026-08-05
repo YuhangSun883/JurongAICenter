@@ -9,21 +9,24 @@ import type {
 } from '@/types/media';
 
 const API = '/api/media';
+const UPLOAD_API = '/api/comfyui'; // 后端实际上传端点
 
 export async function listAssets(q: MediaListQuery = {}): Promise<{ items: MediaItem[]; total: number }> {
-  return request(`${API}/assets`, { query: q as Record<string, string | number> });
+  // 后端暂无 /api/media/assets 列表接口
+  return Promise.resolve({ items: [], total: 0 });
 }
 
-export async function deleteAsset(id: string): Promise<void> {
-  await request(`${API}/assets/${id}`, { method: 'DELETE' });
+export async function deleteAsset(_id: string): Promise<void> {
+  // 后端暂无 /api/media/assets/{id} 删除接口
+  return Promise.resolve();
 }
 
-/** 文件上传：后端期望 multipart/form-data，单文件 */
+/** 文件上传：后端实际端点是 POST /api/comfyui/upload (multipart) */
 export async function uploadAsset(file: File): Promise<MediaUploadResponse> {
   const form = new FormData();
   form.append('file', file);
   const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
-  const res = await fetch(`${API}/assets`, {
+  const res = await fetch(`${UPLOAD_API}/upload`, {
     method: 'POST',
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
     body: form,
@@ -32,12 +35,12 @@ export async function uploadAsset(file: File): Promise<MediaUploadResponse> {
   return res.json();
 }
 
-/** 角色库分类 */
+/** 角色库分类：后端暂无 */
 export async function listRoleCategories(): Promise<RoleCategory[]> {
-  return request<RoleCategory[]>(`${API}/roles/categories`);
+  return Promise.resolve([]);
 }
 
-/** 角色库列表 */
+/** 角色库列表：后端暂无 */
 export async function listRoles(q: RoleListQuery = {}): Promise<{ items: MediaItem[]; total: number }> {
-  return request(`${API}/roles`, { query: q as Record<string, string | number> });
+  return Promise.resolve({ items: [], total: 0 });
 }

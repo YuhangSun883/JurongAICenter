@@ -8,9 +8,11 @@ import { TOKEN_KEY } from '@/api/config';
 
 interface LoginDialogProps {
   onClose?: () => void;
+  /** 切换到注册弹窗 */
+  onSwitchToRegister?: () => void;
 }
 
-export function LoginDialog({ onClose }: LoginDialogProps) {
+export function LoginDialog({ onClose, onSwitchToRegister }: LoginDialogProps) {
   const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -32,13 +34,20 @@ export function LoginDialog({ onClose }: LoginDialogProps) {
 
     setSubmitting(true);
     try {
-      // 后端接口契约：POST /api/auth/login，参数为 { account, password }。
+      // 后端接口契约：POST /api/auth/login，参数为 { email, password }。
       const result = await authApi.login({
-        account: account.trim(),
+        email: account.trim(),
         password,
       });
-      localStorage.setItem(TOKEN_KEY, result.token);
-      localStorage.setItem('user', JSON.stringify(result.user));
+      localStorage.setItem(TOKEN_KEY, result.accessToken);
+      localStorage.setItem('refreshToken', result.refreshToken);
+      localStorage.setItem('user', JSON.stringify({
+        id: result.userId,
+        email: result.email,
+        role: result.role,
+      }));
+      // 通知所有监听者（SidebarUserMenu、TopBar 等）刷新用户信息
+      window.dispatchEvent(new Event('auth-changed'));
       onClose?.();
     } catch (cause) {
       if (cause instanceof ApiError) {
@@ -156,7 +165,11 @@ export function LoginDialog({ onClose }: LoginDialogProps) {
 
           <p className="mt-6 text-center text-xs text-slate-400">
             还没有账号？
-            <button type="button" className="ml-1 font-medium text-brand hover:text-brand-dark">
+            <button
+              type="button"
+              onClick={onSwitchToRegister}
+              className="ml-1 font-medium text-brand hover:text-brand-dark"
+            >
               立即注册
             </button>
           </p>

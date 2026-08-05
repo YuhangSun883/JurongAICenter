@@ -5,9 +5,11 @@ import com.jurong.aicenter.dto.auth.LoginRequest;
 import com.jurong.aicenter.dto.auth.RefreshRequest;
 import com.jurong.aicenter.dto.auth.RegisterRequest;
 import com.jurong.aicenter.dto.user.UserResponse;
+import com.jurong.aicenter.entity.RevokedToken;
 import com.jurong.aicenter.entity.User;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.RevokedTokenRepository;
 import com.jurong.aicenter.repository.UserRepository;
 import com.jurong.aicenter.security.JwtTokenProvider;
 import com.jurong.aicenter.service.AuthService;
@@ -19,8 +21,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 
 @Slf4j
 @Service
@@ -30,6 +34,7 @@ public class AuthServiceImpl implements AuthService {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenProvider jwtTokenProvider;
+    private final RevokedTokenRepository revokedTokenRepository;
 
     @Override
     public AuthResponse register(RegisterRequest request) {
@@ -103,6 +108,12 @@ public class AuthServiceImpl implements AuthService {
                 throw new BusinessException(ErrorCode.INVALID_TOKEN, "无效的 Refresh Token");
             }
 
+            // 1.5 检查 refresh token 是否已被撤销（登出 / 改密 / 强制下线）
+            String jti = claims.getId();
+            if (jti != null && revokedTokenRepository.countByJti(jti) > 0) {
+                throw new BusinessException(ErrorCode.INVALID_TOKEN, "Refresh Token 已被撤销，请重新登录");
+            }
+
             // 2. 提取 userId 并查询用户
             Long userId = Long.valueOf(claims.getSubject());
             User user = userRepository.selectById(userId);
@@ -131,6 +142,49 @@ public class AuthServiceImpl implements AuthService {
             );
         } catch (JwtException e) {
             throw new BusinessException(ErrorCode.INVALID_TOKEN, "Token 无效或已过期");
+        }
+    }
+
+    @Override
+    public void logout(String refreshToken) {
+        // 1. 没传 refreshToken：纯前端清理场景，后端无事可做，直接返回成功
+        if (refreshToken == null || refreshToken.isBlank()) {
+            log.info("logout called without refreshToken (frontend cleanup only)");
+            return;
+        }
+
+        try {
+            // 2. 解析 refresh token，提取 jti 和过期时间
+            Claims claims = jwtTokenProvider.parse(refreshToken);
+            String type = (String) claims.get("type");
+            if (!"refresh".equals(type)) {
+                // 不是 refresh token 也算成功（幂等）
+                log.warn("logout called with non-refresh token, ignored");
+                return;
+            }
+
+            String jti = claims.getId();
+            Long userId = Long.valueOf(claims.getSubject());
+            Instant exp = jwtTokenProvider.getExpiration(refreshToken);
+
+            // 3. 幂等：已撤销的不重复写入
+            if (jti != null && revokedTokenRepository.countByJti(jti) > 0) {
+                log.info("refresh token already revoked (jti={})", jti);
+                return;
+            }
+
+            // 4. 写入 revoked_tokens 表
+            RevokedToken revoked = new RevokedToken();
+            revoked.setJti(jti);
+            revoked.setUserId(userId);
+            revoked.setRevokedAt(LocalDateTime.now());
+            revoked.setExpiresAt(exp.atZone(ZoneId.systemDefault()).toLocalDateTime());
+            revokedTokenRepository.insert(revoked);
+
+            log.info("user {} logged out, refresh token jti={} revoked", userId, jti);
+        } catch (JwtException e) {
+            // token 无效 / 已过期：当作幂等成功（不需要报错）
+            log.warn("logout called with invalid refresh token: {}", e.getMessage());
         }
     }
 
