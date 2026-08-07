@@ -48,3 +48,27 @@ logging:
     root: INFO
     com.jurong.aicenter: DEBUG
     com.baomidou.mybatisplus: WARN
+
+# ============================================================
+# LLM 配置（画布文本润色 / Agent 对话共用）
+# ============================================================
+llm:
+  model: deepseek-v4-flash       # 模型名（NewAPI /v1/models 返回）
+  max-tokens: 2048                # 最大输出 token
+  system-prompt: |
+    你是一个专业的文案润色师。请保持核心信息和意图不变，改善表达使文字更有感染力，适合用于电商详情页、社交媒体等场景。输出纯文本，不要使用 markdown 格式。
+  image-poll-timeout-sec: 600    # ComfyUI text-to-image 超时（10 分钟）
+  video-poll-timeout-sec: 1800   # NewAPI 视频生成超时（30 分钟）
+
+# 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
+canvas:
+  workflows-dir: D:/ymWork/JurongAICenter/workflows/
+  # 画布节点的默认模型参数（最便宜档位，节省测试费用）
+  defaults:
+    image-model: gpt-image-2-1k
+    image-size: 1024x1024    # ComfyUI 最小可用尺寸（512 不被节点接受）
+    image-quality: low        # 最低质量（节省点数）
+    video-model: doubao-seedance-2.0
+    video-duration: 4         # 秒，最小
+    video-resolution: 480P     # 最小分辨率
+    video-enable-prompt-optimize: true

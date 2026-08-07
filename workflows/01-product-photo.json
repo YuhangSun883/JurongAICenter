@@ -3,7 +3,9 @@
     "class_type": "JurongTextToImage",
     "inputs": {
       "prompt": "{{prompt}}",
-      "size": "1024x1024"
+      "size": "1024x1024",
+      "model": "gpt-image-2-1k",
+      "negative_prompt": ""
     }
   },
   "2": {

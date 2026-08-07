@@ -63,8 +63,18 @@ public class ComfyUIClient {
             .map(this::extractPromptIdOrThrow)
             .onErrorMap(e -> {
                 if (e instanceof BusinessException) return e;
-                log.error("ComfyUI /prompt failed: {}", e.getMessage());
-                return new BusinessException(ErrorCode.COMFYUI_UNREACHABLE, e.getMessage());
+                // 4xx 错误：抓 response body 以诊断为什么 ComfyUI 拒绝
+                String detail = e.getMessage();
+                if (e instanceof org.springframework.web.reactive.function.client.WebClientResponseException) {
+                    org.springframework.web.reactive.function.client.WebClientResponseException wcre =
+                        (org.springframework.web.reactive.function.client.WebClientResponseException) e;
+                    String respBody = wcre.getResponseBodyAsString();
+                    log.error("ComfyUI /prompt 拒绝 ({}): body={}", wcre.getStatusCode(), respBody);
+                    detail = String.format("%s | body: %s", wcre.getStatusCode(), respBody);
+                } else {
+                    log.error("ComfyUI /prompt failed: {}", e.getMessage());
+                }
+                return new BusinessException(ErrorCode.COMFYUI_REJECTED, detail);
             })
             .block();
     }

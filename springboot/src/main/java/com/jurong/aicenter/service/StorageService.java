@@ -28,6 +28,16 @@ public interface StorageService {
                       InputStream input, String contentType);
 
     /**
+     * 自定义 objectKey 上传（用于非 (userId, jobId, filename) 标准路径的场景，
+     * 例如画布节点异步任务用 UUID 字符串做 key）
+     * @param objectKey  完整对象 key（如 "canvas/{taskId}/{filename}"）
+     * @param input      文件输入流
+     * @param contentType MIME type
+     * @return 公开可访问的 URL
+     */
+    String uploadObject(String objectKey, InputStream input, String contentType);
+
+    /**
      * 删除文件
      */
     void deleteFile(String objectKey);

@@ -56,6 +56,17 @@ export async function generateNode(req: GenerateCanvasNodeRequest): Promise<Gene
   };
 }
 
+/** Mock 轮询：总是返回 success */
+export async function getTask(_taskId: string): Promise<GenerateCanvasNodeResponse> {
+  return {
+    taskId: _taskId,
+    nodeId: '',
+    status: 'success',
+    text: '这里是 mock 的轮询响应。',
+    creditsEstimated: 0.2,
+  };
+}
+
 function defaultTitle(type: CreateCanvasNodeRequest['type']) {
   const titles = {
     text: '文本节点',

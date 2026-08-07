@@ -50,6 +50,22 @@ public class StorageServiceImpl implements StorageService {
     }
 
     @Override
+    public String uploadObject(String objectKey, InputStream input, String contentType) {
+        try {
+            minioClient.putObject(PutObjectArgs.builder()
+                .bucket(bucket)
+                .object(objectKey)
+                .stream(input, -1, 10 * 1024 * 1024)
+                .contentType(contentType)
+                .build());
+            return getPresignedUrl(objectKey, 24);
+        } catch (Exception e) {
+            log.error("MinIO uploadObject failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Upload failed: " + e.getMessage());
+        }
+    }
+
+    @Override
     public void deleteFile(String objectKey) {
         try {
             minioClient.removeObject(RemoveObjectArgs.builder()
