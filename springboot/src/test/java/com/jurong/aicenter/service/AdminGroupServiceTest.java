@@ -41,7 +41,7 @@ class AdminGroupServiceTest {
 
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.createGroup(req, 1L));
-        assertEquals(ErrorCode.GROUP_NAME_DUPLICATE, ex.getErrorCode());
+        assertEquals(ErrorCode.GROUP_NAME_DUPLICATE, ex.getCode());
         verify(adminAuditService, never()).log(any(), any(), any(), any(), any(), any());
     }
 
@@ -55,7 +55,7 @@ class AdminGroupServiceTest {
 
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.deleteGroup(1L, 99L));
-        assertEquals(ErrorCode.GROUP_IS_DEFAULT_CANNOT_DELETE, ex.getErrorCode());
+        assertEquals(ErrorCode.GROUP_IS_DEFAULT_CANNOT_DELETE, ex.getCode());
         verify(userGroupRepository, never()).deleteById(anyLong());
     }
 
@@ -87,7 +87,7 @@ class AdminGroupServiceTest {
 
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.addMember(2L, 5L, 1L));
-        assertEquals(ErrorCode.USER_ALREADY_IN_GROUP, ex.getErrorCode());
+        assertEquals(ErrorCode.USER_ALREADY_IN_GROUP, ex.getCode());
     }
 
     @Test
@@ -101,6 +101,6 @@ class AdminGroupServiceTest {
 
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.removeMember(2L, 5L, 1L));
-        assertEquals(ErrorCode.USER_NOT_IN_GROUP, ex.getErrorCode());
+        assertEquals(ErrorCode.USER_NOT_IN_GROUP, ex.getCode());
     }
 }

@@ -1,8 +1,18 @@
+// 媒体资产类型定义（前后端共用契约）
 // 媒体（素材库 / 资产库 / 上传）
 
-export type MediaType = 'image' | 'video' | 'audio';
-export type MediaSource = 'uploaded' | 'ai-generated';
-export type MediaCategory = 'image' | 'video' | 'audio';
+export interface MediaLibrary {
+  id: number;
+  name: string;
+  /** system-uploaded / system-ai / custom */
+  type: string;
+  iconKey: string;
+  description?: string;
+  sortOrder: number;
+  assetCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
 
 /** system-uploaded / system-ai / custom */
 export type LibraryType = 'system-uploaded' | 'system-ai' | 'custom';
@@ -82,6 +92,15 @@ export interface RoleCategory {
   label: string;
 }
 
+export interface MediaRole {
+  id: number;
+  name: string;
+  category: string;
+  imageUrl: string;
+  description?: string;
+  tags?: string[];
+  createdAt: number;
+}
 /** 角色库列表查询（保留旧字段，向后兼容） */
 export interface RoleListQuery {
   category?: string;

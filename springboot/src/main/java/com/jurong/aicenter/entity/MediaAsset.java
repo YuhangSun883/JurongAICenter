@@ -9,6 +9,14 @@ import lombok.Data;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
+/**
+ * 媒体素材资产
+ *
+ * <p>对应 V8 migration: media_assets
+ *
+ * <p>每个素材归属于一个 {@link MediaLibrary}。
+ * 字段名跟前端 MediaPickerDialog 用的 PickedMedia 保持一致。
+ */
 @Data
 @TableName("media_assets")
 public class MediaAsset {

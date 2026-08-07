@@ -1,7 +1,6 @@
-// 业务侧统一入口
-import { USE_MOCK } from './config';
+// 媒体资产业务侧统一入口
+// （不再支持 mock,统一走真实后端）
 import * as real from './media.real';
-import * as mock from './media.mock';
 
 export const mediaApi = {
   // 资产库

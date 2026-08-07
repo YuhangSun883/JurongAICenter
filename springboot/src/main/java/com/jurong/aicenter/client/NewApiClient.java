@@ -5,7 +5,11 @@ import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.MediaType;
+import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
@@ -149,7 +153,9 @@ public class NewApiClient {
                 .bodyValue(body)
                 .retrieve()
                 .bodyToMono(JsonNode.class)
-                .timeout(Duration.ofSeconds(60))
+                // LLM 润色在 aicoming 队列里可能会等很久,60s 太少
+                // 生产中会出现 "Did not observe any item within 60000ms" 导致文本节点失败
+                .timeout(Duration.ofSeconds(180))
                 .onErrorMap(WebClientResponseException.class, e -> {
                     log.error("NewAPI /v1/chat/completions failed: {} {}",
                         e.getStatusCode(), e.getResponseBodyAsString());
@@ -179,6 +185,130 @@ public class NewApiClient {
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI chatCompletion failed: {}", e.getMessage());
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    /**
+     * 提交 NewAPI 视频生成任务（图生视频 / 文生视频均可用）
+     * 调用链：节点 → NewAPI → aicoming.top
+     *
+     * 关键坑（已踩）：
+     *   - body.prompt 必须顶层（aicoming 强制要求）
+     *   - input_reference 支持多张（同名 multipart part）
+     *   - duration 是字符串 "4" 不是 int
+     *   - aicoming-video-proxy 要求至少一个 multipart file，文生视频也要传占位
+     *
+     * @param prompt         用户输入提示词
+     * @param imageBytes     上游图片字节（文生视频时传 null，内部用占位图）
+     * @param imageFilename  文件名（aicoming 用来识别格式）
+     * @param imageMime      MIME 类型，如 image/png
+     * @param duration       视频时长（秒）
+     * @param resolution     分辨率，如 480P
+     * @return               NewAPI 返回的 task_id
+     */
+    public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
+                              String imageMime, int duration, String resolution) {
+        return submitVideo(prompt, imageBytes, imageFilename, imageMime, duration, resolution, null);
+    }
+
+    /**
+     * 图生视频：调 NewAPI /v1/videos（走 aicoming-video-proxy）
+     *
+     * 必填字段（从 jurong-api-nodes/api_client.py 确认，跟能跑通的 Python 版本一致）：
+     *   - model = "doubao-seedance-2.0"（唯一实测能处理 image ref 的模型）
+     *   - prompt （顶层）
+     *   - duration 字符串（如 "4"）
+     *   - resolution "480P" / "720p" / "1080p" / "4k"
+     *   - input_reference 第一帧图（multipart file）
+     *
+     * 注意：**不传 ratio 和 watermark**。Python 参考版本没这俩字段。
+     * 我们之前多塞了可能让 aicoming 误判（已改回去）。
+     */
+    public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
+                              String imageMime, int duration, String resolution, String ratio) {
+        try {
+            MultipartBodyBuilder builder = new MultipartBodyBuilder();
+            builder.part("model", "doubao-seedance-2.0");
+            builder.part("prompt", prompt);
+            builder.part("duration", String.valueOf(duration));
+            builder.part("resolution", resolution);
+            // ratio / watermark 不传，参考能跑通的 Python api_client.py
+
+            if (imageBytes != null && imageBytes.length > 0) {
+                // 图生视频：传上游图片
+                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
+                final String mime = imageMime != null ? imageMime : "image/png";
+                builder.part("input_reference",
+                    new ByteArrayResource(imageBytes) {
+                        @Override
+                        public String getFilename() { return fname; }
+                    },
+                    MediaType.parseMediaType(mime));
+            } else {
+                // 文生视频：aicoming 也要求一个 file 字段，传 16x16 透明 PNG 占位
+                final String placeholderName = "_placeholder.png";
+                builder.part("input_reference",
+                    new ByteArrayResource(DUMMY_PNG_BYTES) {
+                        @Override
+                        public String getFilename() { return placeholderName; }
+                    },
+                    MediaType.IMAGE_PNG);
+            }
+
+            JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .body(BodyInserters.fromMultipartData(builder.build()))
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(Duration.ofSeconds(600))
+                .onErrorMap(WebClientResponseException.class, e -> {
+                    String body = e.getResponseBodyAsString();
+                    log.error("NewAPI /v1/videos failed: {} body={}", e.getStatusCode(), body);
+                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "视频任务提交失败: " + e.getStatusCode() + " | " + body);
+                })
+                .block();
+
+            if (response == null) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 视频提交返回空");
+            }
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
+            if (taskId.isEmpty()) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI 响应里没找到 task_id: " + response);
+            }
+            log.info("NewAPI video task submitted: {} (image={}, size={}B, duration={}s, resolution={})",
+                taskId,
+                imageBytes != null ? imageFilename : "placeholder",
+                imageBytes != null ? imageBytes.length : 0,
+                duration, resolution);
+            return taskId;
+        } catch (Exception e) {
+            if (e instanceof BusinessException) throw e;
+            log.error("NewAPI submitVideo failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    // 16x16 透明 PNG 占位图（文生视频时 aicoming-video-proxy 强制要求至少一个 file 字段）
+    // 用 ImageIO 动态生成，避免手敲 hex / 拷 Python 语法错误
+    private static final byte[] DUMMY_PNG_BYTES = createPlaceholderPng();
+
+    private static byte[] createPlaceholderPng() {
+        try {
+            // BufferedImage 初始为全透明(0,0,0,0)，Aicoming 不会在意图片内容
+            java.awt.image.BufferedImage img = new java.awt.image.BufferedImage(
+                16, 16, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            javax.imageio.ImageIO.write(img, "png", baos);
+            byte[] bytes = baos.toByteArray();
+            log.info("Generated placeholder PNG: {} bytes", bytes.length);
+            return bytes;
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Failed to generate placeholder PNG bytes", e);
         }
     }
 
