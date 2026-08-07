@@ -241,8 +241,21 @@ public class ComfyUIClient {
             .retrieve()
             .bodyToMono(JsonNode.class)
             .onErrorMap(e -> {
-                log.error("ComfyUI /upload/image failed: {}", e.getMessage());
-                return new BusinessException(ErrorCode.COMFYUI_UNREACHABLE, e.getMessage());
+                // 关键:把 ComfyUI 响应 body 抠出来,否则 500 只能看到 "500 Internal Server Error"
+                String detail = e.getMessage();
+                if (e instanceof WebClientResponseException wcre) {
+                    String respBody = wcre.getResponseBodyAsString();
+                    log.error("ComfyUI /upload/image FAILED: status={}, body={}",
+                              wcre.getStatusCode(), respBody);
+                    detail = String.format("%s | body: %s | filename: %s | size: %d bytes",
+                                           wcre.getStatusCode(),
+                                           respBody == null ? "(empty)" : respBody,
+                                           filename, data.length);
+                } else {
+                    log.error("ComfyUI /upload/image failed: filename={}, size={}, err={}",
+                              filename, data.length, e.getMessage());
+                }
+                return new BusinessException(ErrorCode.COMFYUI_UNREACHABLE, detail);
             })
             .block();
 

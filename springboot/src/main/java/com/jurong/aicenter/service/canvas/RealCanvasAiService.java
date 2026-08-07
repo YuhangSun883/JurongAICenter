@@ -113,7 +113,19 @@ public class RealCanvasAiService implements CanvasAiService {
             return upstreamContent;
         }
 
-        // 两者都有 → LLM 智能合并
+        // 用户输入太短（<20字）→ 调 LLM 不划算，直接拼接
+        // 原因：用户只填关键词（如"高端手表"）时，上游文案已经足够描述产品，
+        //       LLM 合并反而多 1 次调用、30-60秒延迟，偶尔还会 180s 超时
+        // 阈值 20 字符经验值：低于这个长度一般是"补充关键词"，不需要智能合并
+        final int LLM_MERGE_MIN_USER_LEN = 20;
+        if (trimmedUser.length() < LLM_MERGE_MIN_USER_LEN) {
+            String concat = trimmedUser + ", " + trimmedUp;
+            log.info("Canvas mergePrompts: user prompt too short ({}<{}), skip LLM, concat: {}",
+                     trimmedUser.length(), LLM_MERGE_MIN_USER_LEN, concat);
+            return concat;
+        }
+
+        // 两者都有且用户输入足够长 → LLM 智能合并
         String mergeSystemPrompt = "你是 AI 创作提示词工程师。请基于【用户输入】（主）和【上游润色文案】（参考），生成适合视频/图片生成的最终详细描述。\n\n" +
             "规则：\n" +
             "1. **以用户输入为主**：用户指定的具体细节（颜色、动作、天气、场景、角色特征等）优先级最高\n" +
@@ -190,22 +202,133 @@ public class RealCanvasAiService implements CanvasAiService {
 
     @Override
     public String generateVideo(String prompt, String imageUrl, String upstreamContent) {
-        // 根据 imageUrl 是否为空选择 workflow：空则走纯文本 video，不空则走 image-to-video
-        boolean isTextToVideo = (imageUrl == null || imageUrl.isBlank());
+        // 分流：
+        //   - 有上游图片 → 走 NewAPI（图生视频）
+        //     原因：ComfyUI 的 /upload/image 端点不稳定（500 Server got itself in trouble），
+        //     且 NewAPI 本来就是图生视频的实际执行者，多绕一层 ComfyUI 没意义
+        //   - 无上游图片 → 走 ComfyUI workflow 02（纯文生视频，昨实验证可用）
+        if (imageUrl == null || imageUrl.isBlank()) {
+            return generateVideoViaComfyUI(prompt, null, upstreamContent);
+        }
+        return generateVideoViaNewApi(prompt, imageUrl, upstreamContent);
+    }
+
+    /**
+     * 图生视频：直接调 NewAPI /v1/videos，绕开 ComfyUI
+     * 调用链：MinIO → 字节 → NewAPI → aicoming.top 视频模型 → URL → 下载 → MinIO
+     */
+    private String generateVideoViaNewApi(String prompt, String imageUrl, String upstreamContent) {
+        // 1. 智能合并 prompt
+        String finalPrompt = mergePrompts(prompt, upstreamContent);
+
+        // 兑底：图生视频必须有 prompt（NewAPI 400 会拒）
+        // 关键：仿照 jurong-api-nodes/image_to_video.py 的 _enhance_prompt
+        // 自动在 prompt 末尾追加 CRITICAL 后缀，强制锁定参考图主体
+        if (finalPrompt == null || finalPrompt.trim().isEmpty()) {
+            // 没输入：默认走一个轻描述，后缀会接 CRITICAL
+            finalPrompt = "Animate this image with subtle, natural motion. Cinematic, smooth camera movement.";
+        }
+        // 无论是默认还是用户输入，都加 CRITICAL 后缀
+        finalPrompt = enhanceVideoPrompt(finalPrompt);
+
+        // 2. 从 MinIO 下载上游图片字节
+        byte[] imageBytes;
+        String imageFilename;
+        String imageMime;
+        try (InputStream is = new URI(imageUrl).toURL().openStream()) {
+            byte[] rawBytes = is.readAllBytes();
+            // 去掉 presigned URL 的 query string，取纯文件名
+            String fullName = imageUrl.contains("/")
+                ? imageUrl.substring(imageUrl.lastIndexOf('/') + 1)
+                : "canvas_input.png";
+            String originalName = fullName.contains("?")
+                ? fullName.substring(0, fullName.indexOf('?'))
+                : fullName;
+            imageFilename = originalName;
+            String originalMime = inferContentType(originalName, "image");
+
+            // 关键修复：aicoming-video-proxy 只接受 JPEG 做 image ref，PNG 被静默忽略
+            // 验证：测试 README 里 input_reference 示例就是 filename="source.jpg" + image/jpeg
+            // 我们强制转成 JPEG，文件大小通常还更小
+            if (originalMime != null && originalMime.toLowerCase().contains("png")) {
+                try {
+                    java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(rawBytes);
+                    java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(bais);
+                    if (img != null) {
+                        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                        javax.imageio.ImageIO.write(img, "jpg", baos);
+                        imageBytes = baos.toByteArray();
+                        imageFilename = originalName.replaceAll("\\.png$", ".jpg");
+                        imageMime = "image/jpeg";
+                        log.info("Canvas video (NewAPI) converted PNG→JPEG: {}B → {}B, filename={}",
+                                 rawBytes.length, imageBytes.length, imageFilename);
+                    } else {
+                        imageBytes = rawBytes;
+                        imageMime = originalMime;
+                    }
+                } catch (Exception imgErr) {
+                    log.warn("Canvas video (NewAPI) PNG→JPEG conversion failed, using raw bytes: {}",
+                             imgErr.getMessage());
+                    imageBytes = rawBytes;
+                    imageMime = originalMime;
+                }
+            } else {
+                imageBytes = rawBytes;
+                imageMime = originalMime;
+            }
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                "下载上游图片失败: " + e.getMessage());
+        }
+        log.info("Canvas video (NewAPI) input: imageBytes={}B, filename={}, mime={}, prompt={}",
+            imageBytes.length, imageFilename, imageMime, finalPrompt.substring(0, Math.min(60, finalPrompt.length())));
+
+        // 3. 提交 NewAPI 视频任务（图生视频）
+        // 硬编码 4 秒 / 480P，后续可以从 req.getSettings() 读用户设置
+        String taskId = newApiClient.submitVideo(
+            finalPrompt, imageBytes, imageFilename, imageMime, 4, "480P");
+
+        // 4. 轮询等结果
+        JsonNode pollResult = newApiClient.waitForVideo(taskId, videoPollTimeoutSec);
+        log.info("Canvas video (NewAPI) taskId={} completed: {}", taskId, pollResult);
+
+        // 5. 提取视频 URL
+        String videoUrl = newApiClient.extractVideoUrl(pollResult);
+        if (videoUrl == null || videoUrl.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_VIDEO_URL_MISSING,
+                "NewAPI 响应中未找到视频 URL: " + pollResult);
+        }
+
+        // 6. 下载视频 → 上传 MinIO
+        try (InputStream is = new URI(videoUrl).toURL().openStream()) {
+            String ext = "mp4";
+            if (videoUrl.contains(".mov")) ext = "mov";
+            else if (videoUrl.contains(".webm")) ext = "webm";
+            String objectKey = STORAGE_PREFIX + "/" + taskId + "/video." + ext;
+            String uploaded = storageService.uploadObject(objectKey, is, "video/" + ext);
+            log.info("Canvas video (NewAPI) → MinIO: taskId={}, url={}", taskId, uploaded);
+            return uploaded;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                "视频下载/上传失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 文生视频：走 ComfyUI workflow 02（已验证可用）
+     * imageFilename 为 null 时走纯文本，否则是上游图片（上传到 ComfyUI input 后的名字）
+     */
+    private String generateVideoViaComfyUI(String prompt, String imageFilename, String upstreamContent) {
+        boolean isTextToVideo = (imageFilename == null);
         String template;
         String nodeOutputKey;
-        String imageFilename = null;
 
         if (isTextToVideo) {
-            // 纯文本生成视频：workflow 02 (JurongTextToVideoV2)，输出节点是 "1"
             template = readWorkflowTemplate("02-text-to-video.json");
             nodeOutputKey = "1";
         } else {
-            // 图片转视频：workflow 03 (LoadImage → JurongImageToVideo)，输出节点是 "2"
             template = readWorkflowTemplate("03-image-to-video.json");
             nodeOutputKey = "2";
-            // 下载上游图片 + 上传到 ComfyUI input 目录
-            imageFilename = uploadImageToComfyUiInput(imageUrl);
         }
 
         // 智能合并：用户输入为主，上游文案作为风格参考；冲突时以用户为准
@@ -227,7 +350,7 @@ public class RealCanvasAiService implements CanvasAiService {
         }
 
         String promptId = comfyUIClient.submit(workflow);
-        log.info("Canvas video workflow submitted: promptId={}, mode={}, imageFilename={}",
+        log.info("Canvas video (ComfyUI) workflow submitted: promptId={}, mode={}, imageFilename={}",
             promptId, isTextToVideo ? "text-to-video" : "image-to-video", imageFilename);
 
         // 轮询 history
@@ -262,14 +385,13 @@ public class RealCanvasAiService implements CanvasAiService {
         }
 
         if (url == null) {
-            // dump 整个 outNode 到日志，方便调试
             log.error("ComfyUI video outNode[{}] dump: {}", nodeOutputKey,
                 outNode == null ? "null" : outNode.toString());
             throw new BusinessException(ErrorCode.COMFYUI_REJECTED,
                 nodeOutputKey + " 节点 outputs 既无 video_url/video_path 也无 newapi_task_id");
         }
 
-        log.info("Canvas video generated: promptId={}, url={}", promptId, url);
+        log.info("Canvas video (ComfyUI) generated: promptId={}, url={}", promptId, url);
         return url;
     }
 
@@ -475,13 +597,22 @@ public class RealCanvasAiService implements CanvasAiService {
         return null;
     }
 
-    /** 把上游图片 URL 下载下来 → 上传到 ComfyUI input 目录 → 返回 ComfyUI 给的 filename */
+    /** 把上游图片 URL 下载下来 → 上传到 ComfyUI input 目录 → 返回 ComfyUI 给的 filename
+     *
+     * 注意：filename 只能取纯文件名，不能带 presigned URL 的 query string，
+     * 否则 ComfyUI 写入文件时会报 OSError: [Errno 36] File name too long
+     * (Linux 文件名限制 255 字节，presigned URL 通常 300+ 字节)
+     */
     private String uploadImageToComfyUiInput(String imageUrl) {
         try (InputStream is = new URI(imageUrl).toURL().openStream()) {
             byte[] data = is.readAllBytes();
-            String originalName = imageUrl.contains("/")
+            // 从 URL 末尾取文件名, 切掉 ? 后面的 query string
+            String fullName = imageUrl.contains("/")
                 ? imageUrl.substring(imageUrl.lastIndexOf('/') + 1)
                 : "canvas_input_" + System.currentTimeMillis();
+            String originalName = fullName.contains("?")
+                ? fullName.substring(0, fullName.indexOf('?'))
+                : fullName;
             String mime = inferContentType(originalName, "image");
             String comfyFilename = comfyUIClient.uploadImage(data, originalName, mime);
             log.info("Uploaded image to ComfyUI input: url={} → filename={}", imageUrl, comfyFilename);
@@ -559,5 +690,48 @@ public class RealCanvasAiService implements CanvasAiService {
         // 3. 兜底：返回整条 entry（限制 800 字）
         String json = entry.toString();
         return "ComfyUI workflow error: " + (json.length() > 800 ? json.substring(0, 800) + "..." : json);
+    }
+
+    /**
+     * 图生视频 prompt 增强器（仿 jurong-api-nodes/image_to_video.py 的 _enhance_prompt）
+     *
+     * 关键约束：模型必须复刻参考图里的人物/物体外观，
+     * 禁止改变性别/年龄/服装/发型/体型/肤色，
+     * 只动画作和镜头运动。
+     *
+     * 如果用户 prompt 里已经包含"保持原图/preserve/lock"等关键词，就跳过
+     * 避免重复强调。
+     */
+    private String enhanceVideoPrompt(String prompt) {
+        if (prompt == null) prompt = "";
+        String lower = prompt.toLowerCase();
+        String[] existingKeywords = {
+            "same as reference", "保持原图", "保持", "preserve",
+            "consistent", "exact same", "identical",
+            "same person", "same face", "maintain",
+            "锁定", "不要改变", "do not change",
+        };
+        for (String k : existingKeywords) {
+            if (lower.contains(k)) {
+                return prompt;
+            }
+        }
+
+        String enhancer =
+            "CRITICAL: The subject(s) shown in the reference image MUST appear "
+            + "EXACTLY as in the reference \u2014 same face, same gender, same age, "
+            + "same hairstyle and hair color, same clothing, same body type, "
+            + "same skin tone, same accessories. Do NOT replace, swap, gender-swap, "
+            + "or alter the subject's identity in any way. "
+            + "Only animate the actions, expressions, and camera movement described above. "
+            + "Preserve the exact composition, color palette, lighting, and visual style "
+            + "of the reference image throughout the entire video. "
+            + "Lock the first frame as the visual anchor.";
+        String trimmed = prompt.trim();
+        // 去掉末尾的句号（如果有），避免 double punctuation
+        while (trimmed.endsWith(".") || trimmed.endsWith("\u3002")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        }
+        return trimmed + ". " + enhancer;
     }
 }

@@ -1,53 +1,67 @@
-// 媒体（素材库 / 角色库 / 上传）
+// 媒体资产类型定义（前后端共用契约）
 
-export type MediaType = 'image' | 'video' | 'audio';
-export type MediaSource = 'uploaded' | 'ai-generated';
-export type MediaCategory = 'image' | 'video' | 'audio';
-
-export interface MediaItem {
-  id: string;
-  type: MediaType;
-  source: MediaSource;
-  url: string;
+export interface MediaLibrary {
+  id: number;
   name: string;
-  size?: number;
+  /** system-uploaded / system-ai / custom */
+  type: string;
+  iconKey: string;
+  description?: string;
+  sortOrder: number;
+  assetCount: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MediaAsset {
+  id: number;
+  libraryId: number | null;
+  /** image / video / audio */
+  type: string;
+  /** uploaded / ai-generated */
+  source: string;
+  name: string;
+  mimeType?: string;
+  sizeBytes?: number;
   width?: number;
   height?: number;
+  durationSec?: number;
+  /** 公网 URL（前端 <img src=...>） */
+  url: string;
+  sourceTool?: string;
+  sourceTaskId?: string;
   createdAt: number;
 }
 
-/** 列表查询 */
-export interface MediaListQuery {
-  category?: MediaCategory;
-  source?: MediaSource | 'all';
-  keyword?: string;
-  page?: number;
-  pageSize?: number;
+export interface MediaAssetListResponse {
+  items: MediaAsset[];
+  total: number;
+  page: number;
+  pageSize: number;
 }
 
-/** 上传请求 */
-export interface MediaUploadRequest {
-  file: File;
-  type: MediaType;
-  /** 角色库分类（仅当 category=role 时使用） */
-  roleCategory?: string;
+export interface UploadMediaResponse {
+  id: number;
+  libraryId: number | null;
+  type: string;
+  source: string;
+  name: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  url: string;
 }
 
-/** 上传响应 */
-export interface MediaUploadResponse {
-  item: MediaItem;
-}
-
-/** 角色分类 */
-export interface RoleCategory {
+export interface MediaRoleCategory {
   key: string;
   label: string;
 }
 
-/** 角色库列表查询 */
-export interface RoleListQuery {
-  category?: string;
-  keyword?: string;
-  page?: number;
-  pageSize?: number;
+export interface MediaRole {
+  id: number;
+  name: string;
+  category: string;
+  imageUrl: string;
+  description?: string;
+  tags?: string[];
+  createdAt: number;
 }

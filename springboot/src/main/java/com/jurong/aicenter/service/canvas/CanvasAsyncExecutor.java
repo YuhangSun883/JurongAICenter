@@ -73,6 +73,13 @@ public class CanvasAsyncExecutor {
                 case "image":
                     // 生图：上游若有文本节点，把它的 content 作为 upstreamContent
                     String upstreamTextForImage = pickUpstreamText(upstreamNodes);
+                    // 关键：润色后文案可能几百字,ComfyUI 处理超长 prompt 会超时
+                    // 截断到 500 字符（优先在句号/逗号/空格处断开）
+                    if (upstreamTextForImage != null && upstreamTextForImage.length() > 500) {
+                        log.info("Truncating long upstream text for image prompt: {} -> 500 chars",
+                                 upstreamTextForImage.length());
+                        upstreamTextForImage = truncateAtBoundary(upstreamTextForImage, 500);
+                    }
                     url = aiService.generateImage(req.getPrompt(), upstreamTextForImage);
                     task.setResultUrl(url);
                     node.setResultUrl(url);
@@ -88,6 +95,12 @@ public class CanvasAsyncExecutor {
                         }
                     }
                     String upstreamTextForVideo = pickUpstreamText(upstreamNodes);
+                    // 同样：上游润色文案过长会拖慢 NewAPI/aicoming，截断到 800 字符
+                    if (upstreamTextForVideo != null && upstreamTextForVideo.length() > 800) {
+                        log.info("Truncating long upstream text for video prompt: {} -> 800 chars",
+                                 upstreamTextForVideo.length());
+                        upstreamTextForVideo = truncateAtBoundary(upstreamTextForVideo, 800);
+                    }
                     if (upstreamTextForVideo != null && !upstreamTextForVideo.isBlank()) {
                         String preview = upstreamTextForVideo.length() > 150
                             ? upstreamTextForVideo.substring(0, 150) + "..."
@@ -195,5 +208,35 @@ public class CanvasAsyncExecutor {
             }
         }
         return null;
+    }
+
+    /**
+     * 把长文本截断到适合 prompt 的长度。
+     * 优先在中英文句子边界处断开（。!?.；,， ），避免在单词/字中间硬切。
+     * 如果找不到合适的边界点，直接在 maxLen 处硬切并加 "..."。
+     *
+     * 使用场景：润色后的营销文案可能几百字，直接丢给 ComfyUI / NewAPI 会超时。
+     */
+    private String truncateAtBoundary(String text, int maxLen) {
+        if (text == null) return null;
+        String trimmed = text.trim();
+        if (trimmed.length() <= maxLen) return trimmed;
+
+        String cut = trimmed.substring(0, maxLen);
+        // 优先在句号/感叹号/问号/分号/逗号/空格处断开
+        // 顺序很重要：先找高优先级的边界（句号类），再找低优先级的（逗号/空格）
+        char[] breakers = {'。', '!', '?', ';', '；', '.', ',', '，', ' ', '、'};
+        int bestBreak = -1;
+        for (char c : breakers) {
+            int idx = cut.lastIndexOf(c);
+            if (idx > maxLen * 0.5) {  // 至少在中间以后才断（避免前面断太多）
+                bestBreak = idx;
+                break;
+            }
+        }
+        if (bestBreak > 0) {
+            return cut.substring(0, bestBreak + 1) + "...";
+        }
+        return cut + "...";
     }
 }

@@ -2,10 +2,10 @@
 
 import { useState, type DragEvent } from 'react';
 import { Plus, ArrowUp } from 'lucide-react';
-import { nanoid } from 'nanoid';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
+import { mediaApi } from '@/api/media';
 import { cn } from '@/lib/utils';
 
 interface ChatComposerProps {
@@ -40,27 +40,47 @@ export function ChatComposer({
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const remainingPickSlots = Math.max(0, AGENT_MAX_REFS - picked.length);
 
-  function handleUploadFiles(files: FileList | null): PickedMedia[] {
+  /** 异步上传到后端。返回本地上传中的占位，实际项在 upload() 解决后由 addMaterials 加进去 */
+  async function handleUploadFiles(files: FileList | null): Promise<PickedMedia[]> {
     if (!files) return [];
-    const existingFingerprints = new Set(materials.map((material) => `${material.name}_${material.size ?? material.url.length}`));
-    const fresh: GlobalMaterial[] = [];
-
+    const existingFingerprints = new Set(
+      materials.map((m) => `${m.name}_${m.size ?? m.url.length}`)
+    );
+    const queued: File[] = [];
     Array.from(files).forEach((file) => {
       const fingerprint = `${file.name}_${file.size}`;
       if (existingFingerprints.has(fingerprint)) return;
       existingFingerprints.add(fingerprint);
-
-      fresh.push({
-        id: nanoid(10),
-        type: file.type.startsWith('video') ? 'video' : file.type.startsWith('audio') ? 'audio' : 'image',
-        url: URL.createObjectURL(file),
-        name: file.name,
-        size: file.size,
-      });
+      queued.push(file);
     });
 
-    addMaterials(fresh);
-    return fresh;
+    //  同步发起上传（并行）
+    const results = await Promise.allSettled(
+      queued.map(async (file) => {
+        const res = await mediaApi.upload(file);
+        const mat: GlobalMaterial = {
+          id: String(res.id),
+          type: (res.type as 'image' | 'video' | 'audio'),
+          url: res.url,
+          name: res.name,
+          size: res.sizeBytes,
+        };
+        addMaterials([mat]);
+        return {
+          id: mat.id,
+          type: mat.type,
+          url: mat.url,
+          name: mat.name,
+        } satisfies PickedMedia;
+      })
+    );
+
+    // 返回成功上传的项（忽略失败的）
+    const picked: PickedMedia[] = [];
+    results.forEach((r) => {
+      if (r.status === 'fulfilled') picked.push(r.value);
+    });
+    return picked;
   }
 
   function onDrop(e: DragEvent) {

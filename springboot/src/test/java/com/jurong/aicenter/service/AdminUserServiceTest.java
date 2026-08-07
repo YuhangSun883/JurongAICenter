@@ -34,8 +34,8 @@ class AdminUserServiceTest {
         // currentAdminId == targetUserId 应被拒
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.updateUserRole(1L, req, 1L));
-        assertEquals(ErrorCode.ADMIN_CANNOT_CHANGE_OWN_ROLE, ex.getErrorCode());
-        verify(userRepository, never()).updateById(any());
+        assertEquals(ErrorCode.ADMIN_CANNOT_CHANGE_OWN_ROLE, ex.getCode());
+        verify(userRepository, never()).updateById(any(User.class));
         verify(adminAuditService, never()).log(any(), any(), any(), any(), any(), any());
     }
 
@@ -45,7 +45,7 @@ class AdminUserServiceTest {
         req.setRole("GOD");
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.updateUserRole(2L, req, 1L));
-        assertEquals(ErrorCode.INVALID_ROLE_VALUE, ex.getErrorCode());
+        assertEquals(ErrorCode.INVALID_ROLE_VALUE, ex.getCode());
     }
 
     @Test
@@ -60,7 +60,7 @@ class AdminUserServiceTest {
 
         when(userRepository.selectById(2L)).thenReturn(target);
         when(userRepository.selectById(1L)).thenReturn(makeUser(1L, "admin@x.com", "ADMIN"));
-        when(userRepository.updateById(any())).thenReturn(1);
+        when(userRepository.updateById(any(User.class))).thenReturn(1);
 
         String newRole = service.updateUserRole(2L, req, 1L);
         assertEquals("ADMIN", newRole);
@@ -75,7 +75,7 @@ class AdminUserServiceTest {
     void updateUserDisabled_CannotDisableSelf() {
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.updateUserDisabled(1L, true, 1L));
-        assertEquals(ErrorCode.ADMIN_CANNOT_DISABLE_SELF, ex.getErrorCode());
+        assertEquals(ErrorCode.ADMIN_CANNOT_DISABLE_SELF, ex.getCode());
     }
 
     @Test
@@ -83,7 +83,7 @@ class AdminUserServiceTest {
         when(userRepository.selectById(2L)).thenReturn(null);
         BusinessException ex = assertThrows(BusinessException.class,
                 () -> service.updateUserDisabled(2L, true, 1L));
-        assertEquals(ErrorCode.USER_NOT_FOUND, ex.getErrorCode());
+        assertEquals(ErrorCode.USER_NOT_FOUND, ex.getCode());
     }
 
     @Test
@@ -94,7 +94,7 @@ class AdminUserServiceTest {
         target.setDisabled(0);
         when(userRepository.selectById(2L)).thenReturn(target);
         when(userRepository.selectById(1L)).thenReturn(makeUser(1L, "a@x.com", "ADMIN"));
-        when(userRepository.updateById(any())).thenReturn(1);
+        when(userRepository.updateById(any(User.class))).thenReturn(1);
 
         Integer newVal = service.updateUserDisabled(2L, true, 1L);
         assertEquals(1, newVal);
