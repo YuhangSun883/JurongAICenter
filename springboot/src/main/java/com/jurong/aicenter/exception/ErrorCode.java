@@ -60,7 +60,18 @@ public enum ErrorCode {
     GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "默认分组的 is_default 不可关闭"),
     USER_ALREADY_IN_GROUP(6007, "用户已在该分组中"),
     USER_NOT_IN_GROUP(6008, "用户不在该分组中"),
-    INVALID_ROLE_VALUE(6009, "角色取值必须是 USER 或 ADMIN");
+    INVALID_ROLE_VALUE(6009, "角色取值必须是 USER 或 ADMIN"),
+
+    // Media (7xxx) — 资产库 / 素材
+    MEDIA_LIBRARY_NAME_DUPLICATE(7001, "资产库名称已存在"),
+    MEDIA_LIBRARY_NOT_FOUND(7002, "资产库不存在"),
+    MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY(7003, "系统默认资产库不可修改或删除"),
+    MEDIA_ASSET_NOT_FOUND(7010, "素材不存在"),
+    MEDIA_ASSET_TYPE_INVALID(7011, "素材类型不支持"),
+    MEDIA_ASSET_NAME_DUPLICATE(7012, "当前库内已存在同名素材"),
+    MEDIA_UPLOAD_FAILED(7020, "文件上传失败"),
+    MEDIA_FILE_TOO_LARGE(7021, "文件超过大小限制"),
+    MEDIA_FILE_EMPTY(7022, "文件为空");
 
     private final int code;
     private final String message;
