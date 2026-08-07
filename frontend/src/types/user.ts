@@ -1,28 +1,21 @@
 // 用户认证（占位）
 
 export interface UserInfo {
-  id: string | number;
+  id: string;
   nickname: string;
   avatar?: string;
   email?: string;
-  role?: 'USER' | 'ADMIN';
 }
 
 export interface LoginRequest {
-  email: string;
-  password: string;
-}
-
-export interface RegisterRequest {
-  email: string;
-  password: string;
-  displayName?: string;
+  account?: string;
+  email?: string;
+  phone?: string;
+  code?: string;
+  password?: string;
 }
 
 export interface LoginResponse {
-  accessToken: string;
-  refreshToken: string;
-  userId: number;
-  email: string;
-  role: 'USER' | 'ADMIN';
+  token: string;
+  user: UserInfo;
 }

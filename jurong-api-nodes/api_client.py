@@ -60,14 +60,21 @@ def check_balance() -> dict:
 
 def generate_image(prompt: str, model: str, size: str,
                    negative_prompt: str = "", n: int = 1,
-                   poll_timeout_sec: int = 600, poll_interval: int = 8) -> str:
+                   poll_timeout_sec: int = 600, poll_interval: int = 8,
+                   **kwargs) -> str:
     """POST /v1/images/generations
     返回第一个结果的 URL。
 
-    已知问题（2026-08-01 实测）：这个 NewAPI（calciumion/new-api:latest）版本
-    对图像任务只回传 {"status":"submitted","task_id":"..."}，没有直接的 url。
-    我们尝试轮询相同路径（实际上 404），所以这里降级为报错提示用户。
+    接受 **kwargs 以兼容 ComfyUI 节点可能传的其他参数（如 quality, style 等），
+    这些参数会被静默忽略，避免 ComfyUI 节点升级后调用失败。
+
+    已知行为（2026-08-01 实测）：NewAPI（calciumion/new-api:latest）对部分图像任务
+    只回传 {"data":[{"task_id":"..."}]}，没有直接的 url，此时走 Case 2 异步轮询分支
+    调用 GET /api/task/{task_id} 拿到最终 url。
     """
+    if kwargs:
+        logger.debug("generate_image ignoring extra kwargs: %s", list(kwargs.keys()))
+
     body = {
         "model": model,
         "prompt": prompt,
@@ -86,30 +93,47 @@ def generate_image(prompt: str, model: str, size: str,
     resp.raise_for_status()
     data = resp.json()
 
-    # Case 1: 同步返回（带 url）
+    # Case 1: 同步返回 —— 优先 url，没有就看 b64_json（OpenAI 两种格式都支持）
     if "data" in data and isinstance(data["data"], list) and data["data"]:
         first = data["data"][0]
-        if isinstance(first, dict) and first.get("url"):
-            logger.info("Generated image sync: %s", first["url"])
-            return first["url"]
+        if isinstance(first, dict):
+            if first.get("url"):
+                logger.info("Generated image sync (url): %s", first["url"])
+                return first["url"]
+            if first.get("b64_json"):
+                logger.info("Generated image sync (b64_json), decoding...")
+                return _save_b64_to_tempfile(first["b64_json"])
 
-    # Case 2: 异步返回（只有 task_id）
+    # Case 2: 异步返回 → 轮询 /api/task/{task_id} 直到拿到 url
     if "data" in data and data["data"] and "task_id" in data["data"][0]:
         task_id = data["data"][0]["task_id"]
-        raise RuntimeError(
-            f"图像生成返回异步任务 {task_id}，但当前 NewAPI 版本不支持图像任务轮询。\n"
-            f"请让管理员：（1）升级 NewAPI 到支持图像任务轮询的版本，或\n"
-            f"（2）给 token 加管理员权限查询 /api/task/{task_id}。"
+        logger.info("Image task %s submitted, polling %s every %ds (timeout %ds)...",
+                    task_id, f"{NEWAPI_BASE_URL}/api/task/{task_id}",
+                    poll_interval, poll_timeout_sec)
+        result = wait_for_image_task(
+            task_id,
+            timeout_sec=poll_timeout_sec,
+            poll_interval=poll_interval,
         )
+        url = _extract_url_from_image_task(result)
+        logger.info("Generated image async: %s", url)
+        return url
 
     raise RuntimeError(f"Unexpected image response: {data}")
 
 
 def edit_image(image_bytes: bytes, prompt: str, model: str, size: str = "1024x1024",
-               poll_timeout_sec: int = 600) -> str:
+               poll_timeout_sec: int = 600, poll_interval: int = 8,
+               **kwargs) -> str:
     """POST /v1/images/edits (multipart)
     image_bytes: 输入图片的 PNG/JPG 字节
+
+    接受 **kwargs 以兼容 ComfyUI 节点可能传的其他参数（如 quality, style 等），
+    这些参数会被静默忽略，避免 ComfyUI 节点升级后调用失败。
     """
+    if kwargs:
+        logger.debug("edit_image ignoring extra kwargs: %s", list(kwargs.keys()))
+
     files = {"image": ("input.png", image_bytes, "image/png")}
     data = {
         "model": model,
@@ -128,16 +152,112 @@ def edit_image(image_bytes: bytes, prompt: str, model: str, size: str = "1024x10
 
     if "data" in data and isinstance(data["data"], list) and data["data"]:
         first = data["data"][0]
-        if isinstance(first, dict) and first.get("url"):
-            logger.info("Edited image sync: %s", first["url"])
-            return first["url"]
+        if isinstance(first, dict):
+            if first.get("url"):
+                logger.info("Edited image sync (url): %s", first["url"])
+                return first["url"]
+            if first.get("b64_json"):
+                logger.info("Edited image sync (b64_json), decoding...")
+                return _save_b64_to_tempfile(first["b64_json"], prefix="jurong_edit")
+        # Case 2: 异步 task_id → 走图像任务轮询（与 text_to_image 对齐）
         if isinstance(first, dict) and first.get("task_id"):
             task_id = first["task_id"]
-            raise RuntimeError(
-                f"图生图返回异步任务 {task_id}，但当前 NewAPI 不支持图像任务轮询。"
+            logger.info("Image edit task %s submitted, polling %s every %ds (timeout %ds)...",
+                        task_id, f"{NEWAPI_BASE_URL}/api/task/{task_id}",
+                        poll_interval, poll_timeout_sec)
+            result = wait_for_image_task(
+                task_id,
+                timeout_sec=poll_timeout_sec,
+                poll_interval=poll_interval,
             )
+            url = _extract_url_from_image_task(result)
+            logger.info("Edited image async: %s", url)
+            return url
 
     raise RuntimeError(f"Unexpected edit image response: {data}")
+
+
+# ============================================================================
+# 图像异步任务轮询（NewAPI 部分版本只回 task_id，需 GET /api/task/{task_id}）
+# ============================================================================
+
+def _extract_url_from_image_task(result: dict) -> str:
+    """从 /api/task/{task_id} 响应里抠出图像 URL —— 兼容多种 NewAPI 形态。
+
+    形态 1: data.url                                (NewAPI 常见，task.data.url)
+    形态 2: data.data[0].url                        (data 里再包一层数组)
+    形态 3: 顶层 url / output_url / image_url 等    (兼容 OpenAI 风格)
+    形态 4: 顶层 data 是数组                        (兼容 NewAPI 包装)
+    """
+    if not isinstance(result, dict):
+        raise RuntimeError(f"Unexpected image task response: {result!r}")
+
+    data_obj = result.get("data")
+
+    # 形态 1 / 2: data 是 dict
+    if isinstance(data_obj, dict):
+        for key in ("url", "output_url", "image_url", "download_url", "file_url"):
+            if data_obj.get(key):
+                return data_obj[key]
+        # 形态 2: data.data[0].url
+        nested = data_obj.get("data")
+        if isinstance(nested, list) and nested:
+            first = nested[0]
+            if isinstance(first, dict) and first.get("url"):
+                return first["url"]
+
+    # 形态 4: 顶层 data 是数组
+    if isinstance(data_obj, list) and data_obj:
+        first = data_obj[0]
+        if isinstance(first, dict):
+            for key in ("url", "output_url", "image_url"):
+                if first.get(key):
+                    return first[key]
+
+    # 形态 3: 顶层 url
+    for key in ("url", "output_url", "image_url", "download_url", "file_url"):
+        if result.get(key):
+            return result[key]
+
+    raise RuntimeError(f"Could not extract image URL from task result: {result}")
+
+
+def poll_image_task(task_id: str) -> dict:
+    """GET /api/task/{task_id} —— 查一次图像异步任务状态。"""
+    resp = requests.get(
+        f"{NEWAPI_BASE_URL}/api/task/{task_id}",
+        headers=_auth_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wait_for_image_task(task_id: str, timeout_sec: int = 600,
+                        poll_interval: int = 8) -> dict:
+    """轮询直到图像异步任务完成或超时。
+
+    完成的返回：{"status": "success", "data": {"url": "..."}, ...}
+    状态值兼容: success/completed/succeeded 与 failed/error/failure/cancelled。
+    """
+    start = time.time()
+    last_status = None
+    while time.time() - start < timeout_sec:
+        result = poll_image_task(task_id)
+        # NewAPI 通常把 status 放在 data.status，也有直接放顶层的
+        data_obj = result.get("data") if isinstance(result.get("data"), dict) else {}
+        status = (
+            data_obj.get("status") or result.get("status") or "unknown"
+        ).lower()
+        if status != last_status:
+            logger.info("Image task %s status: %s", task_id, status)
+            last_status = status
+        if status in ("success", "completed", "succeeded"):
+            return result
+        if status in ("failed", "error", "failure", "cancelled"):
+            raise RuntimeError(f"Image task {task_id} failed: {result}")
+        time.sleep(poll_interval)
+    raise TimeoutError(f"Image task {task_id} did not complete in {timeout_sec}s")
 
 
 # ============================================================================
@@ -295,23 +415,77 @@ def extract_video_url(poll_result: dict) -> str:
 # ============================================================================
 
 def download_bytes(url: str, timeout: int = 300) -> bytes:
+    """下载字节。支持 http(s):// 与 file://（处理 Windows file:///C:/... 盘符）。"""
+    if url.startswith("file://"):
+        from pathlib import Path
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        # 不依赖 url2pathname（Linux 上 urllib.parse 根本没有这个名字，
+        # nturl2path 是 Windows-only 的逻辑——会把 /app/temp/... 转成反斜杠，
+        # 在 Linux 上反而是 bug）。直接手写：unquote + 处理 Windows 盘符。
+        local_path = urllib.parse.unquote(parsed.path)
+        if os.name == "nt" and local_path.startswith("/") and len(local_path) > 2 and local_path[2] == ":":
+            # file:///C:/foo → C:/foo
+            local_path = local_path[1:]
+        return Path(local_path).read_bytes()
     resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.content
 
 
+def _save_b64_to_tempfile(b64_str: str, prefix: str = "jurong_img") -> str:
+    """把 NewAPI 回传的 b64_json 解码后写本地文件，返回 file:// URL。
+
+    优先放 ComfyUI temp 目录（通过 folder_paths 拿），找不到就系统 temp。
+    留作临时中转，下游 image_url_to_tensor 读完就被 GC，无需长留。
+    """
+    import base64
+    import tempfile
+    import uuid
+    from pathlib import Path
+
+    raw = base64.b64decode(b64_str)
+    try:
+        import folder_paths  # ComfyUI 自带
+        out_dir = Path(folder_paths.get_temp_directory())
+    except Exception:
+        out_dir = Path(tempfile.gettempdir())
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fp = out_dir / f"{prefix}_{uuid.uuid4().hex[:8]}.png"
+    fp.write_bytes(raw)
+    file_url = fp.as_uri()  # 自动处理 Windows file:///C:/... 与 POSIX file:///tmp/...
+    logger.info("Saved b64 image to %s (%d bytes)", fp, len(raw))
+    return file_url
+
+
 def image_url_to_tensor(url: str):
     """下载 URL 图片，转成 ComfyUI IMAGE tensor。"""
-    import numpy as np
-    from PIL import Image
-    import io
-    import torch
-
     raw = download_bytes(url)
+    return _bytes_to_tensor(raw)
+
+
+def _bytes_to_tensor(raw: bytes):
+    """图片 bytes → ComfyUI IMAGE tensor（共用底层）。"""
+    import io
+    from PIL import Image
+    import numpy as np
+    import torch
     pil = Image.open(io.BytesIO(raw)).convert("RGB")
     arr = np.array(pil).astype(np.float32) / 255.0  # [H, W, C]
     tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W, C]
     return tensor
+
+
+# 兼容旧名：仓库历史上有节点/工作流直接用 image_bytes_to_tensor 这个名字。
+# 老版本的 text_to_image.py 传的是 URL 字符串，少数魔改版传的是图片 bytes，
+# 这里两种都接，内部走同一条 _bytes_to_tensor 路径。
+def image_bytes_to_tensor(data):
+    """兼容旧名：接受 URL 字符串 或 图片 bytes，统一转成 IMAGE tensor。"""
+    if isinstance(data, (bytes, bytearray)):
+        return _bytes_to_tensor(bytes(data))
+    # 其他全部当 URL 处理（http/https/file://）
+    return image_url_to_tensor(data)
 
 
 def tensor_to_png_bytes(tensor) -> bytes:
