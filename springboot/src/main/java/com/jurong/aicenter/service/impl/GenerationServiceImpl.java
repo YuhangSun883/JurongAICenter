@@ -15,6 +15,7 @@ import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.repository.JobRepository;
 import com.jurong.aicenter.repository.WorkflowRepository;
 import com.jurong.aicenter.service.GenerationService;
+import com.jurong.aicenter.service.MediaService;
 import com.jurong.aicenter.service.StorageService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -51,6 +52,7 @@ public class GenerationServiceImpl implements GenerationService {
     private final WorkflowRepository workflowRepository;
     private final StorageService storageService;
     private final ObjectMapper objectMapper;
+    private final MediaService mediaService; // V8 资产库：AI 完成的素材写入 "AI 生成结果"
 
     /** C3 - RUNNING 任务最大存活时间（视频节点可达 5+ 分钟，给 1h 余量） */
     private static final Duration MAX_RUNNING_DURATION = Duration.ofMinutes(60);
@@ -591,14 +593,25 @@ public class GenerationServiceImpl implements GenerationService {
             if (filename.isEmpty()) continue;
             String subfolder = item.path("subfolder").asText("");
             String type = item.path("type").asText("output");
-            String contentType = item.path("type").asText("");  // ComfyUI 的 type 字段是 output/input/temp，不是 MIME
-            contentType = inferContentType(filename, mediaKind);
+            // ComfyUI 的 type 字段是 output/input/temp，不是 MIME
+            String contentType = inferContentType(filename, mediaKind);
 
             try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, type)) {
                 String url = storageService.uploadFile(
                     job.getUserId(), job.getId(), filename, is, contentType);
                 urls.add(url);
                 log.info("job {} uploaded {} → {}", job.getId(), filename, url);
+
+                // V8 资产库：AI 完成的素材自动写入 "AI 生成结果" 库
+                String objectKey = String.format("ai-platform/%d/%d/%s",
+                    job.getUserId(), job.getId(), filename);
+                try {
+                    mediaService.recordAiGenerated(
+                        job.getUserId(), mediaKind, filename, contentType, 0L,
+                        objectKey, "video", String.valueOf(job.getId()));
+                } catch (Exception e) {
+                    log.warn("recordAiGenerated failed for job {}: {}", job.getId(), e.getMessage());
+                }
             } catch (Exception e) {
                 log.warn("job {} download/upload failed for {}: {}", job.getId(), filename, e.getMessage());
             }

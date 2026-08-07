@@ -4,12 +4,21 @@ import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaLibraryDto;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
 import com.jurong.aicenter.dto.media.UploadMediaResponse;
+import com.jurong.aicenter.dto.PageResult;
+import com.jurong.aicenter.dto.media.BatchDeleteAssetsRequest;
+import com.jurong.aicenter.dto.media.MediaAssetResponse;
+import com.jurong.aicenter.dto.media.MediaListQuery;
+import com.jurong.aicenter.dto.media.MediaUploadResponse;
+import com.jurong.aicenter.dto.media.PatchAssetRequest;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.MediaService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -33,6 +42,18 @@ import java.util.Map;
 @Slf4j
 @RestController
 @RequestMapping("/api/media")
+ * 资产素材 REST API。
+ *
+ * 端点列表：
+ *   GET    /api/media/assets           分页列表（按 userId 隔离）
+ *   GET    /api/media/assets/{id}      素材详情
+ *   POST   /api/media/assets           上传（multipart/form-data，libraryId 可选）
+ *   PATCH  /api/media/assets/{id}      改名
+ *   DELETE /api/media/assets/{id}      删除（连 MinIO）
+ *   POST   /api/media/assets/batch-delete  批量删除
+ */
+@RestController
+@RequestMapping("/api/media/assets")
 @RequiredArgsConstructor
 public class MediaController {
 
@@ -59,6 +80,16 @@ public class MediaController {
 
     @GetMapping("/assets/{id}")
     public MediaAssetDto getAsset(
+    @GetMapping
+    public PageResult<MediaAssetResponse> list(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            MediaListQuery query) {
+        requireUser(user);
+        return mediaService.listAssets(user.id(), query);
+    }
+
+    @GetMapping("/{id}")
+    public MediaAssetResponse get(
             @AuthenticationPrincipal AuthenticatedUser user,
             @PathVariable Long id) {
         requireUser(user);
@@ -98,6 +129,40 @@ public class MediaController {
             return mediaService.listAllRoles();
         }
         return mediaService.listRolesByCategory(category);
+    @PostMapping
+    public MediaUploadResponse upload(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @RequestParam(value = "libraryId", required = false) Long libraryId,
+            @RequestParam("file") MultipartFile file) {
+        requireUser(user);
+        return mediaService.uploadAsset(user.id(), libraryId, file);
+    }
+
+    @PatchMapping("/{id}")
+    public MediaAssetResponse rename(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id,
+            @Valid @RequestBody PatchAssetRequest request) {
+        requireUser(user);
+        return mediaService.renameAsset(user.id(), id, request.getName());
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> delete(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id) {
+        requireUser(user);
+        mediaService.deleteAsset(user.id(), id);
+        return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/batch-delete")
+    public Map<String, Object> batchDelete(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody BatchDeleteAssetsRequest request) {
+        requireUser(user);
+        int deleted = mediaService.batchDeleteAssets(user.id(), request.getIds());
+        return Map.of("deleted", deleted, "requested", request.getIds().size());
     }
 
     private void requireUser(AuthenticatedUser user) {
@@ -105,4 +170,5 @@ public class MediaController {
             throw new BusinessException(ErrorCode.UNAUTHORIZED);
         }
     }
+}
 }

@@ -11,7 +11,7 @@
   - 生产（待部署）：`http://192.140.163.161:18080`
 - **鉴权**：`Authorization: Bearer <accessToken>`（除 `/api/auth/*` 和 `/api/health`）
 - **响应格式**：`{code: int, message: string, data: <T>|null}`
-- **错误码**分段：见 §10
+- **错误码**分段：见 §11
 
 ---
 
@@ -152,6 +152,132 @@
 | GET | `/api/health` | — | `{status: "ok", service: "aicenter-backend", version: "0.1.0"}` | ✅ 已实现 |
 
 > **不是** `/actuator/health`（Spring Boot actuator 端点**未启用**）—— 走自定义 `/api/health`。
+
+---
+
+## 6.5 Media 资产库 / 素材（需 JWT）
+
+> **2026-08-07 落地**（V8 migration + `MediaController` + `MediaLibraryController`）。详见 `frontend/docs/CHANGELOG.md`。
+>
+> 资产库是用户维度的容器，注册时自动建 2 个系统默认库：
+> - **"我的资产"** (`type=system-uploaded`)：装用户上传的素材
+> - **"AI 生成结果"** (`type=system-ai`)：装 AI 生成的素材
+>
+> 用户可建自定义库 (`type=custom`)，可重命名/删除；系统库**不可**重命名/删除。
+> 删除自定义库时**级联删除**库内素材（同时删除 MinIO 对象）。
+
+### 6.5.1 资产库
+
+| 方法 | 路径 | 请求体 | 响应 | 状态 |
+|------|------|--------|------|------|
+| GET    | `/api/media/libraries` | — | `{code, message, data: MediaLibraryResponse[]}` | ✅ 已实现 |
+| POST   | `/api/media/libraries` | `CreateLibraryRequest` | `{code, message, data: MediaLibraryResponse}` | ✅ 已实现 |
+| PATCH  | `/api/media/libraries/{id}` | `RenameLibraryRequest` | `{code, message, data: MediaLibraryResponse}` | ✅ 已实现 |
+| DELETE | `/api/media/libraries/{id}` | — | `{code, message}` | ✅ 已实现 |
+
+```json
+// MediaLibraryResponse
+{
+  "id": 1,
+  "name": "我的资产",
+  "type": "system-uploaded",   // system-uploaded / system-ai / custom
+  "iconKey": "folder",
+  "description": null,
+  "sortOrder": 0,
+  "assetCount": 12,
+  "createdAt": "2026-08-01T10:00:00",
+  "updatedAt": "2026-08-07T12:00:00"
+}
+
+// CreateLibraryRequest
+{ "name": "工作素材", "iconKey": "folder", "description": "可选" }
+
+// RenameLibraryRequest
+{ "name": "工作素材 2", "iconKey": "folder" }
+```
+
+**系统库保护**：对 `type=system-*` 的库做 `PATCH` / `DELETE` 返回 `7003=MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY`。
+
+### 6.5.2 素材
+
+| 方法 | 路径 | 请求体 | 响应 | 状态 |
+|------|------|--------|------|------|
+| GET    | `/api/media/assets?libraryId=&type=&source=&keyword=&page=&pageSize=` | — | `{code, message, data: PageResult<MediaAssetResponse>}` | ✅ 已实现 |
+| GET    | `/api/media/assets/{id}` | — | `{code, message, data: MediaAssetResponse}` | ✅ 已实现 |
+| POST   | `/api/media/assets` | `multipart/form-data (file, libraryId?)` | `{code, message, data: MediaUploadResponse}` | ✅ 已实现 |
+| PATCH  | `/api/media/assets/{id}` | `PatchAssetRequest` | `{code, message, data: MediaAssetResponse}` | ✅ 已实现 |
+
+> **上传类型白名单**（`POST /api/media/assets`）：
+> - 图片：`image/jpeg | image/png | image/gif | image/webp | image/bmp`，扩展名 `jpg/jpeg/png/gif/webp/bmp`
+> - 视频：`video/mp4 | video/webm | video/quicktime | video/x-msvideo | video/x-matroska`，扩展名 `mp4/webm/mov/avi/mkv`
+> - 音频：`audio/mpeg | audio/wav | audio/ogg | audio/aac | audio/x-m4a | audio/mp4`，扩展名 `mp3/wav/ogg/m4a/aac`
+> - **校验规则**：MIME 与扩展名都必须在白名单内且**指向同一类别**（image/video/audio），否则返回 `7300 MEDIA_ASSET_TYPE_INVALID`。
+> - **黑名单**（直接拒绝）：可执行（exe/msi/bat/sh/jar/apk 等）、脚本（js/php/jsp 等）、文档（pdf/doc/xls/ppt 等）、压缩包（zip/rar/7z 等）、配置文件/证书（env/pem/key 等）、HTML/SVG/XML 等。
+| DELETE | `/api/media/assets/{id}` | — | `{code, message}` | ✅ 已实现 |
+| POST   | `/api/media/assets/batch-delete` | `BatchDeleteAssetsRequest` | `{code, message, data: {deleted, requested}}` | ✅ 已实现 |
+
+```json
+// MediaAssetResponse（列表 / 详情 / 改名返回）
+{
+  "id": 100,
+  "libraryId": 1,
+  "libraryName": "我的资产",
+  "type": "image",            // image / video / audio
+  "source": "uploaded",       // uploaded / ai-generated
+  "name": "商品-主图-01.png",
+  "mimeType": "image/png",
+  "sizeBytes": 102400,
+  "width": 800,
+  "height": 800,
+  "durationSec": null,
+  "url": "https://minio/...?X-Amz-Signature=...",   // 24h 预签名 URL
+  "sourceTool": "upload",     // upload / video / image / canvas / agent
+  "sourceTaskId": null,
+  "createdAt": "2026-08-07T10:00:00",
+  "updatedAt": "2026-08-07T10:00:00"
+}
+
+// MediaUploadResponse
+{ "id": 100, "url": "https://...", "name": "商品-主图-01.png", "type": "image", "size": 102400 }
+
+// PatchAssetRequest
+{ "name": "商品-主图-01-改.png" }
+
+// BatchDeleteAssetsRequest
+{ "ids": [100, 101, 102] }
+```
+
+**上传限制**（`MediaServiceImpl.checkSize`）：
+- 图片 ≤ **20 MB** → 超限返 `7021=MEDIA_FILE_TOO_LARGE`
+- 视频 ≤ **200 MB**
+- 音频 ≤ **50 MB**
+- 空文件返 `7022=MEDIA_FILE_EMPTY`
+- 不支持的 MIME/扩展名返 `7011=MEDIA_ASSET_TYPE_INVALID`
+- 未指定 `libraryId` → 默认进 "我的资产" 库
+
+**MinIO 存储**：
+- 对象 Key 格式：`media/{userId}/{yyyy-MM}/{uuid}.{ext}`
+- 列表/详情返回的 `url` 是 **24h 预签名 URL**（`StorageService.getPresignedUrl`）
+- 前端不要把 `url` 持久化到 localStorage，跨页面/跨天会失效
+
+### 6.5.3 错误码
+
+| code | 含义 |
+|------|------|
+| 7001 | `MEDIA_LIBRARY_NAME_DUPLICATE` 库名重复（同一用户下唯一）|
+| 7002 | `MEDIA_LIBRARY_NOT_FOUND` 库不存在或不属于当前用户 |
+| 7003 | `MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY` 系统库不可改/删 |
+| 7010 | `MEDIA_ASSET_NOT_FOUND` 素材不存在或不属于当前用户 |
+| 7011 | `MEDIA_ASSET_TYPE_INVALID` 文件类型不支持 |
+| 7020 | `MEDIA_UPLOAD_FAILED` MinIO 上传失败 |
+| 7021 | `MEDIA_FILE_TOO_LARGE` 文件超过大小限制 |
+| 7022 | `MEDIA_FILE_EMPTY` 文件为空 |
+
+### 6.5.4 业务接入点
+
+- **注册自动建库**：`AuthServiceImpl` 在 `register` 成功后调用 `MediaLibraryService.createDefaultLibraries(userId)`，建 2 个系统库
+- **AI 生成落库**：`GenerationServiceImpl` 在生成完成回调中调用 `MediaService.recordAiGenerated(...)`，把产物写入 "AI 生成结果" 库（`source=ai-generated`，`sourceTool` 标记为 video/image/canvas/agent）
+- **库级联删除**：`MediaLibraryServiceImpl.deleteLibrary` 先调 `MediaService.deleteAssetsByLibrary` 把库内素材和 MinIO 对象清干净，再软删库
 
 ---
 
@@ -345,7 +471,7 @@ GET /api/admin/users?displayName=user@example.com
 
 ---
 
-## 9. Workflow 模板（**未来**做）
+## 10. Workflow 模板（**未来**做）
 
 > **计划中**：根目录创建 `workflows/` 子目录 + 3 个开箱即用 workflow JSON 模板（产品图 / 动漫风 / 图生视频）。由 C 在 Phase 5 阶段做。
 
@@ -363,7 +489,7 @@ GET /api/admin/users?displayName=user@example.com
 
 ---
 
-## 10. 错误码分段
+## 11. 错误码分段
 
 | 段 | 模块 | 例 |
 |---|------|-----|
@@ -375,6 +501,7 @@ GET /api/admin/users?displayName=user@example.com
 | 4xxx | Workflow | `4001=WORKFLOW_NOT_FOUND / 4002=WORKFLOW_ACCESS_DENIED` |
 | 5xxx | Billing | `5001=BILLING_NOT_ENABLED`（Phase 8）|
 | 6xxx | Admin | `6001=ADMIN_OPERATION_DENIED / 6002=ADMIN_CANNOT_CHANGE_OWN_ROLE / 6003=ADMIN_CANNOT_DISABLE_SELF / 6004=GROUP_NAME_DUPLICATE / 6005=GROUP_IS_DEFAULT_CANNOT_DELETE / 6006=GROUP_IS_DEFAULT_CANNOT_UNSET / 6007=USER_ALREADY_IN_GROUP / 6008=USER_NOT_IN_GROUP / 6009=INVALID_ROLE_VALUE` |
+| 7xxx | Media | `7001=MEDIA_LIBRARY_NAME_DUPLICATE / 7002=MEDIA_LIBRARY_NOT_FOUND / 7003=MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY / 7010=MEDIA_ASSET_NOT_FOUND / 7011=MEDIA_ASSET_TYPE_INVALID / 7020=MEDIA_UPLOAD_FAILED / 7021=MEDIA_FILE_TOO_LARGE / 7022=MEDIA_FILE_EMPTY` |
 
 返回格式：
 ```json
@@ -383,7 +510,7 @@ GET /api/admin/users?displayName=user@example.com
 
 ---
 
-## 11. curl 请求示例
+## 12. curl 请求示例
 
 ```bash
 # ===== 1. 注册 =====
@@ -586,15 +713,67 @@ curl -X DELETE http://localhost:8080/api/admin/groups/1 \
 curl "http://localhost:8080/api/admin/users" \
   -H "Authorization: Bearer $TOKEN"
 # HTTP 403（Spring Security 在 filter 链直接拒绝；不走 BusinessException）
+
+# ===== 26. 列出我的资产库（注册时自动建 2 个系统库） =====
+curl http://localhost:8080/api/media/libraries \
+  -H "Authorization: Bearer $TOKEN"
+# 返: { "code": 0, "data": [
+#   { "id": 1, "name": "我的资产", "type": "system-uploaded", "assetCount": 0, ... },
+#   { "id": 2, "name": "AI 生成结果", "type": "system-ai", "assetCount": 0, ... }
+# ] }
+
+# ===== 27. 上传素材到「我的资产」(未传 libraryId 默认进 system-uploaded) =====
+curl -X POST http://localhost:8080/api/media/assets \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/path/to/photo.png"
+# 返: { "code": 0, "data": { "id": 100, "url": "https://minio/...", "name": "photo.png", "type": "image", "size": 102400 } }
+# 超 20M 返 7021，空文件返 7022，类型不支持返 7011
+
+# ===== 28. 上传素材到指定 custom 库 =====
+curl -X POST http://localhost:8080/api/media/assets \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@/path/to/clip.mp4" \
+  -F "libraryId=3"
+# video ≤ 200M, audio ≤ 50M
+
+# ===== 29. 分页查询素材 =====
+curl "http://localhost:8080/api/media/assets?libraryId=1&type=image&page=1&pageSize=20" \
+  -H "Authorization: Bearer $TOKEN"
+# 返: { "code": 0, "data": { "items": [...], "total": 12, "page": 1, "pageSize": 20 } }
+
+# ===== 30. 新建 custom 库 =====
+curl -X POST http://localhost:8080/api/media/libraries \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"工作素材","iconKey":"folder","description":"可选"}'
+# 重名返 7001
+
+# ===== 31. 重命名库（系统库会返 7003） =====
+curl -X PATCH http://localhost:8080/api/media/libraries/3 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"工作素材 2","iconKey":"folder"}'
+
+# ===== 32. 删除 custom 库（级联删素材 + MinIO 对象） =====
+curl -X DELETE http://localhost:8080/api/media/libraries/3 \
+  -H "Authorization: Bearer $TOKEN"
+# 系统库返 7003
+
+# ===== 33. 批量删除素材 =====
+curl -X POST http://localhost:8080/api/media/assets/batch-delete \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"ids":[100,101,102]}'
+# 返: { "code": 0, "data": { "deleted": 3, "requested": 3 } }
 ```
 
 ---
 
-## 12. 维护规则
+## 13. 维护规则
 
 **加 / 改端点必须**：
 1. **先改本文件**（API.md 真理源）—— 改完才能动代码
-2. **加 curl 示例**（§11 模板）
+2. **加 curl 示例**（§12 模板）
 3. **测试通过**（单元 + 集成 + 手测）
 4. **PR 描述里贴 curl 输出**
 
@@ -605,4 +784,4 @@ curl "http://localhost:8080/api/admin/users" \
 
 ---
 
-**最后更新**：2026-08-02 by  developerC
+**最后更新**：2026-08-07 by developerC（新增 §6.5 资产库 / 素材 + 7xxx 错误码 + curl §26-33）

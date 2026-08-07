@@ -46,13 +46,13 @@ public class MediaAsset {
 
     private BigDecimal durationSec;
 
-    /** MinIO 对象 key（如 media/3/3/photo.png） */
+    /** MinIO object key */
     private String objectKey;
 
-    /** video/image/canvas/agent/upload - 哪个工具产生的（可选） */
+    /** video / image / canvas / agent / upload */
     private String sourceTool;
 
-    /** 关联的任务 ID（可选） */
+    /** 关联任务 ID */
     private String sourceTaskId;
 
     @TableLogic
