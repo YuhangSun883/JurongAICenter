@@ -1,52 +1,102 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter, usePathname } from 'next/navigation';
 import { LoginDialog } from './LoginDialog';
-import { RegisterDialog } from './RegisterDialog';
+import { onAuthFailure } from '@/lib/http';
+import {
+  bootstrapTokens, isLoggedIn,
+  startAuthWatchdog, bindActivityRefresh,
+} from '@/lib/auth-store';
+import { bootstrapAuth } from '@/api/auth.real';
 
-export function LoginGate() {
-  // null=关闭，'login'=登录，'register'=注册
-  const [mode, setMode] = useState<'login' | 'register' | null>(null);
+/**
+ * 登录门控组件。
+ *
+ * 行业标准流程：
+ *   1. 启动时从 localStorage 恢复 tokens；如已过期则 silent refresh
+ *   2. 用户活跃（点击/键盘/滚动）→ 滑动窗口：如果 access token < 5 分钟过期，静默 refresh
+ *   3. 周期性 watchdog：每 60 秒检查一次 token 状态
+ *   4. silent refresh 失败（refresh token 也过期）→ 清 token + 跳 /login
+ *   5. 任意 API 返回 401 且 refresh 失败 → 跳 /login
+ *
+ * 用法：
+ *   在受保护的页面外层包上：
+ *     <LoginGate><CanvasPage /></LoginGate>
+ */
+export function LoginGate({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const [bootstrapped, setBootstrapped] = useState(false);
+  const [showDialog, setShowDialog] = useState(false);
 
-  // 检查当前 token 状态
-  const checkAuth = () => {
-    if (typeof window === 'undefined') return;
-    const hasToken = !!(localStorage.getItem('token') || localStorage.getItem('accessToken'));
-    setMode(hasToken ? null : 'login');
-  };
-
-  // 初始检查
+  // 启动时：bootstrap auth（恢复 token + 必要时 silent refresh）
   useEffect(() => {
-    checkAuth();
+    let cancelled = false;
+    (async () => {
+      bootstrapTokens();
+      // 在登录页本身就不需要校验
+      if (pathname === '/login') {
+        setBootstrapped(true);
+        return;
+      }
+      const ok = await bootstrapAuth();
+      if (cancelled) return;
+      if (!ok) {
+        // 没登录或 refresh 失败 → 跳登录页
+        router.replace(`/login?from=${encodeURIComponent(pathname || '/')}`);
+        return;
+      }
+      setBootstrapped(true);
+    })();
+    return () => { cancelled = true; };
+  }, [router, pathname]);
+
+  // 启动周期性 watchdog（每 60 秒检查 token）
+  useEffect(() => {
+    startAuthWatchdog();
+    const unbind = bindActivityRefresh();
+    return () => {
+      unbind();
+      // 注意：watchdog 全局共享，不在 unmount 时停（否则切换 tab 会失效）
+    };
   }, []);
 
-  // 监听 auth-changed 事件（登出、refresh 失败等）
+  // 订阅全局 401 事件：refresh 失败 → 跳登录页
   useEffect(() => {
-    const handler = () => checkAuth();
-    window.addEventListener('auth-changed', handler);
-    return () => window.removeEventListener('auth-changed', handler);
-  }, []);
+    return onAuthFailure(() => {
+      if (pathname !== '/login') {
+        router.replace(`/login?from=${encodeURIComponent(pathname || '/')}`);
+      }
+    });
+  }, [router, pathname]);
 
-  if (!mode) return null;
+  // storage 事件：跨 tab 同步登录状态
+  useEffect(() => {
+    function onStorage(event: StorageEvent) {
+      if (event.key === 'accessToken') {
+        if (!event.newValue && pathname !== '/login') {
+          router.replace(`/login?from=${encodeURIComponent(pathname || '/')}`);
+        }
+      }
+    }
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [router, pathname]);
 
-  if (mode === 'register') {
+  // bootstrap 没完成前显示空白（避免未鉴权页面闪一下）
+  if (!bootstrapped) {
     return (
-      <RegisterDialog
-        onClose={() => setMode(null)}
-        onSuccess={() => {
-          // 注册成功 → 关闭弹窗，触发全局刷新
-          window.dispatchEvent(new Event('auth-changed'));
-          setMode(null);
-        }}
-        onSwitchToLogin={() => setMode('login')}
-      />
+      <div className="flex h-screen items-center justify-center bg-[#f1f2f4] text-sm text-[#8a96a8]">
+        加载中…
+      </div>
     );
   }
 
   return (
-    <LoginDialog
-      onClose={() => setMode(null)}
-      onSwitchToRegister={() => setMode('register')}
-    />
+    <>
+      {children}
+      {showDialog && <LoginDialog onClose={() => setShowDialog(false)} />}
+    </>
   );
 }

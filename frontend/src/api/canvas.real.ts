@@ -26,3 +26,8 @@ export function generateNode(req: GenerateCanvasNodeRequest): Promise<GenerateCa
     body: req,
   });
 }
+
+/** 轮询任务状态 */
+export function getTask(taskId: string): Promise<GenerateCanvasNodeResponse> {
+  return request<GenerateCanvasNodeResponse>(`${API}/tasks/${taskId}`);
+}

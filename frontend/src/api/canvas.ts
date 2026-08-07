@@ -21,6 +21,8 @@ export interface CreateCanvasNodeRequest {
   title?: string;
   content?: string;
   assetId?: string;
+  /** 上游节点 ID 列表（用于跨节点传递润色/生成结果） */
+  upstreamIds?: string[];
 }
 
 export interface UpdateCanvasNodeRequest {
@@ -57,4 +59,8 @@ export const canvasApi = {
 
   generateNode: (req: GenerateCanvasNodeRequest): Promise<GenerateCanvasNodeResponse> =>
     USE_MOCK ? mock.generateNode(req) : real.generateNode(req),
+
+  /** 轮询任务状态（前端轮询用） */
+  getTask: (taskId: string): Promise<GenerateCanvasNodeResponse> =>
+    USE_MOCK ? mock.getTask(taskId) : real.getTask(taskId),
 };

@@ -35,6 +35,7 @@ import Link from 'next/link';
 import { useEffect, useState, type ComponentType, type MouseEvent, type PointerEvent } from 'react';
 import { canvasApi, type CanvasNodeType } from '@/api/canvas';
 import { cn } from '@/lib/utils';
+import { LoginGate } from '@/components/common/LoginGate';
 
 type ToolId = 'select' | 'hand' | 'component' | 'template' | 'history' | 'help';
 
@@ -44,6 +45,9 @@ interface CanvasViewNode {
   x: number;
   y: number;
   content?: string;
+  resultUrl?: string;
+  /** 每个节点独立的 prompt 输入（不跨节点共享） */
+  prompt?: string;
 }
 
 interface CanvasEdge {
@@ -103,12 +107,15 @@ export default function NewCanvasPage() {
   const [nodes, setNodes] = useState<CanvasViewNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState('');
+  // 去掉全局 prompt：每个节点的 prompt 独立存储在 node.prompt 里
+  // const [prompt, setPrompt] = useState('');
   const [zoom, setZoom] = useState(100);
   const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [linkDrag, setLinkDrag] = useState<LinkDragState | null>(null);
   const [nodeMenu, setNodeMenu] = useState<NodeContextMenuState | null>(null);
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [generateError, setGenerateError] = useState<string>('');
 
   const activeNode = nodes.find((node) => node.id === activeNodeId) ?? null;
 
@@ -213,7 +220,11 @@ export default function NewCanvasPage() {
 
   const addNode = async (type: CanvasNodeType) => {
     const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
-    const created = await canvasApi.createNode({ type, title: nodeTitle(type) });
+    const created = await canvasApi.createNode({
+      type,
+      title: nodeTitle(type),
+      upstreamIds: source ? [source.id] : undefined,
+    });
     const position = source
       ? {
           x: source.x + 430,
@@ -226,6 +237,8 @@ export default function NewCanvasPage() {
       x: clampNodeX(position.x),
       y: clampNodeY(position.y),
       content: created.content,
+      resultUrl: created.resultUrl,
+      prompt: '', // 每个节点独立 prompt，初始为空
     };
 
     setNodes((current) => [...current, nextNode]);
@@ -245,6 +258,10 @@ export default function NewCanvasPage() {
 
   const updateNodeContent = (id: string, value: string) => {
     setNodes((current) => current.map((node) => (node.id === id ? { ...node, content: value } : node)));
+  };
+
+  const updateNodePrompt = (id: string, value: string) => {
+    setNodes((current) => current.map((node) => (node.id === id ? { ...node, prompt: value } : node)));
   };
 
   const duplicateNode = (node: CanvasViewNode) => {
@@ -285,21 +302,78 @@ export default function NewCanvasPage() {
   };
 
   const requestGeneration = async () => {
-    if (!activeNode) return;
-    const result = await canvasApi.generateNode({
-      nodeId: activeNode.id,
-      type: activeNode.type,
-      prompt,
-      content: activeNode.content,
-      assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
-    });
+    if (!activeNode || generating) return;
+    const nodePrompt = (activeNode.prompt ?? '').trim();
+    if (!nodePrompt) {
+      setGenerateError('请先输入提示词');
+      return;
+    }
+    setGenerating(true);
+    setGenerateError('');
 
-    if (activeNode.type === 'text' && result.text) {
-      updateNodeContent(activeNode.id, result.text);
+    try {
+      // 1. 提交生成任务（后端立刻返回 pending 状态）
+      const initial = await canvasApi.generateNode({
+        nodeId: activeNode.id,
+        type: activeNode.type,
+        prompt: nodePrompt,
+        content: activeNode.content,
+        assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
+      });
+
+      // 2. 轮询任务状态（按节点类型分档超时）
+      const POLL_INTERVAL = 2000;
+      // 文本：60s；图片：300s（5 分钟，gpt-image 实际需要）；视频：600s（10 分钟）
+      const MAX_DURATION =
+        activeNode.type === 'text'  ? 60_000 :
+        activeNode.type === 'image' ? 300_000 :
+        /* video */                  600_000;
+      const start = Date.now();
+      let lastResult = initial;
+
+      while (Date.now() - start < MAX_DURATION) {
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+        try {
+          lastResult = await canvasApi.getTask(initial.taskId);
+        } catch (pollErr) {
+          // 轮询中途网络错误：继续重试，不直接报错
+          console.warn('[canvas] poll failed, retrying:', pollErr);
+          continue;
+        }
+
+        if (lastResult.status === 'success') {
+          // 3. 成功：根据节点类型更新 UI
+          if (activeNode.type === 'text' && lastResult.text) {
+            updateNodeContent(activeNode.id, lastResult.text);
+          } else if ((activeNode.type === 'image' || activeNode.type === 'video')
+                     && lastResult.resultUrl) {
+            setNodes((current) =>
+              current.map((n) =>
+                n.id === activeNode.id ? { ...n, resultUrl: lastResult.resultUrl } : n
+              )
+            );
+          }
+          return;
+        }
+
+        if (lastResult.status === 'failed') {
+          setGenerateError(`生成失败：${lastResult.status}`);
+          return;
+        }
+        // pending / running 继续轮询
+      }
+
+      setGenerateError('生成超时，请重试');
+    } catch (err: any) {
+      console.error('[canvas] generate error:', err);
+      setGenerateError(err?.message || '生成出错，请重试');
+    } finally {
+      setGenerating(false);
     }
   };
 
   return (
+    <LoginGate>
     <main className="relative h-screen min-h-[640px] overflow-hidden bg-[#f1f2f4] text-[#5e6878]">
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,255,255,0.16),transparent_38%)]" />
       {addMenu && (
@@ -438,11 +512,25 @@ export default function NewCanvasPage() {
       {activeNode && (
         <PromptComposer
           node={activeNode}
-          value={prompt}
+          value={activeNode.prompt ?? ''}
           referenceCount={edges.filter((edge) => edge.to === activeNode.id).length}
-          onChange={setPrompt}
+          onChange={(value) => updateNodePrompt(activeNode.id, value)}
           onSubmit={requestGeneration}
+          generating={generating}
         />
+      )}
+
+      {generateError && (
+        <div className="fixed bottom-24 left-1/2 z-50 -translate-x-1/2 rounded-md border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-600 shadow-lg">
+          {generateError}
+          <button
+            type="button"
+            className="ml-3 text-red-400 hover:text-red-600"
+            onClick={() => setGenerateError('')}
+          >
+            ✕
+          </button>
+        </div>
       )}
       {addMenu && <AddCanvasMenu menu={addMenu} onAddNode={addNode} />}
       {nodeMenu && (
@@ -489,6 +577,7 @@ export default function NewCanvasPage() {
         </button>
       </div>
     </main>
+    </LoginGate>
   );
 }
 
@@ -626,6 +715,25 @@ function CanvasNodeCard({
               active ? 'border border-[#48566a]' : 'border border-[#e0e4ea]'
             )}
           />
+        ) : node.resultUrl ? (
+          // 生成成功：按类型渲染 <video> 或 <img>
+          node.type === 'video' ? (
+            <video
+              src={node.resultUrl}
+              controls
+              data-no-node-drag="true"
+              className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-black object-contain active:cursor-grabbing"
+              onClick={onActivate}
+            />
+          ) : (
+            <img
+              src={node.resultUrl}
+              alt={nodeTitle(node.type)}
+              data-no-node-drag="true"
+              className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-white/35 object-contain active:cursor-grabbing"
+              onClick={onActivate}
+            />
+          )
         ) : (
           <button
             type="button"
@@ -683,14 +791,18 @@ function PromptComposer({
   referenceCount,
   onChange,
   onSubmit,
+  generating,
 }: {
   node: CanvasViewNode;
   value: string;
   referenceCount: number;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  generating?: boolean;
 }) {
   const isText = node.type === 'text';
+  const isImage = node.type === 'image';
+  const isVideo = node.type === 'video';
   const { width, height } = viewport();
   const left = clamp(node.x + NODE_WIDTH / 2 - PROMPT_WIDTH / 2, 84, Math.max(84, width - PROMPT_WIDTH - 84));
   const top = clamp(
@@ -698,6 +810,16 @@ function PromptComposer({
     178,
     Math.max(178, height - PROMPT_HEIGHT - PROMPT_BOTTOM_MARGIN)
   );
+
+  // 按节点类型定制 placeholder
+  const placeholder = isText
+    ? '可连续添加素材并 @引用，描述你想生成的文本。例如：提炼这款保温杯的核心卖点，写成适合电商详情页的短文。'
+    : isImage
+    ? '可连续添加素材并 @引用，描述你想生成或编辑的图片。例如：生成一张电商主图，突出商品质感、使用场景和促销氛围。'
+    : '可连续添加素材并 @引用，描述你想生成的视频内容。例如：一只小猫在草地上散步，阳光透过树梢洒下来，镜头缓缓推进。';
+
+  // 按节点类型定制价格（与后端 estimateCredits 对齐）
+  const creditCost = isText ? '0.20' : isImage ? '1.18' : '20.00';
 
   return (
     <div
@@ -718,11 +840,7 @@ function PromptComposer({
       <textarea
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        placeholder={
-          isText
-            ? '可连续添加素材并 @引用，描述你想生成的文本。例如：提炼这款保温杯的核心卖点，写成适合电商详情页的短文。'
-            : '可连续添加素材并 @引用，描述你想生成或编辑的图片。例如：生成一张电商主图，突出商品质感、使用场景和促销氛围。'
-        }
+        placeholder={placeholder}
         className={cn(
           'h-[118px] w-full resize-none bg-transparent pr-8 text-sm leading-6 text-[#4b5565] outline-none placeholder:text-[#606b7c]',
           referenceCount > 0 && 'pl-[74px]'
@@ -740,7 +858,8 @@ function PromptComposer({
         </button>
       </div>
       <div className="absolute bottom-14 left-3 right-3 h-px bg-[#e9edf2]" />
-      {isText ? null : (
+      {isText ? null : isImage ? (
+        // 图片节点：高级版 / 自适应 / 1K / 技能包
         <div className="absolute bottom-5 left-4 flex items-center gap-2 text-xs font-medium text-[#516074]">
           <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
             <Sparkles className="h-3 w-3" />
@@ -761,18 +880,45 @@ function PromptComposer({
           </button>
           <span className="text-[#b4bdc9]">⌄</span>
         </div>
+      ) : (
+        // 视频节点：模型 / 时长 / 分辨率
+        <div className="absolute bottom-5 left-4 flex items-center gap-2 text-xs font-medium text-[#516074]">
+          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
+            <Sparkles className="h-3 w-3" />
+            <span>doubao-seedance</span>
+          </button>
+          <span className="text-[#b4bdc9]">⌄</span>
+          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
+            <span>4 秒</span>
+          </button>
+          <span className="text-[#b4bdc9]">⌄</span>
+          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
+            <span>480P</span>
+          </button>
+          <span className="text-[#b4bdc9]">⌄</span>
+        </div>
       )}
       <div className="absolute bottom-4 right-4 flex items-center gap-2">
         <span className="text-xs font-medium text-[#536072]">
-          <span className="text-[#1a8cff]">✦</span> {isText ? '0.20' : '1.18'} / 条
+          <span className="text-[#1a8cff]">✦</span> {creditCost} / 条
         </span>
         <button
           type="button"
           onClick={onSubmit}
-          className="grid h-9 w-9 place-items-center rounded-full bg-[#d9dee8] text-white transition hover:bg-[#2f78ff]"
-          title="生成"
+          disabled={generating}
+          className={cn(
+            'grid h-9 w-9 place-items-center rounded-full text-white transition',
+            generating
+              ? 'cursor-not-allowed bg-[#d9dee8]'
+              : 'bg-[#d9dee8] hover:bg-[#2f78ff]'
+          )}
+          title={generating ? '生成中…' : '生成'}
         >
-          <span className="-mt-0.5 text-xl leading-none">↑</span>
+          {generating ? (
+            <span className="block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+          ) : (
+            <span className="-mt-0.5 text-xl leading-none">↑</span>
+          )}
         </button>
       </div>
     </div>

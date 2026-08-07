@@ -60,14 +60,21 @@ def check_balance() -> dict:
 
 def generate_image(prompt: str, model: str, size: str,
                    negative_prompt: str = "", n: int = 1,
-                   poll_timeout_sec: int = 600, poll_interval: int = 8) -> str:
+                   poll_timeout_sec: int = 600, poll_interval: int = 8,
+                   **kwargs) -> str:
     """POST /v1/images/generations
     返回第一个结果的 URL。
+
+    接受 **kwargs 以兼容 ComfyUI 节点可能传的其他参数（如 quality, style 等），
+    这些参数会被静默忽略，避免 ComfyUI 节点升级后调用失败。
 
     已知问题（2026-08-01 实测）：这个 NewAPI（calciumion/new-api:latest）版本
     对图像任务只回传 {"status":"submitted","task_id":"..."}，没有直接的 url。
     我们尝试轮询相同路径（实际上 404），所以这里降级为报错提示用户。
     """
+    if kwargs:
+        logger.debug("generate_image ignoring extra kwargs: %s", list(kwargs.keys()))
+
     body = {
         "model": model,
         "prompt": prompt,

@@ -1,28 +1,36 @@
-// 用户认证（占位）
+// 用户认证
 
 export interface UserInfo {
-  id: string | number;
+  id: string;
   nickname: string;
   avatar?: string;
   email?: string;
-  role?: 'USER' | 'ADMIN';
 }
 
 export interface LoginRequest {
-  email: string;
-  password: string;
+  account?: string;
+  email?: string;
+  phone?: string;
+  code?: string;
+  password?: string;
 }
 
+/**
+ * 前端统一的登录响应。
+ * - token: 后端叫 accessToken（短命，30 分钟）
+ * - refreshToken: 刷新用（长命，7 天，可滑动延长）
+ * - expiresIn: access token 的有效秒数（默认 1800 = 30 分钟）
+ */
+export interface LoginResponse {
+  token: string;
+  refreshToken: string;
+  expiresIn?: number;
+  user: UserInfo;
+}
+
+/** 注册请求 — 后端契约：{ email, password, displayName? } */
 export interface RegisterRequest {
   email: string;
   password: string;
   displayName?: string;
-}
-
-export interface LoginResponse {
-  accessToken: string;
-  refreshToken: string;
-  userId: number;
-  email: string;
-  role: 'USER' | 'ADMIN';
 }

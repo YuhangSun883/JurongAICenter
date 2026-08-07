@@ -71,10 +71,6 @@ export const creationsApi = {
   listTasks: (q?: { type?: CreationType }): Promise<CreationTask[]> =>
     USE_MOCK ? mock.listTasks(q) : real.listTasks(q),
 
-  /** 取消任务（DELETE /api/generation/jobs/{id}） */
-  cancelTask: (id: string): Promise<void> =>
-    USE_MOCK ? mock.cancelTask(id) : real.cancelTask(id),
-
   /** 积分前置校验（前端可选调用，由后端决定是否真校验） */
   checkCredits: (req: CreditsCheckRequest): Promise<CreditsCheckResponse> =>
     USE_MOCK ? mock.checkCredits(req) : real.checkCredits(req),
