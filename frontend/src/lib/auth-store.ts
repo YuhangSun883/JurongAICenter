@@ -142,8 +142,8 @@ export async function silentRefresh(): Promise<boolean> {
       // 后端目前 refresh 后保持 refreshToken 不变，但保险起见更新
       const newAccess = payload.accessToken;
       const newRefresh = payload.refreshToken || refreshTokenInMemory!;
-      // 假设 access token 还是 30 分钟（与后端配置一致）
-      setTokens(newAccess, newRefresh, 30 * 60);
+      // 假设 access token 还是 2 小时(与后端 jwt.access-token-expiry 一致)
+      setTokens(newAccess, newRefresh, 2 * 60 * 60);
       notifyAuthChange('refresh');
       console.log('[auth] silent refresh succeeded');
       return true;

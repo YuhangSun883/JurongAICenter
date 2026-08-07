@@ -19,12 +19,16 @@ interface BackendAuthResponse {
   role: string;
 }
 
+// 必须跟后端 application.yml 里 jwt.access-token-expiry 一致(目前是 2h)
+// 这是前端预估的过期时间,真实过期以后端签发时间为准
+const ACCESS_TOKEN_TTL_SEC = 2 * 60 * 60;
+
 /** 后端响应 → 前端 LoginResponse */
 function adapt(resp: BackendAuthResponse): LoginResponse {
   return {
     token: resp.accessToken,
     refreshToken: resp.refreshToken || '',
-    expiresIn: 30 * 60, // 与后端 application-dev.yml 中 access-token-expiry 一致
+    expiresIn: ACCESS_TOKEN_TTL_SEC,
     user: {
       id: String(resp.userId),
       nickname: resp.email.split('@')[0],
@@ -35,14 +39,15 @@ function adapt(resp: BackendAuthResponse): LoginResponse {
 
 /** 持久化 tokens + user */
 function persist(authResp: LoginResponse) {
-  setTokens(authResp.token, authResp.refreshToken, authResp.expiresIn || 30 * 60);
+  setTokens(authResp.token, authResp.refreshToken, authResp.expiresIn || ACCESS_TOKEN_TTL_SEC);
   setUser(authResp.user);
 }
 
 export async function login(req: LoginRequest): Promise<LoginResponse> {
+  // 只发邮箱 + 密码两个字段(后端 LoginRequest 契约)
   const backendReq = {
-    email: req.email || req.account || '',
-    password: req.password || req.code || '',
+    email: req.email,
+    password: req.password,
   };
 
   const backendResp = await request<BackendAuthResponse>('/api/auth/login', {
