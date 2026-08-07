@@ -1,3 +1,13 @@
+# ============================================================
+# JWT 配置(HS256,密钥至少 32 字节)
+# 生产环境务必用环境变量覆盖:JWT_SECRET=xxx,别把密钥写进 yml 提交到 git
+# ============================================================
+jwt:
+  secret: ${JWT_SECRET:dev-only-secret-please-change-in-production-32bytes-min}
+  access-token-expiry: 2h
+  refresh-token-expiry: 7d
+  issuer: jurong-aicenter
+
 spring:
   profiles:
     active: dev

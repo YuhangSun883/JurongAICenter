@@ -34,8 +34,9 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // 无论哪个页面都先读 LS → in-memory,这样 LoginPage 的 isLoggedIn() 才能正确判断
       bootstrapTokens();
-      // 在登录页本身就不需要校验
+      // 在登录页本身就不需要校验跳转
       if (pathname === '/login') {
         setBootstrapped(true);
         return;
