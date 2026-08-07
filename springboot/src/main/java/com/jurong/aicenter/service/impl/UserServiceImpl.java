@@ -13,6 +13,7 @@ import com.jurong.aicenter.entity.User;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.repository.UserRepository;
+import com.jurong.aicenter.service.MediaLibraryService;
 import com.jurong.aicenter.service.QuotaService;
 import com.jurong.aicenter.service.UserService;
 import lombok.RequiredArgsConstructor;
@@ -33,6 +34,7 @@ public class UserServiceImpl implements UserService {
     private final QuotaService quotaService;
     private final UserGroupMemberRepository userGroupMemberRepository;
     private final UserGroupRepository userGroupRepository;
+    private final MediaLibraryService mediaLibraryService; // V8 资产库：注册时建默认库
     @Override
     public UserResponse getCurrentUser(Long userId) {
         User user = userRepository.selectById(userId);

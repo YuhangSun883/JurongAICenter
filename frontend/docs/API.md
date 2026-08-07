@@ -18,7 +18,7 @@
 | `auth` 用户认证 | ✅ mock | `src/api/auth.ts` | [§1](#1-用户认证-authts) |
 | `agent` AI 聊天 | ✅ mock | `src/api/agent.ts` | [§2](#2-agent-聊天-agentts) |
 | `video` 视频生成 | ✅ mock | `src/api/video.ts` | [§3](#3-视频生成-videots) |
-| `media` 素材库 | ✅ mock | `src/api/media.ts` | [§4](#4-媒体素材库--角色库--上传-mediat) |
+| `media` 资产库 / 素材 | ✅ mock | `src/api/media.ts` | [§4](#4-媒体资产库--素材-mediat) |
 | `creations` 统一创作（视频/图片/Agent） | ✅ mock | `src/api/creations.ts` | [§5](#5-统一创作-creations) |
 | `canvas` 画布节点 | ✅ mock | `src/api/canvas.ts` | [§6](#6-画布节点-canvasts) |
 
@@ -170,20 +170,134 @@ type Duration = 4 | 5 | 6 | /* ... */ 29 | 30;
 
 ---
 
-## 4. 媒体（素材库 / 角色库 / 上传）(`src/api/media.ts`)
+## 4. 媒体（资产库 / 素材）(`src/api/media.ts`)
+
+> **核心模型**：
+> - **资产库（MediaLibrary）**：用户维度的容器，每个用户注册时自动创建 2 个系统默认库
+>   - 「我的资产」(`type=system-uploaded`)：存放用户上传的素材
+>   - 「AI 生成结果」(`type=system-ai`)：存放 AI 生成的素材
+>   - 用户可新建自定义库 (`type=custom`)，可重命名/删除；系统库**不可**重命名/删除
+> - **素材（MediaAsset）**：图片/视频/音频，归属到某个库
+>   - `source=uploaded` 用户上传 / `source=ai-generated` AI 生成
+>   - 删除自定义库时**级联删除**库内素材（同时删除 MinIO 对象）
+>
+> **业务接入**：
+> - 注册时由后端 `AuthServiceImpl` 自动调用 `MediaLibraryService.createDefaultLibraries` 建库
+> - AI 生成完成时由 `GenerationServiceImpl` 调用 `MediaService.recordAiGenerated` 写入「AI 生成结果」库
+
+### 4.1 资产库
 
 | ✅ | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|---|
-| ☐ | GET    | `/api/media/assets?category=&source=&keyword=&page=&pageSize=` | - | `{ items: MediaItem[], total }` |
-| ☐ | DELETE | `/api/media/assets/:id` | - | - |
-| ☐ | POST   | `/api/media/assets` | `multipart/form-data (file)` | `{ item: MediaItem }` |
-| ☐ | GET    | `/api/media/roles/categories` | - | `RoleCategory[]` |
-| ☐ | GET    | `/api/media/roles?category=&keyword=&page=&pageSize=` | - | `{ items: MediaItem[], total }` |
+| ✅ | GET    | `/api/media/libraries` | - | `MediaLibrary[]` |
+| ✅ | POST   | `/api/media/libraries` | `CreateLibraryRequest` | `MediaLibrary` |
+| ✅ | PATCH  | `/api/media/libraries/{id}` | `RenameLibraryRequest` | `MediaLibrary` |
+| ✅ | DELETE | `/api/media/libraries/{id}` | - | - |
 
-`MediaItem = { id, type: 'image'|'video'|'audio', source: 'uploaded'|'ai-generated', url, name, size?, width?, height?, createdAt }`
-`RoleCategory = { key, label }`
+```ts
+type LibraryType = 'system-uploaded' | 'system-ai' | 'custom';
 
-> **大文件上传建议**：前端先调 `POST /api/media/assets/sign` 拿 OSS/S3 直传签名 → 前端直传到对象存储 → 再 `POST /api/media/assets` 提交 url 落库。**如果暂时没空**，先支持普通 multipart，前端能跑通就行。
+MediaLibrary = {
+  id: number;
+  name: string;                       // 库名
+  type: LibraryType;                  // 系统库 / 自定义库
+  iconKey?: 'folder' | 'star' | 'heart' | 'sparkles' | string;
+  description?: string;
+  sortOrder?: number;                 // 排序值，小的在前
+  assetCount?: number;                // 库内素材数量
+  createdAt?: string;                 // ISO timestamp
+  updatedAt?: string;
+};
+
+CreateLibraryRequest = {
+  name: string;                       // 必填，1~100 字符
+  iconKey?: string;                   // 可选，默认 'folder'
+  description?: string;               // 可选
+};
+
+RenameLibraryRequest = {
+  name: string;                       // 必填
+  iconKey?: string;                   // 可选，不传则保留原值
+};
+```
+
+> 错误码：
+> - `MEDIA_LIBRARY_NAME_DUPLICATE` 库名重复
+> - `MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY` 系统库不可重命名/删除
+> - `MEDIA_LIBRARY_NOT_FOUND` 库不存在或不属于当前用户
+
+### 4.2 素材
+
+| ✅ | 方法 | 路径 | 请求 | 响应 |
+|---|---|---|---|---|
+| ✅ | GET    | `/api/media/assets?libraryId=&type=&source=&keyword=&page=&pageSize=` | - | `PageResult<MediaAsset>` |
+| ✅ | GET    | `/api/media/assets/{id}` | - | `MediaAsset` |
+| ✅ | POST   | `/api/media/assets` | `multipart/form-data (file, libraryId?)` | `MediaUploadResponse` |
+| ✅ | PATCH  | `/api/media/assets/{id}` | `PatchAssetRequest` | `MediaAsset` |
+| ✅ | DELETE | `/api/media/assets/{id}` | - | - |
+| ✅ | POST   | `/api/media/assets/batch-delete` | `BatchDeleteAssetsRequest` | `{ deleted: number, requested: number }` |
+
+```ts
+type MediaType = 'image' | 'video' | 'audio';
+type MediaSource = 'uploaded' | 'ai-generated';
+
+MediaAsset = {
+  id: number;
+  libraryId: number;                  // 所属资产库
+  libraryName?: string;               // 冗余字段，列表时填充
+  type: MediaType;
+  source: MediaSource;
+  name: string;                       // 文件名
+  mimeType?: string;
+  sizeBytes?: number;
+  width?: number;
+  height?: number;
+  durationSec?: number;               // 视频/音频时长
+  url: string;                        // MinIO 24h 预签名 URL，前端直接展示
+  sourceTool?: 'video'|'image'|'canvas'|'agent'|'upload'|string;
+  sourceTaskId?: string;              // 关联的生成任务 ID（AI 素材时）
+  createdAt: string;                  // ISO timestamp
+  updatedAt?: string;
+};
+
+MediaUploadResponse = {
+  id: number;
+  url: string;                        // 预签名 URL
+  name: string;
+  type: MediaType;
+  size: number;                       // bytes
+};
+
+PatchAssetRequest = { name: string };
+BatchDeleteAssetsRequest = { ids: number[] };
+```
+
+> **上传限制**（后端 `MediaServiceImpl.checkSize`）：
+> - 图片 ≤ 20 MB
+> - 视频 ≤ 200 MB
+> - 音频 ≤ 50 MB
+> - 支持 MIME：`image/*` `video/*` `audio/*`，或按扩展名兜底
+> - 前端调用时**不要**自己设 `Content-Type`，让浏览器自动生成 `multipart/form-data` 边界
+>
+> **下载**：返回的 `url` 是 24h 有效的 MinIO 预签名 URL，前端直接 `<img src=url>` 展示即可；不要在客户端持久化该 URL。
+>
+> 错误码：
+> - `MEDIA_FILE_EMPTY` 文件为空
+> - `MEDIA_ASSET_TYPE_INVALID` 文件类型不支持
+> - `MEDIA_FILE_TOO_LARGE` 超过大小限制
+> - `MEDIA_UPLOAD_FAILED` MinIO 上传失败
+> - `MEDIA_ASSET_NOT_FOUND` 素材不存在或不属于当前用户
+
+### 4.3 角色库（兼容旧接口）
+
+> 历史「角色库」功能已并入资产库的 `type=custom` 库，下方接口保留向后兼容，**新业务请走 4.1/4.2**。
+
+| ✅ | 方法 | 路径 | 请求 | 响应 |
+|---|---|---|---|---|
+| ☐ | GET  | `/api/media/roles/categories` | - | `RoleCategory[]` |
+| ☐ | GET  | `/api/media/roles?category=&keyword=&page=&pageSize=` | - | `{ items: MediaItem[], total: number }` |
+
+`RoleCategory = { key: string; label: string }`
 
 ---
 

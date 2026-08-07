@@ -14,6 +14,86 @@
 
 ---
 
+## 2026-08-07 media · 上传类型校验加强
+
+> **目标**：原 `inferType` 只用前缀和扩展名正则匹配，过于宽松——任何带 `.png` 后缀的 `application/octet-stream` 都能通过，攻击者可绕过类型限制上传任意文件。现改为「MIME 白名单 + 扩展名白名单 + 类别一致性 + 黑名单」多重校验。
+
+### 后端
+
+- 修改 `service/impl/MediaServiceImpl.java`
+  - 新增白名单常量 `ALLOWED_IMAGE_MIME/VIDEO/AUDIO`、`ALLOWED_IMAGE_EXT/VIDEO/AUDIO`，仅接受明确的具体 MIME 与扩展名
+  - 新增黑名单常量 `BLACKLIST_EXT`、`BLACKLIST_MIME`，覆盖可执行/脚本/文档/压缩包/配置/证书/HTML/SVG 等危险类型
+  - 重写 `inferType(mime, filename)`：
+    1. 先过黑名单（黑命中直接拒绝）
+    2. MIME 与扩展名都必须在白名单，且**指向同一类别**（image/video/audio）才接受
+    3. 只命中其一可接受；都未命中拒绝
+  - 新增辅助 `categorizeByMime` / `categorizeByExt`
+  - 错误信息 `MEDIA_ASSET_TYPE_INVALID` 改为包含 mime、filename、允许的类型列表
+
+### 前端
+
+- 修改 `api/media.real.ts`：上传失败时尝试从响应体提取 `message` 字段抛出
+- 修改 `app/assets/AssetsView.tsx` 的 `handleUpload`：逐文件 try/catch，错误汇总后 alert 提示
+
+### 文档
+
+- 修改 `API.md`：在 `POST /api/media/assets` 接口行下补充白名单/黑名单说明
+
+---
+
+## 2026-08-07 media · 新增资产库（Media Library）+ 素材资产模块
+
+> **目标**：将原「素材库 / 角色库」重构为「资产库 + 素材」模型，注册时自动建 2 个系统库（"我的资产"/"AI 生成结果"），用户可建自定义库。
+
+### 后端
+
+- 新增 V8 迁移 `V8__media_assets.sql`：建表 `media_libraries`（用户资产库）和 `media_assets`（素材）
+  - `media_libraries` 唯一约束 `(user_id, name)`，索引 `idx_user_type` `idx_user_created`
+  - `media_assets` 索引 `idx_user_created` `idx_user_type` `idx_user_source` `idx_user_library`
+  - 两表均使用 MyBatis Plus `@TableLogic` 软删
+- 新增实体 `entity/MediaLibrary.java`、`entity/MediaAsset.java`
+- 新增 Repository `repository/MediaLibraryRepository.java`、`repository/MediaAssetRepository.java`（均继承 `BaseMapper<T>` + `@Mapper`）
+- 新增 Service 接口与实现：
+  - `service/MediaLibraryService(Impl).java`：listLibraries / createLibrary / renameLibrary / deleteLibrary / createDefaultLibraries / getAiLibrary / getUploadLibrary / getOrCreateDefaultCustom
+  - `service/MediaService(Impl).java`：listAssets / getAsset / uploadAsset / deleteAsset / batchDeleteAssets / renameAsset / recordAiGenerated / deleteAssetsByLibrary
+- 新增 Controller：
+  - `controller/MediaLibraryController.java` → `/api/media/libraries`
+  - `controller/MediaController.java` → `/api/media/assets`
+- 新增 DTO：`MediaListQuery` `MediaAssetResponse` `MediaUploadResponse` `PatchAssetRequest` `BatchDeleteAssetsRequest` `CreateLibraryRequest` `RenameLibraryRequest` `MediaLibraryResponse`
+- 新增错误码（7xxx 段）：`MEDIA_LIBRARY_NOT_FOUND` / `MEDIA_LIBRARY_NAME_DUPLICATE` / `MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY` / `MEDIA_ASSET_NOT_FOUND` / `MEDIA_ASSET_TYPE_INVALID` / `MEDIA_FILE_EMPTY` / `MEDIA_FILE_TOO_LARGE` / `MEDIA_UPLOAD_FAILED`
+- `AuthServiceImpl` 注册逻辑：注册成功后调用 `MediaLibraryService.createDefaultLibraries(userId)` 自动建 2 个系统库
+- `GenerationServiceImpl` AI 生成完成：调用 `MediaService.recordAiGenerated(...)` 把产物写入"AI 生成结果"库
+- 文件上传限制：图片 ≤ 20MB / 视频 ≤ 200MB / 音频 ≤ 50MB（`application.yml` 已放宽 `spring.servlet.multipart` 限制）
+
+### 接口契约
+
+- 新增 `GET  /api/media/libraries` → 列出我的所有库（2 个系统库 + custom 库，按 sortOrder 升序）
+- 新增 `POST /api/media/libraries` → 新建 custom 库（`CreateLibraryRequest`）
+- 新增 `PATCH /api/media/libraries/{id}` → 重命名（系统库返回 `MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY`）
+- 新增 `DELETE /api/media/libraries/{id}` → 删除 custom 库（级联删除库内素材 + MinIO 对象）
+- 新增 `GET  /api/media/assets?libraryId=&type=&source=&keyword=&page=&pageSize=` → 分页列表
+- 新增 `GET  /api/media/assets/{id}` → 素材详情
+- 新增 `POST /api/media/assets` → `multipart/form-data` 上传（`file`, `libraryId?`），未传 libraryId 默认进"我的资产"
+- 新增 `PATCH /api/media/assets/{id}` → 改名
+- 新增 `DELETE /api/media/assets/{id}` → 删除（连 MinIO）
+- 新增 `POST /api/media/assets/batch-delete` → 批量删除
+
+### 前端
+
+- 新增类型 `types/media.ts`：`MediaLibrary` `MediaAsset` `MediaListQuery` `MediaUploadResponse` 等
+- 新增 `api/media.real.ts` / `api/media.mock.ts` / `api/media.ts`（统一出口，按 `USE_MOCK` 分发）
+- `mediaApi` 暴露方法：`listLibraries / createLibrary / renameLibrary / deleteLibrary / listAssets / getAsset / uploadAsset / renameAsset / deleteAsset / batchDeleteAssets` + 旧 `listRoleCategories / listRoles` 兼容
+- mock 默认数据：2 个系统库（`我的资产` / `AI 生成结果`）+ 5 条示例素材
+- 上传走原生 `fetch` + `FormData`（避免 `@/lib/http` 序列化 JSON 时丢 boundary）
+- `mediaApi` 已在 `src/api/index.ts` 导出（之前已注册到 `config.ts` 的 `APIS` 数组）
+
+### 文档
+
+- 重写 `docs/API.md` 第 4 节，拆为 4.1 资产库 / 4.2 素材 / 4.3 角色库兼容三段
+- 本条变更日志
+
+---
+
 ## 2026-08-03 canvas · 新增画布节点生成接口占位
 
 - 新增 `POST /api/canvas/nodes` → 创建文本 / 图片 / 视频 / 音频节点

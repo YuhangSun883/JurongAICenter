@@ -13,6 +13,7 @@ import com.jurong.aicenter.repository.RevokedTokenRepository;
 import com.jurong.aicenter.repository.UserRepository;
 import com.jurong.aicenter.security.JwtTokenProvider;
 import com.jurong.aicenter.service.AuthService;
+import com.jurong.aicenter.service.MediaLibraryService;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
@@ -35,6 +36,7 @@ public class AuthServiceImpl implements AuthService {
     private final PasswordEncoder passwordEncoder;
     private final JwtTokenProvider jwtTokenProvider;
     private final RevokedTokenRepository revokedTokenRepository;
+    private final MediaLibraryService mediaLibraryService; // V8 资产库：注册即建默认库
 
     @Override
     public AuthResponse register(RegisterRequest request) {
@@ -69,6 +71,14 @@ public class AuthServiceImpl implements AuthService {
 
         // 4. 插入数据库
         userRepository.insert(user);
+
+        // 4.5 V8 资产库：注册即建 2 个系统默认库（"我的资产" + "AI 生成结果"）
+        try {
+            mediaLibraryService.createDefaultLibraries(user.getId());
+        } catch (Exception e) {
+            // 默认库创建失败不应阻塞注册（用户能登录后还能补救）
+            log.warn("createDefaultLibraries failed for userId={}: {}", user.getId(), e.getMessage());
+        }
 
         // 5. 生成 JWT 并返回响应
         return buildAuthResponse(user);
