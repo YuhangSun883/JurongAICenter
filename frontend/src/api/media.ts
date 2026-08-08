@@ -1,35 +1,30 @@
 // 媒体资产业务侧统一入口
-// （不再支持 mock,统一走真实后端）
+// 走真实后端（USE_MOCK 由 .env.local 配置 NEXT_PUBLIC_USE_MOCK=false）
+//
+// mock 实现保留在 media.mock.ts，开发时若要切换可改这里：
+//   import * as real from './media.real';
+//   import * as mock from './media.mock';
+//   import { USE_MOCK } from './config';
+//   ... USE_MOCK ? mock.xxx() : real.xxx()
+
 import * as real from './media.real';
 
 export const mediaApi = {
   // 资产库
-  listLibraries: () =>
-    USE_MOCK ? mock.listLibraries() : real.listLibraries(),
-  createLibrary: (req: Parameters<typeof real.createLibrary>[0]) =>
-    USE_MOCK ? mock.createLibrary(req) : real.createLibrary(req),
-  renameLibrary: (id: number, req: Parameters<typeof real.renameLibrary>[1]) =>
-    USE_MOCK ? mock.renameLibrary(id, req) : real.renameLibrary(id, req),
-  deleteLibrary: (id: number) =>
-    USE_MOCK ? mock.deleteLibrary(id) : real.deleteLibrary(id),
+  listLibraries: () => real.listLibraries(),
+  createLibrary: (req: Parameters<typeof real.createLibrary>[0]) => real.createLibrary(req),
+  renameLibrary: (id: number, req: Parameters<typeof real.renameLibrary>[1]) => real.renameLibrary(id, req),
+  deleteLibrary: (id: number) => real.deleteLibrary(id),
 
   // 素材
-  listAssets: (q?: Parameters<typeof real.listAssets>[0]) =>
-    USE_MOCK ? mock.listAssets(q) : real.listAssets(q),
-  getAsset: (id: number) =>
-    USE_MOCK ? mock.getAsset(id) : real.getAsset(id),
-  renameAsset: (id: number, name: string) =>
-    USE_MOCK ? mock.renameAsset(id, name) : real.renameAsset(id, name),
-  deleteAsset: (id: number) =>
-    USE_MOCK ? mock.deleteAsset(id) : real.deleteAsset(id),
-  batchDeleteAssets: (ids: number[]) =>
-    USE_MOCK ? mock.batchDeleteAssets(ids) : real.batchDeleteAssets(ids),
-  uploadAsset: (file: File, libraryId?: number) =>
-    USE_MOCK ? mock.uploadAsset(file, libraryId) : real.uploadAsset(file, libraryId),
+  listAssets: (q?: Parameters<typeof real.listAssets>[0]) => real.listAssets(q),
+  getAsset: (id: number) => real.getAsset(id),
+  renameAsset: (id: number, name: string) => real.renameAsset(id, name),
+  deleteAsset: (id: number) => real.deleteAsset(id),
+  batchDeleteAssets: (ids: number[]) => real.batchDeleteAssets(ids),
+  uploadAsset: (file: File, libraryId?: number) => real.uploadAsset(file, libraryId),
 
-  // 角色库（兼容旧）
-  listRoleCategories: () =>
-    USE_MOCK ? mock.listRoleCategories() : real.listRoleCategories(),
-  listRoles: (q?: Parameters<typeof real.listRoles>[0]) =>
-    USE_MOCK ? mock.listRoles(q) : real.listRoles(q),
+  // 角色库（同事保留，给画布/Agent 用）
+  listRoleCategories: () => real.listRoleCategories(),
+  listRoles: (q?: Parameters<typeof real.listRoles>[0]) => real.listRoles(q),
 };
