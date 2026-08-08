@@ -34,6 +34,52 @@ interface Props {
   required?: number;
 }
 
+const FALLBACK_PLANS: PlanInfo[] = [
+  {
+    id: 'basic', title: '基础版（月卡）', badge: '9.6 折',
+    price: 99, originalPrice: 103, description: '适合轻度体验',
+    credits: 103, validDays: 30, cta: 'ghost',
+    features: [
+      '视频模型 Seedance 2.0 VIP通道',
+      '高级图片模型',
+      '智能编导·一键商详·无限画布',
+      '电脑手机多端可用',
+    ],
+  },
+  {
+    id: 'standard', title: '标准版（月卡）', badge: '9 折',
+    price: 399, originalPrice: 443, description: '更划算，适合持续创作',
+    credits: 443, validDays: 30, cta: 'primary', highlighted: true,
+    features: [
+      '视频模型 Seedance 2.0 VIP通道',
+      '高级图片模型',
+      '智能编导·一键商详·无限画布',
+      '电脑手机多端可用',
+    ],
+  },
+  {
+    id: 'premium', title: '高级版（月卡）', badge: '8.3 折',
+    price: 699, originalPrice: 838, description: '单价更低，适合高强创作',
+    credits: 838, validDays: 30, cta: 'ghost',
+    features: [
+      '视频模型 Seedance 2.0 VIP通道',
+      '高级图片模型',
+      '智能编导·一键商详·无限画布',
+      '电脑手机多端可用',
+    ],
+  },
+  {
+    id: 'enterprise', title: '企业套餐', description: '联系客服',
+    price: 0, credits: 0, validDays: 0, cta: 'contact',
+    features: [
+      '企业用量与能力可单独报价',
+      '支持合同、对公与开票',
+      '提供企业内训和业务陪跑',
+      '资产存储数量与权限可按需定制',
+    ],
+  },
+];
+
 export function InsufficientCreditsDialog({
   open, onClose, onPaid, remaining, required,
 }: Props) {
@@ -69,12 +115,17 @@ export function InsufficientCreditsDialog({
     setSelectedId(null); // 重置选中
     agentApi.listPlans()
       .then((arr) => {
-        setPlans(arr);
+        const nextPlans = arr.length > 0 ? arr : FALLBACK_PLANS;
+        setPlans(nextPlans);
         // 默认选中：后端 highlighted 的套餐，否则第一张
-        const def = arr.find((p) => p.highlighted) ?? arr[0];
+        const def = nextPlans.find((p) => p.highlighted) ?? nextPlans[0];
         if (def) setSelectedId(def.id);
       })
-      .catch(() => setPlans([]))
+      .catch(() => {
+        setPlans(FALLBACK_PLANS);
+        const def = FALLBACK_PLANS.find((p) => p.highlighted) ?? FALLBACK_PLANS[0];
+        if (def) setSelectedId(def.id);
+      })
       .finally(() => setLoading(false));
   }, [open]);
 

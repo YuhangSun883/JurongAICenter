@@ -8,7 +8,7 @@ export function Hero() {
     <section className="pt-8">
       {/* 主标题 */}
       <h1 className="text-center text-3xl font-bold leading-tight sm:text-5xl">
-        <span className="text-gradient">聚融电商</span>
+        <span className="text-gradient">全域智像</span>
       </h1>
 
       {/* 强调副标题：混排高亮关键词 */}
