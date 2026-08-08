@@ -9,7 +9,7 @@ import type {
   RoleListQuery,
 } from '@/types/media';
 import type { PageResult } from '@/types/api';
-import { ROLES } from '@/components/common/MediaPickerDialog.mocks';
+const ROLES: Record<string, Array<{ id: string; url: string; name: string; size: string }>> = {};
 
 const delay = <T>(v: T, ms = 200) => new Promise<T>((r) => setTimeout(() => r(v), ms));
 
