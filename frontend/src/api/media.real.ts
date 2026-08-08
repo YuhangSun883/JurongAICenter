@@ -86,7 +86,7 @@ export async function uploadAsset(file: File, libraryId?: number): Promise<Media
   if (libraryId != null) {
     form.append('libraryId', String(libraryId));
   }
-  const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null;
+  const token = typeof window !== 'undefined' ? localStorage.getItem('accessToken') : null;
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
   const res = await fetch(`${API_BASE}${API}/assets`, {
     method: 'POST',
