@@ -414,6 +414,7 @@ function AssetsView({
 }) {
   const tabToType: Record<typeof tab, string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
   const showUploaded = source === '全部' || source === '我上传的';
+  const PAGE_SIZE = 24;
 
   return (
     <>
