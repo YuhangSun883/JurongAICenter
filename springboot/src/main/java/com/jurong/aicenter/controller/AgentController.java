@@ -100,6 +100,18 @@ public class AgentController {
         return agentService.getCredits(user.id());
     }
 
+    /**
+     * 积分前置校验（前端发送消息前调用）：
+     * 返回 ok / insufficient，前端根据 status 决定是否走 send
+     */
+    @PostMapping("/credits/check")
+    public AgentCreditCheckResponse checkCredits(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody AgentCreditCheckRequest req) {
+        requireUser(user);
+        return agentService.checkCredits(user.id(), req);
+    }
+
     private void requireUser(AuthenticatedUser user) {
         if (user == null || user.id() == null) {
             throw new BusinessException(ErrorCode.UNAUTHORIZED);

@@ -215,6 +215,38 @@ public class AgentServiceImpl implements AgentService {
         );
     }
 
+    @Override
+    public AgentCreditCheckResponse checkCredits(Long userId, AgentCreditCheckRequest req) {
+        // 1. 拿用户当前剩余积分（复用 getCredits 的逻辑，避免重复读库）
+        AgentCreditInfo info = getCredits(userId);
+        int remaining = info.getRemaining() == null ? 0 : info.getRemaining();
+
+        // 2. 精算 required：MVP 阶段按 estimated 原值返回
+        //    （将来可在此根据 action + context 做更细的换算：
+        //      - agent-send：消息长度 / 模型档位
+        //      - video-create：分辨率 / 时长
+        //      - image-create：分辨率 / 步数）
+        int required = req.getEstimated() == null ? 0 : Math.max(0, req.getEstimated());
+
+        // 3. 判定 status
+        if (remaining >= required) {
+            return new AgentCreditCheckResponse("ok", remaining, required, null, null);
+        }
+
+        // 4. 不够：返回 insufficient + 错误码（让前端弹充值弹窗）
+        //    ErrorCode.INSUFFICIENT_CREDITS 若存在用之，否则复用通用 INVALID_PARAM
+        Integer code = null;
+        String message = "积分不足";
+        try {
+            code = com.jurong.aicenter.exception.ErrorCode.valueOf("INSUFFICIENT_CREDITS").getCode();
+        } catch (Exception ignore) {
+            // 该错误码未定义时降级
+            code = 9001;
+            message = "积分不足,请充值";
+        }
+        return new AgentCreditCheckResponse("insufficient", remaining, required, code, message);
+    }
+
     /* ================== helpers ================== */
 
     private AgentSession requireOwnedSession(Long userId, String sessionId) {

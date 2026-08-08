@@ -22,4 +22,10 @@ public interface AgentService {
     AgentSendResponse send(Long userId, AgentSendRequest req);
     /** 当前用户积分 */
     AgentCreditInfo getCredits(Long userId);
+
+    /**
+     * 积分前置校验（发送前调用）。
+     * <p>按 action + estimated + context 精算 required，返回 ok / insufficient。
+     */
+    AgentCreditCheckResponse checkCredits(Long userId, AgentCreditCheckRequest req);
 }
