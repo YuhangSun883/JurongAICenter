@@ -1,118 +1,150 @@
 package com.jurong.aicenter.controller;
 
-import com.jurong.aicenter.dto.media.MediaAssetDto;
-import com.jurong.aicenter.dto.media.MediaLibraryDto;
-import com.jurong.aicenter.dto.media.MediaRoleDto;
-import com.jurong.aicenter.dto.media.UploadMediaResponse;
 import com.jurong.aicenter.dto.PageResult;
 import com.jurong.aicenter.dto.media.BatchDeleteAssetsRequest;
+import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
+import com.jurong.aicenter.dto.media.MediaLibraryResponse;
 import com.jurong.aicenter.dto.media.MediaListQuery;
+import com.jurong.aicenter.dto.media.MediaRoleDto;
 import com.jurong.aicenter.dto.media.MediaUploadResponse;
 import com.jurong.aicenter.dto.media.PatchAssetRequest;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
+import com.jurong.aicenter.service.MediaLibraryService;
 import com.jurong.aicenter.service.MediaService;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.Map;
 
 /**
- * 媒体资产 REST API
+ * 媒体资产 REST API（合并版：资产库 + 素材 + 角色库）
  *
- * 端点:
- *   GET    /api/media/libraries                 拉资产库列表
- *   GET    /api/media/assets                    拉素材列表(带筛选/分页)
- *   GET    /api/media/assets/{id}               单条素材
- *   POST   /api/media/upload                    上传文件(multipart)
- *   DELETE /api/media/assets/{id}               删除素材
- *   GET    /api/media/roles/categories          拉角色分类
- *   GET    /api/media/roles                     拉全部角色
- *   GET    /api/media/roles?category=xxx        按分类拉角色
+ * <p>合并后的接口一览：
+ * <pre>
+ * 资产库
+ *   GET    /api/media/libraries            拉资产库列表（系统默认 + 自定义）
+ *
+ * 素材
+ *   GET    /api/media/assets               分页列表（按 userId 隔离，支持筛选）
+ *   GET    /api/media/assets/{id}          素材详情
+ *   POST   /api/media/assets               上传（multipart/form-data，libraryId 可选）
+ *   PATCH  /api/media/assets/{id}          改名（同库内重名校验）
+ *   DELETE /api/media/assets/{id}          删除（连 MinIO）
+ *   POST   /api/media/assets/batch-delete  批量删除
+ *
+ * 角色库（同事设计，给画布/Agent 用）
+ *   GET    /api/media/roles/categories     拉角色分类
+ *   GET    /api/media/roles                拉角色列表（支持 ?category=xxx）
+ * </pre>
+ *
+ * <p>说明：资产库的 CRUD（创建/重命名/删除）独立在 MediaLibraryController 里，
+ * 路径前缀 /api/media/libraries/*。
  */
 @Slf4j
 @RestController
 @RequestMapping("/api/media")
- * 资产素材 REST API。
- *
- * 端点列表：
- *   GET    /api/media/assets           分页列表（按 userId 隔离）
- *   GET    /api/media/assets/{id}      素材详情
- *   POST   /api/media/assets           上传（multipart/form-data，libraryId 可选）
- *   PATCH  /api/media/assets/{id}      改名
- *   DELETE /api/media/assets/{id}      删除（连 MinIO）
- *   POST   /api/media/assets/batch-delete  批量删除
- */
-@RestController
-@RequestMapping("/api/media/assets")
 @RequiredArgsConstructor
 public class MediaController {
 
     private final MediaService mediaService;
+    private final MediaLibraryService mediaLibraryService;
+
+    // ==================== 资产库（资产库列表） ====================
 
     @GetMapping("/libraries")
-    public List<MediaLibraryDto> listLibraries(@AuthenticationPrincipal AuthenticatedUser user) {
+    public List<MediaLibraryResponse> listLibraries(@AuthenticationPrincipal AuthenticatedUser user) {
         requireUser(user);
-        return mediaService.listLibraries(user.id());
+        return mediaLibraryService.listLibraries(user.id());
     }
 
+    // ==================== 素材 ====================
+
+    /**
+     * 分页查询素材（按用户隔离）。
+     * query 参数全部绑定到 MediaListQuery 上，详见 MediaListQuery 字段定义。
+     */
     @GetMapping("/assets")
-    public Map<String, Object> listAssets(
-            @AuthenticationPrincipal AuthenticatedUser user,
-            @RequestParam(required = false) Long libraryId,
-            @RequestParam(required = false) String type,
-            @RequestParam(required = false) String source,
-            @RequestParam(required = false) String keyword,
-            @RequestParam(required = false, defaultValue = "1") int page,
-            @RequestParam(required = false, defaultValue = "24") int pageSize) {
-        requireUser(user);
-        return mediaService.listAssets(user.id(), libraryId, type, source, keyword, page, pageSize);
-    }
-
-    @GetMapping("/assets/{id}")
-    public MediaAssetDto getAsset(
-    @GetMapping
-    public PageResult<MediaAssetResponse> list(
+    public PageResult<MediaAssetResponse> listAssets(
             @AuthenticationPrincipal AuthenticatedUser user,
             MediaListQuery query) {
         requireUser(user);
         return mediaService.listAssets(user.id(), query);
     }
 
-    @GetMapping("/{id}")
-    public MediaAssetResponse get(
+    @GetMapping("/assets/{id}")
+    public MediaAssetDto getAsset(
             @AuthenticationPrincipal AuthenticatedUser user,
             @PathVariable Long id) {
         requireUser(user);
         return mediaService.getAsset(user.id(), id);
     }
 
-    @PostMapping("/upload")
-    public UploadMediaResponse upload(
+    /**
+     * 上传素材到指定 libraryId；不传则按你的"当前库"路由：
+     *   - 当前选中 "我的资产" / "AI 生成结果" → 进对应默认库
+     *   - 当前选中自定义库 → 进该库
+     *   - 未登录不允许
+     */
+    @PostMapping("/assets")
+    public MediaUploadResponse upload(
             @AuthenticationPrincipal AuthenticatedUser user,
-            @RequestParam(required = false) Long libraryId,
+            @RequestParam(value = "libraryId", required = false) Long libraryId,
             @RequestParam("file") MultipartFile file) {
         requireUser(user);
-        return mediaService.upload(user.id(), libraryId, file);
+        return mediaService.uploadAsset(user.id(), libraryId, file);
+    }
+
+    /**
+     * 改名（PATCH）：同库内重名校验，错误码 7012 MEDIA_ASSET_NAME_DUPLICATE。
+     */
+    @PatchMapping("/assets/{id}")
+    public MediaAssetResponse rename(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id,
+            @Valid @RequestBody PatchAssetRequest request) {
+        requireUser(user);
+        return mediaService.renameAsset(user.id(), id, request.getName());
     }
 
     @DeleteMapping("/assets/{id}")
-    public Map<String, Object> deleteAsset(
+    public ResponseEntity<Void> delete(
             @AuthenticationPrincipal AuthenticatedUser user,
             @PathVariable Long id) {
         requireUser(user);
         mediaService.deleteAsset(user.id(), id);
-        return Map.of("assetId", id, "status", "deleted");
+        return ResponseEntity.noContent().build();
     }
+
+    /**
+     * 批量删除：传入 ids 列表，返回 {deleted, requested}。
+     */
+    @PostMapping("/assets/batch-delete")
+    public Map<String, Object> batchDelete(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody BatchDeleteAssetsRequest request) {
+        requireUser(user);
+        int deleted = mediaService.batchDeleteAssets(user.id(), request.getIds());
+        return Map.of("deleted", deleted, "requested", request.getIds().size());
+    }
+
+    // ==================== 角色库（同事保留） ====================
 
     @GetMapping("/roles/categories")
     public List<Map<String, String>> listRoleCategories(@AuthenticationPrincipal AuthenticatedUser user) {
@@ -129,46 +161,13 @@ public class MediaController {
             return mediaService.listAllRoles();
         }
         return mediaService.listRolesByCategory(category);
-    @PostMapping
-    public MediaUploadResponse upload(
-            @AuthenticationPrincipal AuthenticatedUser user,
-            @RequestParam(value = "libraryId", required = false) Long libraryId,
-            @RequestParam("file") MultipartFile file) {
-        requireUser(user);
-        return mediaService.uploadAsset(user.id(), libraryId, file);
     }
 
-    @PatchMapping("/{id}")
-    public MediaAssetResponse rename(
-            @AuthenticationPrincipal AuthenticatedUser user,
-            @PathVariable Long id,
-            @Valid @RequestBody PatchAssetRequest request) {
-        requireUser(user);
-        return mediaService.renameAsset(user.id(), id, request.getName());
-    }
-
-    @DeleteMapping("/{id}")
-    public ResponseEntity<Void> delete(
-            @AuthenticationPrincipal AuthenticatedUser user,
-            @PathVariable Long id) {
-        requireUser(user);
-        mediaService.deleteAsset(user.id(), id);
-        return ResponseEntity.noContent().build();
-    }
-
-    @PostMapping("/batch-delete")
-    public Map<String, Object> batchDelete(
-            @AuthenticationPrincipal AuthenticatedUser user,
-            @Valid @RequestBody BatchDeleteAssetsRequest request) {
-        requireUser(user);
-        int deleted = mediaService.batchDeleteAssets(user.id(), request.getIds());
-        return Map.of("deleted", deleted, "requested", request.getIds().size());
-    }
+    // ==================== 工具 ====================
 
     private void requireUser(AuthenticatedUser user) {
         if (user == null || user.id() == null) {
             throw new BusinessException(ErrorCode.UNAUTHORIZED);
         }
     }
-}
 }
