@@ -1,7 +1,6 @@
 package com.jurong.aicenter.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.PageResult;
 import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
@@ -154,8 +153,10 @@ public class MediaServiceImpl implements MediaService {
         }
         wrapper.orderByDesc(MediaAsset::getCreatedAt);
 
-        Page<MediaAsset> mpPage = assetRepository.selectPage(new Page<>(page, size), wrapper);
-        List<MediaAsset> records = mpPage.getRecords();
+        // 显式 count + list（避免依赖 MyBatis Plus 自动 searchCount 行为）
+        Long total = assetRepository.selectCount(wrapper);
+        wrapper.last("LIMIT " + size + " OFFSET " + ((page - 1) * size));
+        List<MediaAsset> records = assetRepository.selectList(wrapper);
 
         // 批量取库名（避免 N+1）
         Map<Long, String> libraryNameMap = batchLoadLibraryNames(userId, records);
@@ -164,7 +165,7 @@ public class MediaServiceImpl implements MediaService {
             .map(asset -> toResponse(asset, libraryNameMap.get(asset.getLibraryId())))
             .toList();
 
-        return new PageResult<>(items, mpPage.getTotal(), page, size);
+        return new PageResult<>(items, total == null ? 0L : total, page, size);
     }
 
     @Override
