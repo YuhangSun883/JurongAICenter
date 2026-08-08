@@ -20,7 +20,7 @@ export interface PickedMedia {
   name: string;
 }
 
-interface MediaPickerDialogProps {
+export interface MediaPickerDialogProps {
   open: boolean;
   onClose: () => void;
   onConfirm?: (picked: PickedMedia[]) => void;
@@ -31,6 +31,7 @@ interface MediaPickerDialogProps {
   max?: number;
   /** 已上传的素材（由父组件持有，关闭弹窗后保留） */
   uploadedFiles?: PickedMedia[];
+  showMockAssets?: boolean;
   /** 默认 false: 走真实 API（我的资产 + 角色库） */
   initialTab?: typeof TABS[number];
   title?: string;
@@ -48,6 +49,8 @@ interface RoleItem {
   date: string;
   size: string;
 }
+
+const PAGE_SIZE = 24;
 
 export function MediaPickerDialog({
   open, onClose, onConfirm, max = 12, uploadedFiles: propUploadedFiles, onUploadFiles, onRemoveUploaded,
@@ -77,8 +80,6 @@ export function MediaPickerDialog({
 
   /** 已上传素材：完全由父组件持有（prop 模式） */
   const uploadedFiles = propUploadedFiles ?? [];
-
-  const PAGE_SIZE = 24;
 
   useEffect(() => setMounted(true), []);
 
@@ -128,7 +129,7 @@ export function MediaPickerDialog({
       try {
         const res = await mediaApi.listAssets({
           libraryId: currentLibId,
-          type: tabToType(tab),
+          type: tabToType[tab],
           source: sourceToApiSource(source),
           keyword,
           page: assetsPage,
@@ -217,7 +218,7 @@ export function MediaPickerDialog({
       if (activeTopTab === 'assets') {
         const res = await mediaApi.listAssets({
           libraryId: currentLibId,
-          type: tabToType(tab),
+          type: tabToType[tab],
           source: sourceToApiSource(source),
           keyword,
           page: 1,
