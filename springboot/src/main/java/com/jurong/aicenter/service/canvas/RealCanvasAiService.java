@@ -202,15 +202,39 @@ public class RealCanvasAiService implements CanvasAiService {
 
     @Override
     public String generateVideo(String prompt, String imageUrl, String upstreamContent) {
-        // 分流：
-        //   - 有上游图片 → 走 NewAPI（图生视频）
-        //     原因：ComfyUI 的 /upload/image 端点不稳定（500 Server got itself in trouble），
-        //     且 NewAPI 本来就是图生视频的实际执行者，多绕一层 ComfyUI 没意义
-        //   - 无上游图片 → 走 ComfyUI workflow 02（纯文生视频，昨实验证可用）
-        if (imageUrl == null || imageUrl.isBlank()) {
-            return generateVideoViaComfyUI(prompt, null, upstreamContent);
+        // 2026-08-07: 统一走 ComfyUI
+        //   - 有上游图片 → 上传到 ComfyUI input → workflow 03 (SVD)
+        //   - 无上游图片 → workflow 02 (文生视频)
+        // 原因:ComfyUI workflow 03 已经实装可用；NewAPI /v1/videos 上游经常 500
+        String imageFilename = null;
+        if (imageUrl != null && !imageUrl.isBlank()) {
+            imageFilename = uploadImageForComfyUI(imageUrl);
         }
-        return generateVideoViaNewApi(prompt, imageUrl, upstreamContent);
+        return generateVideoViaComfyUI(prompt, imageFilename, upstreamContent);
+    }
+
+    /**
+     * 从 MinIO 下载上游图片，上传到 ComfyUI input 目录，返回 ComfyUI 分配的文件名
+     * 后续在 workflow JSON 里用 {{image_filename}} 占位符引用
+     */
+    private String uploadImageForComfyUI(String imageUrl) {
+        try (InputStream is = new URI(imageUrl).toURL().openStream()) {
+            byte[] rawBytes = is.readAllBytes();
+            // 从 URL 取纯文件名（去掉 query string，避开 [Errno 36] File name too long）
+            String fullName = imageUrl.contains("/")
+                ? imageUrl.substring(imageUrl.lastIndexOf('/') + 1)
+                : "canvas_input.png";
+            String originalName = fullName.contains("?")
+                ? fullName.substring(0, fullName.indexOf('?'))
+                : fullName;
+            String mime = inferContentType(originalName, "image");
+            log.info("Canvas video (ComfyUI) uploadImage: input: imageBytes={}B, filename={}, mime={}",
+                rawBytes.length, originalName, mime);
+            return comfyUIClient.uploadImage(rawBytes, originalName, mime);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                "下载上游图片或上传 ComfyUI 失败: " + e.getMessage());
+        }
     }
 
     /**
