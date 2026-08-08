@@ -8,8 +8,10 @@ export { videoApi } from './video';
 export { mediaApi } from './media';
 export { canvasApi } from './canvas';
 export { watermarkApi } from './watermark';
+export { imageApi } from './image';
+export { promptApi } from './prompt';
+
 // 新增功能在这里加一行 export ↓
-// export { imageApi } from './image';
 
 // 通用类型
 export type { ApiResult, PageQuery, PageResult } from '@/types/api';
