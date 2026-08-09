@@ -19,27 +19,73 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
-/**
- * Agent 对话服务实现。
- *
- * 核心功能：会话 CRUD + 消息记忆 + 调 LLM。
- *
- * 关键约束（用户要求）：
- *   - session 与 session **互相独立，没有关联**
- *   - 每个 session 内消息按 created_at 升序（对话记忆）
- *   - 调 LLM 时按 session 内全部历史消息发（标准 chat/completions 格式）
- *   - 标题可以修改（rename）
- *   - 删除会话 CASCADE 删除消息
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class AgentServiceImpl implements AgentService {
+
+    private static final List<PlanInfo> PLANS = List.of(
+            new PlanInfo("basic", "基础版（月卡）", "9.6 折", 99, 103, "适合轻度体验", 103, 30,
+                    List.of(
+                            "视频模型 Seedance 2.0 VIP 通道",
+                            "高级图片模型",
+                            "智能编辑，一键商照，无限画布",
+                            "电脑/手机多端可用"
+                    ),
+                    false,
+                    "ghost"),
+            new PlanInfo("standard", "标准版（月卡）", "9 折", 399, 443, "更划算，适合持续创作", 443, 30,
+                    List.of(
+                            "视频模型 Seedance 2.0 VIP 通道",
+                            "高级图片模型",
+                            "智能编辑，一键商照，无限画布",
+                            "电脑/手机多端可用"
+                    ),
+                    true,
+                    "primary"),
+            new PlanInfo("premium", "高级版（月卡）", "8.3 折", 699, 838, "单价更低，适合高强度创作", 838, 30,
+                    List.of(
+                            "视频模型 Seedance 2.0 VIP 通道",
+                            "高级图片模型",
+                            "智能编辑，一键商照，无限画布",
+                            "电脑/手机多端可用"
+                    ),
+                    false,
+                    "ghost"),
+            new PlanInfo("enterprise", "企业套餐", null, 0, null, "联系客服", 0, 0,
+                    List.of(
+                            "企业用量与能力可单独报价",
+                            "支持合同、对公与开票",
+                            "提供企业内训和业务陪跑",
+                            "资产存储数量与权限可按需定制"
+                    ),
+                    false,
+                    "contact")
+    );
+
+    private static final List<CreditPackage> CREDIT_PACKAGES = List.of(
+            new CreditPackage("pkg-50", 50, 50, false),
+            new CreditPackage("pkg-75", 75, 75, true),
+            new CreditPackage("pkg-150", 150, 150, false),
+            new CreditPackage("pkg-225", 225, 225, false),
+            new CreditPackage("pkg-450", 450, 450, false),
+            new CreditPackage("pkg-882", 882, 900, false),
+            new CreditPackage("pkg-1960", 1960, 2000, false),
+            new CreditPackage("pkg-4900", 4900, 5000, false),
+            new CreditPackage("pkg-9800", 9800, 10000, false)
+    );
+
+    private static final Map<String, OrderRecord> ORDER_STORE = new ConcurrentHashMap<>();
+    private static final int DEFAULT_CREDITS_PER_MESSAGE = 1;
+    private static final int AUTO_PAID_AFTER_MS = 3500;
 
     private final AgentSessionRepository sessionRepo;
     private final AgentMessageRepository messageRepo;
@@ -54,9 +100,6 @@ public class AgentServiceImpl implements AgentService {
 
     @Value("${llm.system-prompt:你是 Jurong AI 助手，简洁专业地回答用户问题。}")
     private String llmSystemPrompt;
-
-    /** 默认每条消息消耗 1 积分（与前端估算口径一致） */
-    private static final int DEFAULT_CREDITS_PER_MESSAGE = 1;
 
     @Override
     public Map<String, Object> listSessions(Long userId, Integer page, Integer pageSize) {
@@ -90,7 +133,6 @@ public class AgentServiceImpl implements AgentService {
         s.setCreatedAt(LocalDateTime.now());
         s.setUpdatedAt(LocalDateTime.now());
         sessionRepo.insert(s);
-        log.info("Agent session created: id={}, userId={}", s.getId(), userId);
         return s;
     }
 
@@ -107,15 +149,12 @@ public class AgentServiceImpl implements AgentService {
     @Transactional
     public void deleteSession(Long userId, String sessionId) {
         requireOwnedSession(userId, sessionId);
-        // 先删消息（FK 关系不严谨，手动 CASCADE）
         messageRepo.delete(new QueryWrapper<AgentMessage>().eq("session_id", sessionId));
         sessionRepo.deleteById(sessionId);
-        log.info("Agent session deleted: id={}, userId={}", sessionId, userId);
     }
 
     @Override
     public Map<String, Object> listMessages(Long userId, String sessionId, Integer page, Integer pageSize) {
-        // 校验所有权
         requireOwnedSession(userId, sessionId);
 
         int p = page == null || page < 1 ? 1 : page;
@@ -140,20 +179,17 @@ public class AgentServiceImpl implements AgentService {
     @Override
     @Transactional
     public AgentSendResponse send(Long userId, AgentSendRequest req) {
-        // 1) 找到或创建 session
         AgentSession session;
-        boolean isNewSession = false;
         if (req.getSessionId() == null || req.getSessionId().isBlank()) {
-            // 用用户消息前 30 字做默认标题
             String defaultTitle = req.getContent().trim();
-            if (defaultTitle.length() > 30) defaultTitle = defaultTitle.substring(0, 30) + "...";
+            if (defaultTitle.length() > 30) {
+                defaultTitle = defaultTitle.substring(0, 30) + "...";
+            }
             session = createSession(userId, defaultTitle);
-            isNewSession = true;
         } else {
             session = requireOwnedSession(userId, req.getSessionId());
         }
 
-        // 2) 存用户消息
         AgentMessage userMsg = new AgentMessage();
         userMsg.setSessionId(session.getId());
         userMsg.setUserId(userId);
@@ -162,17 +198,14 @@ public class AgentServiceImpl implements AgentService {
         userMsg.setCreatedAt(LocalDateTime.now());
         messageRepo.insert(userMsg);
 
-        // 3) 拉历史消息（仅当前 session），组装 chat messages
         List<AgentMessage> history = messageRepo.selectList(
-            new QueryWrapper<AgentMessage>()
-                .eq("session_id", session.getId())
-                .orderByAsc("created_at")
+                new QueryWrapper<AgentMessage>()
+                        .eq("session_id", session.getId())
+                        .orderByAsc("created_at")
         );
 
-        // 4) 调 LLM
         String assistantContent = callLlm(history);
 
-        // 5) 存助手回复
         AgentMessage assistantMsg = new AgentMessage();
         assistantMsg.setSessionId(session.getId());
         assistantMsg.setUserId(userId);
@@ -181,121 +214,400 @@ public class AgentServiceImpl implements AgentService {
         assistantMsg.setCreatedAt(LocalDateTime.now());
         messageRepo.insert(assistantMsg);
 
-        // 6) 更新 session 元数据
         int creditsUsed = (session.getCreditsUsed() == null ? 0 : session.getCreditsUsed()) + DEFAULT_CREDITS_PER_MESSAGE;
         session.setCreditsUsed(creditsUsed);
         session.setUpdatedAt(LocalDateTime.now());
         sessionRepo.updateById(session);
 
-        log.info("Agent send OK: sessionId={}, userId={}, historyMsgs={}, responseLen={}",
-            session.getId(), userId, history.size(), assistantContent.length());
-
         return new AgentSendResponse(
-            session.getId(),
-            userMsg.getId(),
-            assistantMsg.getId(),
-            creditsUsed,
-            DEFAULT_CREDITS_PER_MESSAGE
+                session.getId(),
+                userMsg.getId(),
+                assistantMsg.getId(),
+                creditsUsed,
+                DEFAULT_CREDITS_PER_MESSAGE
         );
     }
 
     @Override
     public AgentCreditInfo getCredits(Long userId) {
-        User user = userRepo.selectById(userId);
-        if (user == null) {
-            throw new BusinessException(ErrorCode.USER_NOT_FOUND, "用户不存在");
-        }
-        int remaining = user.getMonthlyQuota() == null ? 0 : (user.getMonthlyQuota() - (user.getQuotaUsed() == null ? 0 : user.getQuotaUsed()));
+        User user = requireUser(userId);
+        int remaining = resolveRemainingCredits(user);
         return new AgentCreditInfo(
-            user.getMonthlyQuota() == null ? 0 : user.getMonthlyQuota(),
-            user.getQuotaUsed() == null ? 0 : user.getQuotaUsed(),
-            Math.max(0, remaining),
-            user.getMonthlyQuota() == null ? 0 : user.getMonthlyQuota(),
-            null
+                user.getMonthlyQuota() == null ? 0 : user.getMonthlyQuota(),
+                remaining,
+                remaining,
+                user.getMonthlyQuota() == null ? 0 : user.getMonthlyQuota(),
+                null
         );
     }
 
     @Override
-    public AgentCreditCheckResponse checkCredits(Long userId, AgentCreditCheckRequest req) {
-        // 1. 拿用户当前剩余积分（复用 getCredits 的逻辑，避免重复读库）
-        AgentCreditInfo info = getCredits(userId);
-        int remaining = info.getRemaining() == null ? 0 : info.getRemaining();
-
-        // 2. 精算 required：MVP 阶段按 estimated 原值返回
-        //    （将来可在此根据 action + context 做更细的换算：
-        //      - agent-send：消息长度 / 模型档位
-        //      - video-create：分辨率 / 时长
-        //      - image-create：分辨率 / 步数）
-        int required = req.getEstimated() == null ? 0 : Math.max(0, req.getEstimated());
-
-        // 3. 判定 status
-        if (remaining >= required) {
-            return new AgentCreditCheckResponse("ok", remaining, required, null, null);
+    public CreditsCheckResponse checkCredits(Long userId, CreditsCheckRequest req) {
+        User user = requireUser(userId);
+        int remaining = resolveRemainingCredits(user);
+        int required = resolveRequiredCredits(req);
+        if (remaining < required) {
+            return new CreditsCheckResponse(
+                    "insufficient",
+                    remaining,
+                    required,
+                    ErrorCode.QUOTA_INSUFFICIENT.getCode(),
+                    ErrorCode.QUOTA_INSUFFICIENT.getMessage(),
+                    null
+            );
         }
-
-        // 4. 不够：返回 insufficient + 错误码（让前端弹充值弹窗）
-        //    ErrorCode.INSUFFICIENT_CREDITS 若存在用之，否则复用通用 INVALID_PARAM
-        Integer code = null;
-        String message = "积分不足";
-        try {
-            code = com.jurong.aicenter.exception.ErrorCode.valueOf("INSUFFICIENT_CREDITS").getCode();
-        } catch (Exception ignore) {
-            // 该错误码未定义时降级
-            code = 9001;
-            message = "积分不足,请充值";
-        }
-        return new AgentCreditCheckResponse("insufficient", remaining, required, code, message);
+        return new CreditsCheckResponse("ok", remaining, required, null, null, null);
     }
 
-    /* ================== helpers ================== */
+    @Override
+    public List<PlanInfo> listPlans() {
+        return PLANS;
+    }
+
+    @Override
+    public CreatePlanOrderResponse createPlanOrder(Long userId, CreatePlanOrderRequest req) {
+        PlanInfo plan = findPlan(req.getPlanId());
+        String orderId = "order_" + randomId();
+        String payMethod = normalizePayMethod(req.getPayMethod());
+        long expireAt = System.currentTimeMillis() + 15 * 60 * 1000L;
+
+        ORDER_STORE.put(orderId, new OrderRecord(
+                orderId,
+                userId,
+                OrderKind.PLAN,
+                plan.getId(),
+                plan.getPrice(),
+                plan.getCredits(),
+                plan.getValidDays(),
+                payMethod,
+                expireAt
+        ));
+
+        return new CreatePlanOrderResponse(
+                orderId,
+                buildPayUrl(orderId),
+                plan.getPrice(),
+                buildQrCodeUrl(orderId, plan.getPrice()),
+                buildQrCodeContent(orderId, plan.getPrice()),
+                payMethod,
+                expireAt,
+                "pending"
+        );
+    }
+
+    @Override
+    @Transactional
+    public QueryOrderResponse queryOrder(Long userId, String orderId) {
+        OrderRecord order = ORDER_STORE.get(orderId);
+        if (order == null || order.userId != userId) {
+            return new QueryOrderResponse(orderId, "expired", null, null, 0, "", null);
+        }
+
+        long now = System.currentTimeMillis();
+        if ("pending".equals(order.status)) {
+            order.pollCount++;
+            if (now >= order.expireAt) {
+                order.status = "expired";
+            } else if (now >= order.autoPaidAt || order.pollCount >= 2) {
+                order.status = "paid";
+                order.paidAt = now;
+                applyOrderEffect(order, userId);
+            }
+        }
+
+        QueryOrderResponse.Receipt receipt = null;
+        if ("paid".equals(order.status)) {
+            receipt = new QueryOrderResponse.Receipt(order.credits, order.validDays);
+        }
+
+        return new QueryOrderResponse(
+                order.orderId,
+                order.status,
+                order.paidAt,
+                null,
+                order.amount,
+                order.refId,
+                receipt
+        );
+    }
+
+    @Override
+    public void cancelPlanOrder(Long userId, String orderId) {
+        OrderRecord order = ORDER_STORE.get(orderId);
+        if (order == null || order.userId != userId) {
+            return;
+        }
+        if ("pending".equals(order.status)) {
+            order.status = "cancelled";
+        }
+    }
+
+    @Override
+    public ContactInfoResponse getContactInfo(String scope) {
+        if ("general".equalsIgnoreCase(scope)) {
+            return new ContactInfoResponse(
+                    "通用客服",
+                    "如需咨询功能使用、账号问题或开票信息，请联系通用客服。",
+                    List.of(
+                            new ContactChannel("phone", null, null, "400-800-0000", "工作日 9:00-18:00"),
+                            new ContactChannel("email", null, null, "support@jurong.ai", "24 小时内回复")
+                    ),
+                    "工作时间内优先电话联系。"
+            );
+        }
+
+        return new ContactInfoResponse(
+                "企业套餐咨询",
+                "扫码添加客服，咨询企业充值与定制方案。",
+                List.of(
+                        new ContactChannel(
+                                "wechat",
+                                buildContactQrCode(),
+                                null,
+                                null,
+                                "扫码添加，咨询充值"
+                        )
+                ),
+                "扫码添加，咨询充值。"
+        );
+    }
+
+    @Override
+    public List<CreditPackage> listCreditPackages() {
+        return CREDIT_PACKAGES;
+    }
+
+    @Override
+    public CreateCreditsOrderResponse createCreditsOrder(Long userId, CreateCreditsOrderRequest req) {
+        CreditPackage pkg = findCreditPackage(req.getPackageId());
+        String orderId = "cord_" + randomId();
+        String payMethod = normalizePayMethod(req.getPayMethod());
+        long expireAt = System.currentTimeMillis() + 15 * 60 * 1000L;
+
+        ORDER_STORE.put(orderId, new OrderRecord(
+                orderId,
+                userId,
+                OrderKind.CREDIT,
+                pkg.getId(),
+                pkg.getPrice(),
+                pkg.getCredits(),
+                0,
+                payMethod,
+                expireAt
+        ));
+
+        return new CreateCreditsOrderResponse(
+                orderId,
+                buildPayUrl(orderId),
+                pkg.getPrice(),
+                pkg.getCredits(),
+                buildQrCodeUrl(orderId, pkg.getPrice()),
+                buildQrCodeContent(orderId, pkg.getPrice()),
+                payMethod,
+                expireAt,
+                "pending"
+        );
+    }
+
+    @Override
+    @Transactional
+    public RedeemCardResponse redeemCard(Long userId, RedeemCardRequest req) {
+        String code = req.getCode() == null ? "" : req.getCode().trim().toUpperCase();
+        if (!code.matches("^[A-Z]{2}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "卡密格式错误");
+        }
+
+        int creditsAdded = 100 + Math.abs(code.hashCode() % 901);
+        int remaining = addCreditsToUser(userId, creditsAdded);
+        return new RedeemCardResponse(
+                creditsAdded,
+                365,
+                "rc_" + randomId(),
+                remaining
+        );
+    }
+
+    private void applyOrderEffect(OrderRecord order, Long userId) {
+        if (order.applied.compareAndSet(false, true)) {
+            addCreditsToUser(userId, order.credits);
+        }
+    }
+
+    private int addCreditsToUser(Long userId, int delta) {
+        User user = requireUser(userId);
+        int base = user.getCredits() != null
+                ? Math.max(0, user.getCredits())
+                : resolveRemainingCredits(user);
+        int total = base + Math.max(0, delta);
+        user.setCredits(total);
+        user.setUpdatedAt(LocalDateTime.now());
+        userRepo.updateById(user);
+        return total;
+    }
+
+    private User requireUser(Long userId) {
+        User user = userRepo.selectById(userId);
+        if (user == null) {
+            throw new BusinessException(ErrorCode.USER_NOT_FOUND, "用户不存在");
+        }
+        return user;
+    }
+
+    private int resolveRemainingCredits(User user) {
+        if (user.getCredits() != null) {
+            return Math.max(0, user.getCredits());
+        }
+        int monthlyQuota = user.getMonthlyQuota() == null ? 0 : user.getMonthlyQuota();
+        int used = user.getQuotaUsed() == null ? 0 : user.getQuotaUsed();
+        return Math.max(0, monthlyQuota - used);
+    }
+
+    private int resolveRequiredCredits(CreditsCheckRequest req) {
+        if (req != null && req.getEstimated() != null && req.getEstimated() > 0) {
+            return req.getEstimated();
+        }
+        String action = req == null ? null : req.getAction();
+        if ("video-create".equals(action)) {
+            return 30;
+        }
+        if ("image-create".equals(action)) {
+            return 10;
+        }
+        if ("agent-chat".equals(action) || "agent-send".equals(action)) {
+            return DEFAULT_CREDITS_PER_MESSAGE;
+        }
+        return DEFAULT_CREDITS_PER_MESSAGE;
+    }
 
     private AgentSession requireOwnedSession(Long userId, String sessionId) {
         AgentSession s = sessionRepo.selectById(sessionId);
-        if (s == null) {
-            throw new BusinessException(ErrorCode.NOT_FOUND, "会话不存在");
-        }
-        if (!s.getUserId().equals(userId)) {
-            // 不告诉前端"不存在"还是"无权限"，统一脱敏
+        if (s == null || !s.getUserId().equals(userId)) {
             throw new BusinessException(ErrorCode.NOT_FOUND, "会话不存在");
         }
         return s;
     }
 
-    /**
-     * 调 LLM（一次性 chat completion，把整个 session 历史 + 当前用户消息发过去）
-     * 注意：当前消息已写入 history（按 created_at 排序），无需重复传
-     */
+    private PlanInfo findPlan(String planId) {
+        return PLANS.stream()
+                .filter(p -> p.getId().equals(planId))
+                .findFirst()
+                .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "套餐不存在"));
+    }
+
+    private CreditPackage findCreditPackage(String packageId) {
+        return CREDIT_PACKAGES.stream()
+                .filter(p -> p.getId().equals(packageId))
+                .findFirst()
+                .orElseThrow(() -> new BusinessException(ErrorCode.NOT_FOUND, "积分包不存在"));
+    }
+
+    private String normalizePayMethod(String payMethod) {
+        if (payMethod == null || payMethod.isBlank()) {
+            return "alipay";
+        }
+        String normalized = payMethod.trim().toLowerCase();
+        if ("wechat".equals(normalized) || "alipay".equals(normalized) || "card".equals(normalized)) {
+            return normalized;
+        }
+        return "alipay";
+    }
+
+    private String randomId() {
+        return java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+    }
+
+    private String buildPayUrl(String orderId) {
+        return "https://pay.example.com/checkout?order=" + orderId;
+    }
+
+    private String buildQrCodeUrl(String orderId, int amount) {
+        return "https://api.qrserver.com/v1/create-qr-code/?size=240x240&data="
+                + java.net.URLEncoder.encode("mock://pay?order=" + orderId + "&amount=" + amount, java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private String buildQrCodeContent(String orderId, int amount) {
+        return "mock://pay?order=" + orderId + "&amount=" + amount;
+    }
+
+    private String buildContactQrCode() {
+        return "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data="
+                + java.net.URLEncoder.encode("weixin://contacts?username=jurong_kefu", java.nio.charset.StandardCharsets.UTF_8);
+    }
+
     private String callLlm(List<AgentMessage> history) {
-        // 构造 messages 数组
-        List<Map<String, String>> messages = new java.util.ArrayList<>();
+        List<Map<String, String>> messages = new ArrayList<>();
         for (AgentMessage m : history) {
             String role = m.getRole();
-            if (!"user".equals(role) && !"assistant".equals(role) && !"system".equals(role)) continue;
+            if (!"user".equals(role) && !"assistant".equals(role) && !"system".equals(role)) {
+                continue;
+            }
             Map<String, String> msg = new HashMap<>();
             msg.put("role", role);
             msg.put("content", m.getContent());
             messages.add(msg);
         }
 
-        // 把整段历史拼成 user prompt（兼容 NewAPI chat 接口）
-        // 因为 NewAPI 只接受单条 user content，我们把 system + 历史组装成一个文本
         StringBuilder sb = new StringBuilder();
         sb.append(llmSystemPrompt).append("\n\n");
         for (Map<String, String> m : messages) {
             String role = m.get("role");
-            if ("system".equals(role)) continue;
+            if ("system".equals(role)) {
+                continue;
+            }
             sb.append("[").append(role.toUpperCase()).append("]\n");
             sb.append(m.get("content")).append("\n\n");
         }
         sb.append("[ASSISTANT]\n");
-        String userPrompt = sb.toString();
 
         try {
-            String reply = newApiClient.chatCompletion(llmModel, llmSystemPrompt, userPrompt, llmMaxTokens);
-            return reply;
+            return newApiClient.chatCompletion(llmModel, llmSystemPrompt, sb.toString(), llmMaxTokens);
         } catch (Exception e) {
             log.error("LLM call failed: {}", e.getMessage());
             return "抱歉，AI 助手暂时无法回复，请稍后再试。";
+        }
+    }
+
+    private enum OrderKind {
+        PLAN,
+        CREDIT
+    }
+
+    private static final class OrderRecord {
+        private final String orderId;
+        private final Long userId;
+        private final OrderKind kind;
+        private final String refId;
+        private final int amount;
+        private final int credits;
+        private final int validDays;
+        private final String payMethod;
+        private final long expireAt;
+        private final long autoPaidAt;
+        private final AtomicBoolean applied = new AtomicBoolean(false);
+        private volatile String status = "pending";
+        private volatile Long paidAt;
+        private volatile int pollCount;
+
+        private OrderRecord(
+                String orderId,
+                Long userId,
+                OrderKind kind,
+                String refId,
+                int amount,
+                int credits,
+                int validDays,
+                String payMethod,
+                long expireAt) {
+            this.orderId = orderId;
+            this.userId = userId;
+            this.kind = kind;
+            this.refId = refId;
+            this.amount = amount;
+            this.credits = credits;
+            this.validDays = validDays;
+            this.payMethod = payMethod;
+            this.expireAt = expireAt;
+            this.autoPaidAt = System.currentTimeMillis() + AUTO_PAID_AFTER_MS;
         }
     }
 }

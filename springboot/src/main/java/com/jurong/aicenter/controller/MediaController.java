@@ -68,20 +68,8 @@ public class MediaController {
 
     // ==================== 资产库（资产库列表） ====================
 
-    @GetMapping("/libraries")
-    public List<MediaLibraryResponse> listLibraries(@AuthenticationPrincipal AuthenticatedUser user) {
-        requireUser(user);
-        return mediaLibraryService.listLibraries(user.id());
-    }
-
-    // ==================== 素材 ====================
-
-    /**
-     * 分页查询素材（按用户隔离）。
-     * query 参数全部绑定到 MediaListQuery 上，详见 MediaListQuery 字段定义。
-     */
     @GetMapping("/assets")
-    public PageResult<MediaAssetResponse> listAssets(
+    public PageResult<MediaAssetResponse> list(
             @AuthenticationPrincipal AuthenticatedUser user,
             MediaListQuery query) {
         requireUser(user);
@@ -89,21 +77,15 @@ public class MediaController {
     }
 
     @GetMapping("/assets/{id}")
-    public MediaAssetDto getAsset(
+    public MediaAssetResponse get(
             @AuthenticationPrincipal AuthenticatedUser user,
             @PathVariable Long id) {
         requireUser(user);
         return mediaService.getAsset(user.id(), id);
     }
 
-    /**
-     * 上传素材到指定 libraryId；不传则按你的"当前库"路由：
-     *   - 当前选中 "我的资产" / "AI 生成结果" → 进对应默认库
-     *   - 当前选中自定义库 → 进该库
-     *   - 未登录不允许
-     */
     @PostMapping("/assets")
-    public MediaUploadResponse upload(
+    public MediaUploadResponse uploadAsset(
             @AuthenticationPrincipal AuthenticatedUser user,
             @RequestParam(value = "libraryId", required = false) Long libraryId,
             @RequestParam("file") MultipartFile file) {
@@ -111,9 +93,15 @@ public class MediaController {
         return mediaService.uploadAsset(user.id(), libraryId, file);
     }
 
-    /**
-     * 改名（PATCH）：同库内重名校验，错误码 7012 MEDIA_ASSET_NAME_DUPLICATE。
-     */
+    @PostMapping("/upload")
+    public MediaUploadResponse uploadLegacy(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @RequestParam(value = "libraryId", required = false) Long libraryId,
+            @RequestParam("file") MultipartFile file) {
+        requireUser(user);
+        return mediaService.uploadAsset(user.id(), libraryId, file);
+    }
+
     @PatchMapping("/assets/{id}")
     public MediaAssetResponse rename(
             @AuthenticationPrincipal AuthenticatedUser user,
@@ -132,9 +120,6 @@ public class MediaController {
         return ResponseEntity.noContent().build();
     }
 
-    /**
-     * 批量删除：传入 ids 列表，返回 {deleted, requested}。
-     */
     @PostMapping("/assets/batch-delete")
     public Map<String, Object> batchDelete(
             @AuthenticationPrincipal AuthenticatedUser user,
@@ -143,8 +128,6 @@ public class MediaController {
         int deleted = mediaService.batchDeleteAssets(user.id(), request.getIds());
         return Map.of("deleted", deleted, "requested", request.getIds().size());
     }
-
-    // ==================== 角色库（同事保留） ====================
 
     @GetMapping("/roles/categories")
     public List<Map<String, String>> listRoleCategories(@AuthenticationPrincipal AuthenticatedUser user) {
@@ -162,8 +145,6 @@ public class MediaController {
         }
         return mediaService.listRolesByCategory(category);
     }
-
-    // ==================== 工具 ====================
 
     private void requireUser(AuthenticatedUser user) {
         if (user == null || user.id() == null) {

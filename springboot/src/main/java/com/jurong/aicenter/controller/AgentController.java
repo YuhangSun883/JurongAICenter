@@ -8,29 +8,24 @@ import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.AgentService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 /**
- * Agent 对话 REST API。
- *
- * 端点列表(MVP - 仅对话核心):
- *   GET    /api/agent/sessions                  拉会话列表
- *   POST   /api/agent/sessions                  新建会话
- *   PATCH  /api/agent/sessions/{id}             修改标题(重命名)
- *   DELETE /api/agent/sessions/{id}             删除会话(级联删除消息)
- *   GET    /api/agent/sessions/{id}/messages    拉某会话消息(对话记忆)
- *   POST   /api/agent/send                      发送消息 + 调 LLM
- *   GET    /api/agent/credits                   当前用户积分
- *
- * 关键约束:
- *   - 会话之间互相独立,没有关联
- *   - 必须鉴权 (Spring Security 已配 /api/agent/** = authenticated)
+ * Agent REST API.
  */
-@Slf4j
 @RestController
 @RequestMapping("/api/agent")
 @RequiredArgsConstructor
@@ -100,16 +95,73 @@ public class AgentController {
         return agentService.getCredits(user.id());
     }
 
-    /**
-     * 积分前置校验（前端发送消息前调用）：
-     * 返回 ok / insufficient，前端根据 status 决定是否走 send
-     */
     @PostMapping("/credits/check")
-    public AgentCreditCheckResponse checkCredits(
+    public CreditsCheckResponse checkCredits(
             @AuthenticationPrincipal AuthenticatedUser user,
-            @Valid @RequestBody AgentCreditCheckRequest req) {
+            @RequestBody(required = false) CreditsCheckRequest req) {
         requireUser(user);
         return agentService.checkCredits(user.id(), req);
+    }
+
+    @GetMapping("/plans")
+    public List<PlanInfo> listPlans(@AuthenticationPrincipal AuthenticatedUser user) {
+        requireUser(user);
+        return agentService.listPlans();
+    }
+
+    @PostMapping("/plans/orders")
+    public CreatePlanOrderResponse createPlanOrder(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody CreatePlanOrderRequest req) {
+        requireUser(user);
+        return agentService.createPlanOrder(user.id(), req);
+    }
+
+    @GetMapping("/plans/orders/{orderId}")
+    public QueryOrderResponse queryPlanOrder(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable String orderId) {
+        requireUser(user);
+        return agentService.queryOrder(user.id(), orderId);
+    }
+
+    @PostMapping("/plans/orders/{orderId}/cancel")
+    public ResponseEntity<Void> cancelPlanOrder(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable String orderId) {
+        requireUser(user);
+        agentService.cancelPlanOrder(user.id(), orderId);
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/contact")
+    public ContactInfoResponse getContactInfo(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @RequestParam(required = false) String scope) {
+        requireUser(user);
+        return agentService.getContactInfo(scope);
+    }
+
+    @GetMapping("/credits/packages")
+    public List<CreditPackage> listCreditPackages(@AuthenticationPrincipal AuthenticatedUser user) {
+        requireUser(user);
+        return agentService.listCreditPackages();
+    }
+
+    @PostMapping("/credits/orders")
+    public CreateCreditsOrderResponse createCreditsOrder(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody CreateCreditsOrderRequest req) {
+        requireUser(user);
+        return agentService.createCreditsOrder(user.id(), req);
+    }
+
+    @PostMapping("/credits/redeem")
+    public RedeemCardResponse redeemCard(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @Valid @RequestBody RedeemCardRequest req) {
+        requireUser(user);
+        return agentService.redeemCard(user.id(), req);
     }
 
     private void requireUser(AuthenticatedUser user) {

@@ -8,16 +8,35 @@ import { InlineSelect } from '@/components/common/InlineSelect';
 import { InsufficientCreditsDialog } from '@/components/common/InsufficientCreditsDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { creationsApi, type CreationType } from '@/api/creations';
+import { ApiError } from '@/lib/http';
 import { cn } from '@/lib/utils';
 
 const HOME_MAX_REFS = 12;
+const INSUFFICIENT_CREDIT_ERROR_CODES = new Set([403, 3004, 9403]);
+
+function getApiErrorStatus(error: unknown): number | undefined {
+  if (error instanceof ApiError) return error.status;
+
+  if (typeof error === 'object' && error !== null && 'status' in error) {
+    const status = (error as { status?: unknown }).status;
+    if (typeof status === 'number') return status;
+    if (typeof status === 'string') {
+      const parsed = Number(status);
+      return Number.isNaN(parsed) ? undefined : parsed;
+    }
+  }
+
+  return undefined;
+}
 
 export function ScriptCard() {
   const [text, setText] = useState('');
   const [mode, setMode] = useState<CreationType>('agent');
   const [submitting, setSubmitting] = useState(false);
   // 积分不足弹窗
-  const [showInsufficient, setShowInsufficient] = useState(false);
+  const [insufficient, setInsufficient] = useState<{ open: boolean; remaining?: number; required?: number }>({
+    open: false,
+  });
   const [picked, setPicked] = useState<PickedMedia[]>([]);
   const [open, setOpen] = useState(false);
   // 素材库（全局共享，所有工具页面通用）
@@ -151,7 +170,7 @@ export function ScriptCard() {
                         : 'agent-chat';
                     const check = await creationsApi.checkCredits({ action });
                     if (check.status === 'insufficient') {
-                      setShowInsufficient(true);
+                      setInsufficient({ open: true, remaining: check.remaining, required: check.required });
                       return;
                     }
                     if (mode === 'agent') {
@@ -172,6 +191,10 @@ export function ScriptCard() {
                     }
                   } catch (e) {
                     console.error('submit failed', e);
+                    const status = getApiErrorStatus(e);
+                    if (status !== undefined && INSUFFICIENT_CREDIT_ERROR_CODES.has(status)) {
+                      setInsufficient({ open: true });
+                    }
                   } finally {
                     setSubmitting(false);
                   }
@@ -242,10 +265,12 @@ export function ScriptCard() {
 
       {/* 积分不足弹窗（复用现成的 InsufficientCreditsDialog） */}
       <InsufficientCreditsDialog
-        open={showInsufficient}
-        onClose={() => setShowInsufficient(false)}
+        open={insufficient.open}
+        remaining={insufficient.remaining}
+        required={insufficient.required}
+        onClose={() => setInsufficient({ open: false })}
         onPaid={() => {
-          setShowInsufficient(false);
+          setInsufficient({ open: false });
           // 支付成功后用户可以再次点提交重试
         }}
       />

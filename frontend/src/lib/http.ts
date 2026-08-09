@@ -88,7 +88,16 @@ async function requestInner<T>(path: string, opts: RequestOptions = {}, isRetry 
     throw new ApiError(res.status, `HTTP ${res.status}`, payload);
   }
 
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204 || res.status === 200) {
+    // 尝试解析 JSON，如果响应体为空则返回 undefined
+    try {
+      const text = await res.text();
+      if (!text || text.trim() === '') return undefined as T;
+      return JSON.parse(text) as T;
+    } catch {
+      return undefined as T;
+    }
+  }
 
   const json = (await res.json()) as any;
 

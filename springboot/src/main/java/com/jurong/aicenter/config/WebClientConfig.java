@@ -26,6 +26,8 @@ public class WebClientConfig {
             );
 
         return WebClient.builder()
-            .clientConnector(new ReactorClientHttpConnector(httpClient));
+            .clientConnector(new ReactorClientHttpConnector(httpClient))
+            // 增大内存缓冲区上限到 16MB（ComfyUI /history 响应可能超过默认 256KB）
+            .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(16 * 1024 * 1024));
     }
 }

@@ -40,7 +40,7 @@ export function ChatHistory({
   /** 弹窗确认删除 */
   function handleConfirmDelete() {
     if (deleteTarget && onDelete) {
-      onDelete(deleteTarget.id).catch((err: unknown) =>
+      Promise.resolve(onDelete(deleteTarget.id)).catch((err: unknown) =>
         console.warn('[chat-history] delete failed:', err)
       );
     }

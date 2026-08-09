@@ -25,48 +25,28 @@ import java.util.Map;
  */
 public interface MediaService {
 
-    // ==================== 素材 ====================
-
-    /**
-     * 分页查询素材（按用户隔离）
-     */
     PageResult<MediaAssetResponse> listAssets(Long userId, MediaListQuery query);
 
-    /**
-     * 素材详情
-     */
-    MediaAssetDto getAsset(Long userId, Long assetId);
+    MediaAssetResponse getAsset(Long userId, Long assetId);
 
-    /**
-     * 上传素材：未指定 libraryId 时自动进 "我的资产"
-     */
     MediaUploadResponse uploadAsset(Long userId, Long libraryId, MultipartFile file);
 
-    /**
-     * 软删素材 + 删 MinIO 对象
-     */
     void deleteAsset(Long userId, Long assetId);
 
-    /**
-     * 批量软删素材 + 删 MinIO 对象
-     */
     int batchDeleteAssets(Long userId, List<Long> ids);
 
-    /**
-     * 改名（同库内重名校验）
-     */
     MediaAssetResponse renameAsset(Long userId, Long assetId, String name);
 
-    /**
-     * AI 任务完成时调用：写入素材到用户的 "AI 生成结果" 库
-     */
+    List<Map<String, String>> listCategories();
+
+    List<MediaRoleDto> listRolesByCategory(String category);
+
+    List<MediaRoleDto> listAllRoles();
+
     void recordAiGenerated(Long userId, String type, String filename,
                            String mimeType, Long sizeBytes, String objectKey,
                            String sourceTool, String sourceTaskId);
 
-    /**
-     * 删除整个库时调用：级联删素材 + MinIO
-     */
     void deleteAssetsByLibrary(Long userId, Long libraryId);
 
     // ==================== 角色库（同事保留，给画布/Agent 用） ====================
