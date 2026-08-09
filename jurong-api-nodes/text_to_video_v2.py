@@ -234,17 +234,39 @@ def _wait_and_extract(task_id, timeout_sec=600, poll_interval=5, max_retry_after
     """
     轮询直到完成 + 提取 URL。
     如果 status=completed 但响应里没 URL（aicoming 假完成），再轮询 max_retry_after_completed 次。
+
+    2026-08-07 修复:处理 NewAPI 服务端清理任务记录返回 404 的情况。
+    - 之前拿到 status=completed 但被 404,尝试用缓存的响应再提一次 URL
+    - 从未拿到 completed 就被 404,继续轮询(给 server 一段时间重新创建记录)
     """
     start = time.time()
     last_status = None
     completed_no_url_retries = 0
     last_result = None
+    last_completed_result = None  # 缓存最后一次 status=completed 的响应
 
     while time.time() - start < timeout_sec:
         try:
             result = api_client.poll_video(task_id)
         except Exception as e:
             logger.warning("[V2] Poll failed: %s", e)
+            time.sleep(poll_interval)
+            continue
+
+        # 服务端清理任务记录(404 哨兵)
+        if isinstance(result, dict) and result.get("__jurong_404__"):
+            if last_completed_result is not None:
+                # 之前拿到过 completed,server 后清理了 — 用缓存响应再尝试提 URL
+                logger.warning(
+                    "[V2] Server cleaned up task %s (404) but we have last "
+                    "completed result cached. Trying to extract URL...",
+                    task_id,
+                )
+                video_url = _extract_video_url_robust(last_completed_result)
+                if video_url:
+                    return video_url, last_completed_result
+                # 缓存也没 URL,继续轮询看 server 是否重建记录
+            last_result = result
             time.sleep(poll_interval)
             continue
 
@@ -257,6 +279,7 @@ def _wait_and_extract(task_id, timeout_sec=600, poll_interval=5, max_retry_after
 
         # ---- 状态分支 ----
         if status in ("completed", "succeeded", "success"):
+            last_completed_result = result  # 缓存
             # 先尝试提取 URL
             video_url = _extract_video_url_robust(result)
             if video_url:

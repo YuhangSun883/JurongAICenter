@@ -3,6 +3,7 @@ package com.jurong.aicenter.service.canvas;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.dto.canvas.GenerateCanvasNodeRequest;
+import com.jurong.aicenter.dto.canvas.NodeConnection;
 import com.jurong.aicenter.entity.CanvasNode;
 import com.jurong.aicenter.entity.CanvasTask;
 import com.jurong.aicenter.exception.BusinessException;
@@ -25,6 +26,11 @@ import java.util.List;
  * **为什么单独成类**：
  *   Spring @Async 通过 AOP 代理实现，同一类内自调用（this.xxx）**不会**经过代理，
  *   导致 @Async 失效。所以必须把异步方法放在另一个 Bean 里。
+ *
+ * **多端口输入**：
+ *   GenerateCanvasNodeRequest.inputs 是 List&lt;NodeConnection&gt;（每条带 port 名 + nodeId）。
+ *   executor 按"第一个匹配的文本/图片节点"取值（pickUpstreamText / pickUpstreamImageUrl），
+ *   port 名只是路由标识，不影响取值逻辑。
  */
 @Slf4j
 @Component
@@ -41,12 +47,13 @@ public class CanvasAsyncExecutor {
      * 被调用方必须是另一个 Bean（CanvasServiceImpl），不能是本类。
      */
     @Async
-    public void executeGenerationAsync(String taskId, String nodeId,
+    public void executeGenerationAsync(CanvasTask task, CanvasNode node,
                                        GenerateCanvasNodeRequest req, Long userId) {
-        CanvasTask task = taskRepository.selectById(taskId);
-        CanvasNode node = nodeRepository.selectById(nodeId);
+        // 2026-08-08: 接收 entities 而不是 ID —— 避免 Spring @Async 在新线程跑
+        // 看不到父事务的 uncommitted task (task or node not found 错)
+        // 之前 extractCaptionAsync 也有同样问题,已修;这次同步修 generate
         if (task == null || node == null) {
-            log.error("Async execution: task or node not found, taskId={}, nodeId={}", taskId, nodeId);
+            log.error("Async execution: task or node is null (caller bug)");
             return;
         }
 
@@ -59,7 +66,7 @@ public class CanvasAsyncExecutor {
             String url = null;
             String text = null;
 
-            // 查询上游节点：优先用请求里的 assetIds，fallback 到节点自己的 upstreamIds
+            // 查询上游节点：优先用请求里的 inputs（多端口），fallback 到节点自己的 upstreamIds
             List<CanvasNode> upstreamNodes = lookupUpstreamNodes(req, node);
 
             switch (req.getType() == null ? "" : req.getType()) {
@@ -80,7 +87,15 @@ public class CanvasAsyncExecutor {
                                  upstreamTextForImage.length());
                         upstreamTextForImage = truncateAtBoundary(upstreamTextForImage, 500);
                     }
-                    url = aiService.generateImage(req.getPrompt(), upstreamTextForImage);
+                    String userPromptForImage = req.getPrompt();
+                    // 2026-08-08: 后端兜底验证 — 不提交空 prompt 给 ComfyUI(它会 500)
+                    // 前端有检查但可能漏掉(state 同步/点击过快),后端更可靠
+                    if ((userPromptForImage == null || userPromptForImage.isBlank())
+                        && (upstreamTextForImage == null || upstreamTextForImage.isBlank())) {
+                        throw new BusinessException(ErrorCode.INVALID_PARAM,
+                            "请先输入提示词,或从节点左侧/右侧 + 拖一个上游文本节点来引用");
+                    }
+                    url = aiService.generateImage(userPromptForImage, upstreamTextForImage);
                     task.setResultUrl(url);
                     node.setResultUrl(url);
                     break;
@@ -110,7 +125,15 @@ public class CanvasAsyncExecutor {
                     log.info("Canvas video upstream: imageUrl={}, textLen={}",
                         upstreamImageUrl == null ? "null" : "(set)",
                         upstreamTextForVideo == null ? 0 : upstreamTextForVideo.length());
-                    url = aiService.generateVideo(req.getPrompt(), upstreamImageUrl, upstreamTextForVideo);
+
+                    // 2026-08-08 改:不再强制要求 prompt — image_to_video.py 开了 enable_prompt_optimize=true
+                    // 会自动用 VL 模型描述图片 + 加默认动作(主体自然动态)
+                    // 空 prompt 也能跑,但建议用户输入具体动作(图片是一头猪,输入"跳舞"→生成猪跳舞)
+                    String userPromptForVideo = req.getPrompt();
+                    if (userPromptForVideo != null && userPromptForVideo.isBlank()) {
+                        userPromptForVideo = null; // 规范成 null,让 ComfyUI 节点用默认
+                    }
+                    url = aiService.generateVideo(userPromptForVideo, upstreamImageUrl, upstreamTextForVideo);
                     task.setResultUrl(url);
                     node.setResultUrl(url);
                     break;
@@ -125,11 +148,11 @@ public class CanvasAsyncExecutor {
             node.setStatus("success");
             node.setFailReason(null);
             node.setUpdatedAt(LocalDateTime.now());
-            log.info("Canvas task SUCCESS: taskId={}, type={}, durationMs={}",
-                taskId, req.getType(), task.getDurationMs());
+            log.info("Canvas task SUCCESS: task.getId()={}, type={}, durationMs={}",
+                task.getId(), req.getType(), task.getDurationMs());
         } catch (Exception e) {
-            log.error("Canvas task FAILED: taskId={}, type={}, err={}",
-                taskId, req.getType(), e.getMessage(), e);
+            log.error("Canvas task FAILED: task.getId()={}, type={}, err={}",
+                task.getId(), req.getType(), e.getMessage(), e);
             task.setStatus("failed");
             String safeMsg = e.getMessage() == null ? "未知错误"
                 : (e.getMessage().length() > 500 ? e.getMessage().substring(0, 500) + "..." : e.getMessage());
@@ -144,27 +167,27 @@ public class CanvasAsyncExecutor {
 
     /**
      * 查询上游节点列表。
-     * 优先用请求里的 assetIds（前端传入），fallback 到节点自己的 upstreamIds 字段（JSON）。
+     * 优先用请求里的 inputs（多端口 List&lt;NodeConnection&gt;），
+     * fallback 到节点自己的 upstreamIds（多端口格式，兼容旧的 List&lt;String&gt;）。
      * 所有上游节点必须属于同一 userId（防越权）。
      */
     private List<CanvasNode> lookupUpstreamNodes(GenerateCanvasNodeRequest req, CanvasNode currentNode) {
         List<String> upstreamIds = new ArrayList<>();
 
-        // 1. 请求里 assetIds
-        if (req.getAssetIds() != null && !req.getAssetIds().isEmpty()) {
-            upstreamIds.addAll(req.getAssetIds());
+        // 1. 请求里 inputs（多端口格式）
+        if (req.getInputs() != null && !req.getInputs().isEmpty()) {
+            for (NodeConnection c : req.getInputs()) {
+                if (c != null && c.getNodeId() != null && !c.getNodeId().isBlank()) {
+                    upstreamIds.add(c.getNodeId());
+                }
+            }
         }
 
-        // 2. fallback: 节点自己的 upstreamIds (JSON 字符串)
+        // 2. fallback: 节点自己的 upstreamIds（多端口 JSON / 旧 List<String> JSON）
         if (upstreamIds.isEmpty() && currentNode.getUpstreamIds() != null
             && !currentNode.getUpstreamIds().isBlank()) {
-            try {
-                List<String> parsed = objectMapper.readValue(
-                    currentNode.getUpstreamIds(), new TypeReference<List<String>>() {});
-                if (parsed != null) upstreamIds.addAll(parsed);
-            } catch (Exception e) {
-                log.warn("解析 upstreamIds JSON 失败 nodeId={}: {}", currentNode.getId(), e.getMessage());
-            }
+            List<String> parsed = parseUpstreamIdsField(currentNode.getUpstreamIds());
+            if (parsed != null) upstreamIds.addAll(parsed);
         }
 
         if (upstreamIds.isEmpty()) return Collections.emptyList();
@@ -186,6 +209,35 @@ public class CanvasAsyncExecutor {
             result.add(upstream);
         }
         return result;
+    }
+
+    /**
+     * 解析节点 upstreamIds JSON 字段，兼容两种格式：
+     *   - 新：List&lt;NodeConnection&gt;  → 取每个的 nodeId
+     *   - 旧：List&lt;String&gt;         → 直接拿（已经是 nodeId）
+     */
+    private List<String> parseUpstreamIdsField(String json) {
+        if (json == null || json.isBlank()) return Collections.emptyList();
+        // 先按新格式试
+        try {
+            List<NodeConnection> conns = objectMapper.readValue(
+                json, new TypeReference<List<NodeConnection>>() {});
+            if (conns != null) {
+                return conns.stream()
+                    .map(NodeConnection::getNodeId)
+                    .filter(id -> id != null && !id.isBlank())
+                    .toList();
+            }
+        } catch (Exception ignore) {
+            // fall through to old format
+        }
+        // 旧格式：List<String>
+        try {
+            return objectMapper.readValue(json, new TypeReference<List<String>>() {});
+        } catch (Exception e) {
+            log.warn("parseUpstreamIdsField failed: {}", e.getMessage());
+            return Collections.emptyList();
+        }
     }
 
     /** 从上游节点列表里挑第一个文本节点的 content（润色结果） */

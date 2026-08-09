@@ -53,6 +53,57 @@ def check_balance() -> dict:
     resp.raise_for_status()
     return resp.json()
 
+def chat_completion(messages, model="gpt-5.4-mini", temperature=0.5,
+                    max_tokens=300, timeout=60) -> dict:
+    """POST /v1/chat/completions - OpenAI 兼容,支持 vision (image_url content).
+
+    2026-08-07 新增:用于图像描述注入,锁定图生视频的主体。
+    """
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(
+        f"{NEWAPI_BASE_URL}/v1/chat/completions",
+        headers={**_auth_headers(), "Content-Type": "application/json"},
+        json=body,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def describe_image(image_bytes, model="gpt-5.4-mini") -> str:
+    """用视觉模型描述图片,1-2 句话,聚焦主体(物种/外观/关键特征)。
+
+    2026-08-07 新增:让图生视频节点拿到具体的主体描述,避免模型跑偏。
+    """
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text":
+                "Describe this image in 1-2 short sentences. "
+                "Focus on the MAIN SUBJECT (what it is, its appearance, key features). "
+                "Be specific and concise. Reply in English only. "
+                "Start directly with the subject, no preamble."
+            },
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+        ]
+    }]
+    resp = chat_completion(messages, model=model, max_tokens=150, temperature=0.3)
+    try:
+        text = resp["choices"][0]["message"]["content"].strip()
+        if not text:
+            raise RuntimeError(f"Vision model returned empty content: {resp}")
+        return text
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Vision model returned unexpected response: {resp}") from e
+
+
 
 # ============================================================================
 # 图像接口
@@ -88,24 +139,43 @@ def generate_image(prompt: str, model: str, size: str,
         f"{NEWAPI_BASE_URL}/v1/images/generations",
         headers={**_auth_headers(), "Content-Type": "application/json"},
         json=body,
-        timeout=180,
+        timeout=600,
     )
     resp.raise_for_status()
     data = resp.json()
 
-    # Case 1: 同步返回 —— 优先 url，没有就看 b64_json（OpenAI 两种格式都支持）
-    if "data" in data and isinstance(data["data"], list) and data["data"]:
+    # === 2026-08-08 修复: 增加日志 + 内联 b64 解码(绕过 _save_b64_to_tempfile) ===
+    logger.info("[generate_image] Response keys: %s", list(data.keys()))
+    if isinstance(data.get("data"), list) and data["data"]:
+        first_keys = list(data["data"][0].keys()) if isinstance(data["data"][0], dict) else type(data["data"][0]).__name__
+        logger.info("[generate_image] data['data'] has %d item(s), first keys: %s",
+                    len(data["data"]), first_keys)
+
+    # Case 1: 同步返回 —— url 或 b64_json 都支持
+    if isinstance(data.get("data"), list) and data["data"]:
         first = data["data"][0]
         if isinstance(first, dict):
-            if first.get("url"):
-                logger.info("Generated image sync (url): %s", first["url"])
-                return first["url"]
-            if first.get("b64_json"):
-                logger.info("Generated image sync (b64_json), decoding...")
-                return _save_b64_to_tempfile(first["b64_json"])
+            url = first.get("url")
+            if isinstance(url, str) and url:
+                logger.info("[generate_image] Sync (url): %s", url)
+                return url
+            b64 = first.get("b64_json")
+            if isinstance(b64, str) and b64 and len(b64) > 100:
+                logger.info("[generate_image] Sync (b64_json, %d chars), decoding inline...", len(b64))
+                import base64, os
+                img_bytes = base64.b64decode(b64)
+                tmp_dir = os.environ.get("JURONG_VIDEO_OUTPUT_DIR", "/app/output/jurong_videos")
+                os.makedirs(tmp_dir, exist_ok=True)
+                tmp_path = os.path.join(tmp_dir, f"jurong_t2i_{os.urandom(4).hex()}.png")
+                with open(tmp_path, "wb") as f:
+                    f.write(img_bytes)
+                logger.info("[generate_image] Wrote %d bytes to %s", len(img_bytes), tmp_path)
+                return tmp_path
+            logger.warning("[generate_image] First item has neither url nor valid b64_json. Keys: %s",
+                           list(first.keys()))
 
-    # Case 2: 异步返回 → 轮询 /api/task/{task_id} 直到拿到 url
-    if "data" in data and data["data"] and "task_id" in data["data"][0]:
+    # Case 2: 异步返回 → 轮询 /api/task/{task_id}
+    if isinstance(data.get("data"), list) and data["data"] and isinstance(data["data"][0], dict) and "task_id" in data["data"][0]:
         task_id = data["data"][0]["task_id"]
         logger.info("Image task %s submitted, polling %s every %ds (timeout %ds)...",
                     task_id, f"{NEWAPI_BASE_URL}/api/task/{task_id}",
@@ -119,7 +189,7 @@ def generate_image(prompt: str, model: str, size: str,
         logger.info("Generated image async: %s", url)
         return url
 
-    raise RuntimeError(f"Unexpected image response: {data}")
+    raise RuntimeError(f"Unexpected image response: keys={list(data.keys())}, data_preview={str(data)[:300]}")
 
 
 def edit_image(image_bytes: bytes, prompt: str, model: str, size: str = "1024x1024",
@@ -145,7 +215,7 @@ def edit_image(image_bytes: bytes, prompt: str, model: str, size: str = "1024x10
         headers=_auth_headers(),
         files=files,
         data=data,
-        timeout=180,
+        timeout=600,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -223,12 +293,20 @@ def _extract_url_from_image_task(result: dict) -> str:
 
 
 def poll_image_task(task_id: str) -> dict:
-    """GET /api/task/{task_id} —— 查一次图像异步任务状态。"""
+    """GET /api/task/{task_id} —— 查一次图像异步任务状态。
+
+    2026-08-07 修复:NewAPI 在任务完成后会清理记录返回 404,这是预期行为。
+    返回 sentinel dict {"__jurong_404__": True, "task_id": ...} 让上层处理,
+    而不是抛 HTTPError 炸掉整个 workflow。
+    """
     resp = requests.get(
         f"{NEWAPI_BASE_URL}/api/task/{task_id}",
         headers=_auth_headers(),
         timeout=30,
     )
+    if resp.status_code == 404:
+        logger.info("Image task %s returned 404 (server cleaned up)", task_id)
+        return {"__jurong_404__": True, "task_id": task_id}
     resp.raise_for_status()
     return resp.json()
 
@@ -239,11 +317,34 @@ def wait_for_image_task(task_id: str, timeout_sec: int = 600,
 
     完成的返回：{"status": "success", "data": {"url": "..."}, ...}
     状态值兼容: success/completed/succeeded 与 failed/error/failure/cancelled。
+
+    2026-08-07 修复 NewAPI 任务清理导致的 404:
+    - 轮询过程中服务端返回 404（任务已被清理）不再视为致命错误
+    - 若之前拿到过 status=success,返回最后一次成功的响应(含 URL),避免丢结果
+    - 若从未拿到 success 就被 404,抛清晰的 RuntimeError 带 task_id
     """
     start = time.time()
     last_status = None
+    last_success_result = None  # 记住最后一次 status=success 的响应
     while time.time() - start < timeout_sec:
         result = poll_image_task(task_id)
+
+        # 服务端清理任务记录(404 哨兵)
+        if isinstance(result, dict) and result.get("__jurong_404__"):
+            if last_success_result is not None:
+                logger.warning(
+                    "Image task %s was cleaned up by server (404) but we have "
+                    "the success result cached, returning it.",
+                    task_id,
+                )
+                return last_success_result
+            raise RuntimeError(
+                f"Image task {task_id} not found on server (404). "
+                f"This usually means the server cleaned up the task record "
+                f"before we could retrieve the result. The task may have "
+                f"completed or expired. Check NewAPI server logs for {task_id}."
+            )
+
         # NewAPI 通常把 status 放在 data.status，也有直接放顶层的
         data_obj = result.get("data") if isinstance(result.get("data"), dict) else {}
         status = (
@@ -253,6 +354,7 @@ def wait_for_image_task(task_id: str, timeout_sec: int = 600,
             logger.info("Image task %s status: %s", task_id, status)
             last_status = status
         if status in ("success", "completed", "succeeded"):
+            last_success_result = result  # 缓存
             return result
         if status in ("failed", "error", "failure", "cancelled"):
             raise RuntimeError(f"Image task {task_id} failed: {result}")
@@ -288,11 +390,17 @@ def submit_video(prompt: str, model: str = "doubao-seedance-2.0",
     files = []
     if image_files:
         for filename, content, content_type in image_files:
-            # 注意：同名 multipart part，requests 用 tuple 列表表达
-            files.append(("input_reference", (filename, content, content_type)))
+        # 2026-08-08 修复: doubao-seedance-2.0 期望 'image' 字段,不是 'input_reference'
+        # 同时发 3 个字段名,兼容 Doubao Seedance / Sora / aicoming-proxy
+        files.append(("image", (filename, content, content_type)))
+        files.append(("input_reference", (filename, content, content_type)))
+        files.append(("image_url", (filename, content, content_type)))
+        logger.info("[submit_video] Sent image under 3 field names (%d bytes each), total %d parts", len(content), len(files))
     else:
-        # 占位：aicoming-video-proxy 要求至少一个文件
+        # 占位: aicoming-video-proxy 要求至少一个文件
+        files.append(("image", ("_placeholder.png", _DUMMY_PNG_BYTES, "image/png")))
         files.append(("input_reference", ("_placeholder.png", _DUMMY_PNG_BYTES, "image/png")))
+        files.append(("image_url", ("_placeholder.png", _DUMMY_PNG_BYTES, "image/png")))
     if audio_file:
         filename, content, content_type = audio_file
         files.append(("input_audio", (filename, content, content_type)))
@@ -316,12 +424,17 @@ def submit_video(prompt: str, model: str = "doubao-seedance-2.0",
 def poll_video(task_id: str) -> dict:
     """GET /v1/videos/{task_id}
     返回 aicoming 实时状态：in_progress / completed / failed
+
+    2026-08-07 修复:同 poll_image_task,404 返回 sentinel 而不是抛异常。
     """
     resp = requests.get(
         f"{NEWAPI_BASE_URL}/v1/videos/{task_id}",
         headers=_auth_headers(),
         timeout=30,
     )
+    if resp.status_code == 404:
+        logger.info("Video task %s returned 404 (server cleaned up)", task_id)
+        return {"__jurong_404__": True, "task_id": task_id}
     resp.raise_for_status()
     return resp.json()
 
@@ -330,16 +443,37 @@ def wait_for_video(task_id: str, timeout_sec: int = 600,
                    poll_interval: int = 8) -> dict:
     """轮询直到视频任务完成或超时。
     完成的返回：{"status": "completed", "metadata": {"url": "..."}}
+
+    2026-08-07 修复:同 wait_for_image_task,处理 404 sentinel 和缓存最终响应。
     """
     start = time.time()
     last_status = None
+    last_success_result = None  # 记住最后一次 status=completed 的响应
     while time.time() - start < timeout_sec:
         result = poll_video(task_id)
+
+        # 服务端清理任务记录(404 哨兵)
+        if isinstance(result, dict) and result.get("__jurong_404__"):
+            if last_success_result is not None:
+                logger.warning(
+                    "Video task %s was cleaned up by server (404) but we have "
+                    "the success result cached, returning it.",
+                    task_id,
+                )
+                return last_success_result
+            raise RuntimeError(
+                f"Video task {task_id} not found on server (404). "
+                f"This usually means the server cleaned up the task record "
+                f"before we could retrieve the result. Check NewAPI server "
+                f"logs for {task_id}."
+            )
+
         status = result.get("status", "unknown")
         if status != last_status:
             logger.info("Video task %s status: %s", task_id, status)
             last_status = status
         if status in ("completed", "succeeded", "success"):
+            last_success_result = result  # 缓存
             return result
         if status in ("failed", "error", "cancelled"):
             raise RuntimeError(f"Video task {task_id} failed: {result}")

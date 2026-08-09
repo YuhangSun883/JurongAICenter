@@ -9,7 +9,8 @@ PRICING = {
     "JurongTextToImage": {
         "gpt-image-2-1k": 1,
         "gpt-image-2-2k": 4,
-        "gpt-image-2-4k": 16,
+        "gpt-image-2-4k",
+            "gpt-5.4-mini": 16,
     },
     "JurongImageToImage": {
         "gpt-image-2-1k": 2,

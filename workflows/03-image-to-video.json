@@ -12,7 +12,7 @@
       "audio": null,
       "prompt": "{{prompt}}",
       "model": "doubao-seedance-2.0",
-      "duration": 4,
+      "duration": "4",
       "resolution": "480P",
       "enable_prompt_optimize": true,
       "negative_prompt": ""

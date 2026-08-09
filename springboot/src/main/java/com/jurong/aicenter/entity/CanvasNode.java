@@ -22,6 +22,9 @@ public class CanvasNode {
 
     private Long userId;
 
+    /** 所属画布（NULL 表示孤儿节点，由 CanvasBackfillRunner 自动归入默认画布） */
+    private String canvasId;
+
     /** text / image / video / audio */
     private String type;
 
@@ -41,10 +44,15 @@ public class CanvasNode {
     private Integer positionX;
     private Integer positionY;
 
-    /** JSON 字符串：上游节点 id 列表 */
+    /**
+     * JSON 字符串：上游节点连接列表（多端口格式 List&lt;NodeConnection&gt;）。
+     * 每条连接有 port（端口名）和 nodeId（上游节点 UUID）。
+     */
     private String upstreamIds;
 
-    /** JSON 字符串：下游节点 id 列表 */
+    /**
+     * JSON 字符串：下游节点连接列表（多端口格式 List&lt;NodeConnection&gt;）。
+     */
     private String downstreamIds;
 
     /** idle / running / success / failed */

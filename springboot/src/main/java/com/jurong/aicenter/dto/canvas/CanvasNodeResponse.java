@@ -28,6 +28,9 @@ public class CanvasNodeResponse {
 
     private String id;
 
+    /** 所属画布 ID（前端刷新/加载画布时需要） */
+    private String canvasId;
+
     /** text / image / video / audio */
     private String type;
 
@@ -37,6 +40,12 @@ public class CanvasNodeResponse {
 
     /** 图片/视频节点的产物 URL（公开） */
     private String resultUrl;
+
+    /** 画布坐标 X（前端 CanvasNodeCard 用 left: node.x 定位） */
+    private Integer positionX;
+
+    /** 画布坐标 Y（前端 CanvasNodeCard 用 top: node.y 定位） */
+    private Integer positionY;
 
     /** idle / running / success / failed */
     private String status;
@@ -56,11 +65,14 @@ public class CanvasNodeResponse {
         if (n == null) return null;
         CanvasNodeResponse r = new CanvasNodeResponse();
         r.id = n.getId();
+        r.canvasId = n.getCanvasId();
         r.type = n.getType();
         r.title = n.getTitle();
         r.content = n.getContent();
         r.assetId = n.getAssetId();
         r.resultUrl = n.getResultUrl();
+        r.positionX = n.getPositionX();
+        r.positionY = n.getPositionY();
         r.status = n.getStatus();
         r.createdAt = n.getCreatedAt() == null ? null
             : n.getCreatedAt().toInstant(ZoneOffset.UTC).toEpochMilli();
