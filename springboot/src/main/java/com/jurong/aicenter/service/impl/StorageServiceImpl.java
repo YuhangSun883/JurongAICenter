@@ -91,4 +91,18 @@ public class StorageServiceImpl implements StorageService {
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Get presigned URL failed: " + e.getMessage());
         }
     }
+
+    /**
+     * 暴露 MinioClient 实例，供其他服务使用（如列出对象列表）
+     */
+    public io.minio.MinioClient getMinioClient() {
+        return minioClient;
+    }
+
+    /**
+     * 暴露 bucket 名称
+     */
+    public String getBucket() {
+        return bucket;
+    }
 }

@@ -100,7 +100,7 @@ public class MediaServiceImpl implements MediaService {
         Map.of("key", "animal", "label", "鍔ㄧ墿")
     );
 
-    // ==================== 绱犳潗 ====================
+    // ==================== 素材 ====================
 
     @Override
     public PageResult<MediaAssetResponse> listAssets(Long userId, MediaListQuery query) {
@@ -343,7 +343,7 @@ public class MediaServiceImpl implements MediaService {
             }
             return libraryId;
         }
-        return libraryService.getUploadLibrary(userId).getId();
+        return libraryService.getOrCreateUploadLibrary(userId).getId();
     }
 
     private Map<Long, String> batchLoadLibraryNames(Long userId, List<MediaAsset> assets) {
@@ -398,8 +398,7 @@ public class MediaServiceImpl implements MediaService {
         }
     }
 
-
-    /** 绫诲瀷鎺ㄦ柇锛歁IME 鐧藉悕鍗?+ 鎵╁睍鍚嶇櫧鍚嶅崟 + 绫诲埆涓€鑷存€?+ 榛戝悕鍗?*/
+    /** 类型推断：MIME 白名单 + 扩展名白名单 + 类别一致性 + 黑名单 */
     private String inferType(String mime, String filename) {
         String mimeLower = mime == null ? "" : mime.toLowerCase().trim();
         String ext = extractExt(filename);

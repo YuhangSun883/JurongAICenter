@@ -37,13 +37,42 @@ public class MediaLibraryServiceImpl implements MediaLibraryService {
 
     @Override
     public List<MediaLibraryResponse> listLibraries(Long userId) {
+        // 1. 查用户已有库
         LambdaQueryWrapper<MediaLibrary> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(MediaLibrary::getUserId, userId)
                .orderByAsc(MediaLibrary::getSortOrder)
                .orderByAsc(MediaLibrary::getId);
         List<MediaLibrary> libs = libraryRepository.selectList(wrapper);
 
-        // 统计每个库的素材数量
+        // 2. 自动建 2 个系统默认库（首次访问时）
+        if (libs.stream().noneMatch(l -> TYPE_UPLOADED.equals(l.getType()))) {
+            MediaLibrary uploaded = new MediaLibrary();
+            uploaded.setUserId(userId);
+            uploaded.setName("我的资产");
+            uploaded.setType(TYPE_UPLOADED);
+            uploaded.setIconKey("folder");
+            uploaded.setSortOrder(0);
+            uploaded.setCreatedAt(LocalDateTime.now());
+            uploaded.setUpdatedAt(LocalDateTime.now());
+            libraryRepository.insert(uploaded);
+            libs.add(0, uploaded);
+            log.info("Auto-created '我的资产' for userId={}, id={}", userId, uploaded.getId());
+        }
+        if (libs.stream().noneMatch(l -> TYPE_AI.equals(l.getType()))) {
+            MediaLibrary ai = new MediaLibrary();
+            ai.setUserId(userId);
+            ai.setName("AI 生成结果");
+            ai.setType(TYPE_AI);
+            ai.setIconKey("sparkles");
+            ai.setSortOrder(1);
+            ai.setCreatedAt(LocalDateTime.now());
+            ai.setUpdatedAt(LocalDateTime.now());
+            libraryRepository.insert(ai);
+            libs.add(1, ai);
+            log.info("Auto-created 'AI 生成结果' for userId={}, id={}", userId, ai.getId());
+        }
+
+        // 3. 统计每个库的素材数量
         Map<Long, Long> countMap = countAssetsByLibrary(userId, libs);
 
         return libs.stream().map(lib -> toResponse(lib, countMap)).toList();
@@ -171,15 +200,25 @@ public class MediaLibraryServiceImpl implements MediaLibraryService {
     }
 
     @Override
-    public MediaLibrary getUploadLibrary(Long userId) {
+    @Transactional(rollbackFor = Exception.class)
+    public MediaLibrary getOrCreateUploadLibrary(Long userId) {
         LambdaQueryWrapper<MediaLibrary> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(MediaLibrary::getUserId, userId)
                .eq(MediaLibrary::getType, TYPE_UPLOADED);
         MediaLibrary lib = libraryRepository.selectOne(wrapper);
-        if (lib == null) {
-            throw new BusinessException(ErrorCode.MEDIA_LIBRARY_NOT_FOUND,
-                "我的资产库未初始化，请联系管理员");
-        }
+        if (lib != null) return lib;
+
+        // 没有"我的资产"库时自动建一个，避免上传时 7002
+        lib = new MediaLibrary();
+        lib.setUserId(userId);
+        lib.setName("我的资产");
+        lib.setType(TYPE_UPLOADED);
+        lib.setIconKey("upload");
+        lib.setSortOrder(10); // 系统库排在前面，留 0 给 system-ai
+        lib.setCreatedAt(LocalDateTime.now());
+        lib.setUpdatedAt(LocalDateTime.now());
+        libraryRepository.insert(lib);
+        log.info("Auto-created '我的资产' library for userId={}: id={}", userId, lib.getId());
         return lib;
     }
 

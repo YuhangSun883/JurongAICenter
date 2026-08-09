@@ -35,6 +35,9 @@ public class CanvasTask {
     private String settings;
     private String assetIds;
 
+    /** 本次任务新建的 CanvasNode ID 列表（JSON 数组）—— 前端只拉这些节点，不 reload 整张画布 */
+    private String createdNodeIds;
+
     /** AI 生成的产物 */
     private String textResult;
     private String resultUrl;

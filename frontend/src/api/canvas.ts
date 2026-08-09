@@ -40,6 +40,8 @@ export interface GenerateCanvasNodeRequest {
   prompt: string;
   content?: string;
   assetIds?: string[];
+  /** 2026-08-09:提示框中上传的素材节点 id 列表(换装场景) */
+  materialNodeIds?: string[];
   settings?: Record<string, unknown>;
 }
 

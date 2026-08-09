@@ -108,31 +108,23 @@ class JurongImageToVideo:
 
     @staticmethod
     def _enhance_prompt(prompt: str) -> str:
-        """智能优化 prompt，强制锁定参考图主体。
+        """智能优化 prompt，保持首帧的主体/构图/色调/风格。
 
-        关键约束：模型必须复刻参考图里的人物/物体外观，
-        禁止改变性别/年龄/服装/发型/体型/肤色，
-        只动画作和镜头运动。
+        通用引导词（不区分人物/风景/物体），适用于图生视频常见场景。
+        启发式去重：用户 prompt 已有强保持词时不再追加，避免重复。
         """
         lower = prompt.lower()
         existing_keywords = [
             "same as reference", "保持原图", "保持", "preserve",
             "consistent", "exact same", "identical",
             "same person", "same face", "maintain",
-            "锁定", "不要改变", "do not change",
         ]
         if any(k in lower for k in existing_keywords):
             return prompt
 
         enhancer = (
-            "CRITICAL: The subject(s) shown in the reference image MUST appear "
-            "EXACTLY as in the reference — same face, same gender, same age, "
-            "same hairstyle and hair color, same clothing, same body type, "
-            "same skin tone, same accessories. Do NOT replace, swap, gender-swap, "
-            "or alter the subject's identity in any way. "
-            "Only animate the actions, expressions, and camera movement described above. "
-            "Preserve the exact composition, color palette, lighting, and visual style "
-            "of the reference image throughout the entire video. "
-            "Lock the first frame as the visual anchor."
+            "Maintain the EXACT composition, subject(s), color palette, "
+            "and visual style of the reference image throughout the entire video. "
+            "Preserve identity and details."
         )
         return f"{prompt.rstrip('. ')}. {enhancer}"

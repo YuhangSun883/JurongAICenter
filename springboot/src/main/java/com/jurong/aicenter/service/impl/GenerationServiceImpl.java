@@ -328,7 +328,8 @@ public class GenerationServiceImpl implements GenerationService {
         if (runningJobs.size() >= 5) {
             log.info("pollRunningJobs: {} RUNNING", runningJobs.size());
         } else {
-            log.debug("pollRunningJobs: {} RUNNING", runningJobs.size());
+            // 2026-08-09:降到 trace,默认不显示,避免轮询刷屏
+            log.trace("pollRunningJobs: {} RUNNING", runningJobs.size());
         }
         for (Job job : runningJobs) {
             try {

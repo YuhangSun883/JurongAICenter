@@ -42,18 +42,19 @@ public enum ErrorCode {
     USER_NOT_IN_GROUP(6008, "user not in group"),
     INVALID_ROLE_VALUE(6009, "invalid role value"),
 
-    MEDIA_LIBRARY_NAME_DUPLICATE(7001, "media library name duplicate"),
-    MEDIA_LIBRARY_NOT_FOUND(7002, "media library not found"),
-    MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY(7003, "system media library cannot be modified"),
-    MEDIA_ASSET_NOT_FOUND(7010, "media asset not found"),
-    MEDIA_ASSET_TYPE_INVALID(7011, "media asset type invalid"),
-    MEDIA_ASSET_NAME_DUPLICATE(7012, "media asset name duplicate"),
-    MEDIA_UPLOAD_FAILED(7020, "media upload failed"),
-    MEDIA_FILE_TOO_LARGE(7021, "media file too large"),
-    MEDIA_FILE_EMPTY(7022, "media file empty"),
-    ASSET_UPLOAD_FAILED(7023, "asset upload failed"),
-    ASSET_DELETE_FAILED(7024, "asset delete failed"),
-    ASSET_NOT_ACTIVE(7025, "asset not active");
+    // Media (7xxx) — 资产库 / 素材
+    MEDIA_LIBRARY_NAME_DUPLICATE(7001, "资产库名称已存在"),
+    MEDIA_LIBRARY_NOT_FOUND(7002, "资产库不存在"),
+    MEDIA_LIBRARY_IS_SYSTEM_CANNOT_MODIFY(7003, "系统默认资产库不可修改或删除"),
+    MEDIA_ASSET_NOT_FOUND(7010, "素材不存在"),
+    MEDIA_ASSET_TYPE_INVALID(7011, "素材类型不支持"),
+    MEDIA_ASSET_NAME_DUPLICATE(7012, "当前库内已存在同名素材"),
+    MEDIA_UPLOAD_FAILED(7020, "文件上传失败"),
+    ASSET_UPLOAD_FAILED(7021, "素材上传失败（aicoming proxy）"),
+    ASSET_NOT_ACTIVE(7022, "素材未激活(aicoming proxy 返回 status=processing,请轮询等到 active)"),
+    ASSET_DELETE_FAILED(7023, "素材删除失败(aicoming proxy)"),
+    MEDIA_FILE_TOO_LARGE(7021, "文件超过大小限制"),
+    MEDIA_FILE_EMPTY(7022, "文件为空");
 
     private final int code;
     private final String message;

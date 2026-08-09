@@ -117,32 +117,54 @@ class JurongMultiImageToVideo:
         return (first_frame, video_path)
 
     @staticmethod
-    def _enhance_prompt(prompt: str) -> str:
-        """智能优化 prompt，强制锁定参考图主体。
+    def _enhance_prompt(prompt: str, subject_desc: str = None) -> str:
+        """智能优化 prompt，保持首帧的主体/构图/色调/风格。
 
-        关键约束：模型必须复刻参考图里的人物/物体外观，
-        禁止改变性别/年龄/服装/发型/体型/肤色，
-        只动画作和镜头运动。
+        2026-08-07 重大升级:支持 subject_desc 注入(视觉模型描述)。
+        - 有 subject_desc:用描述作为主体锚定,最强力度
+        - 无 subject_desc:降级到通用保持提示
         """
+        # 强锚定模式:有视觉描述
+        if subject_desc:
+            return (
+                f"VIDEO MAIN SUBJECT: {subject_desc}. "
+                f"ACTION: {prompt}. "
+                f"CRITICAL: The subject of this video is EXACTLY: '{subject_desc}'. "
+                "Do NOT replace this subject with any other entity. "
+                "Do NOT generate humans, people, faces, or characters that are not in the reference image. "
+                "Do NOT change the species, appearance, clothing, identity, or any visual attribute. "
+                "The reference image's subject is the ONLY subject in this video. "
+                "Maintain the exact composition, color palette, lighting, and visual style "
+                "of the reference image. Camera and the subject's pose may change, "
+                "but the subject identity is LOCKED."
+            )
+
+        # 降级模式
         lower = prompt.lower()
         existing_keywords = [
             "same as reference", "保持原图", "保持", "preserve",
             "consistent", "exact same", "identical",
             "same person", "same face", "maintain",
-            "锁定", "不要改变", "do not change",
+            "the subject", "the character", "图中", "参考图",
+            "reference image", "this tiger", "this cat", "this dog",
+            "this animal", "this character", "this person",
         ]
         if any(k in lower for k in existing_keywords):
             return prompt
 
+        action = prompt.rstrip(". ").rstrip()
         enhancer = (
-            "CRITICAL: The subject(s) shown in the reference images MUST appear "
-            "EXACTLY as in the references — same face, same gender, same age, "
-            "same hairstyle and hair color, same clothing, same body type, "
-            "same skin tone, same accessories. Do NOT replace, swap, gender-swap, "
-            "or alter the subject's identity in any way. "
-            "Only animate the actions, expressions, and camera movement described above. "
-            "Preserve the exact composition, color palette, lighting, and visual style "
-            "of the reference images throughout the entire video. "
-            "Lock the first frame as the visual anchor."
+            f"Animate the EXACT subject(s) shown in the reference image "
+            f"performing this action: {action}. "
+            "The subject identity (species, appearance, clothing, pose, "
+            "proportions, age) MUST remain identical to the reference image "
+            "throughout the entire video. "
+            "Do NOT replace animals with humans, objects with humans, "
+            "scenes with unrelated characters, or humans with other entities. "
+            "The reference image's subject is the ONLY subject of this video. "
+            "Maintain the exact composition, color palette, lighting, and "
+            "visual style of the reference image. Camera and the subject's "
+            "pose may change, but the subject identity is locked."
         )
-        return f"{prompt.rstrip('. ')}. {enhancer}"
+        return enhancer
+

@@ -204,6 +204,126 @@ export default function Page() {
           </section>
         </div>
       </main>
+      {confirmDelete && (
+        <DeleteCanvasModal
+          target={confirmDelete}
+          deleting={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 删除画布确认弹窗 */
+function DeleteCanvasModal({
+  target,
+  deleting,
+  onConfirm,
+  onCancel,
+}: {
+  target: CanvasListItem;
+  deleting: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-[420px] rounded-xl bg-white p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-2 flex items-center gap-2 text-[#16181d]">
+          <span className="grid h-8 w-8 place-items-center rounded-lg bg-red-50 text-red-500">
+            <Trash2 className="h-4 w-4" />
+          </span>
+          <h3 className="text-base font-semibold">确认删除画布</h3>
+        </div>
+        <p className="mt-1 text-sm leading-6 text-[#5f6876]">
+          画布 <span className="font-medium text-[#16181d]">「{target.name || '未命名画布'}」</span> 将被永久删除,包括其下的
+          {' '}{target.nodeCount ?? 0} 个节点。此操作不可撤销。
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={deleting}
+            className="rounded-md border border-[#e0e2e7] bg-white px-4 py-2 text-sm text-[#4f5969] transition hover:bg-[#f4f7fb] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+            className="rounded-md bg-red-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {deleting ? '删除中…' : '永久删除'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 单个画布卡片(我的创作列表用)
+ * - 缩略图优先用 item.thumbnail(后端有就给);没有就用占位
+ * - 标题:后端的 item.name 或 "未命名画布"
+ * - 时间:相对时间(刚刚/N分钟前/N小时前/yyyy-MM-dd)
+ */
+function CanvasCard({ item, onClick, onRequestDelete }: {
+  item: CanvasListItem;
+  onClick: () => void;
+  onRequestDelete: () => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onClick}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
+      className="group relative flex w-[230px] cursor-pointer flex-col rounded-lg border border-[#e0e2e7] bg-white text-left shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)]"
+      title={`打开画布: ${item.name || '未命名画布'}`}
+    >
+      <div className="relative h-[160px] w-full overflow-hidden rounded-t-lg bg-[#f3f5f8]">
+        {item.thumbnail ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={item.thumbnail}
+            alt={item.name || '未命名画布'}
+            className="h-full w-full object-cover transition group-hover:scale-[1.02]"
+          />
+        ) : (
+          <div className="grid h-full w-full place-items-center text-[#c8d2dd]">
+            <ImageIcon className="h-10 w-10" />
+            <span className="mt-1 text-[11px]">无预览</span>
+          </div>
+        )}
+        {/* 右上角删除按钮:hover 显示，点走弹窗 */}
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onRequestDelete(); }}
+          className="absolute right-2 top-2 grid h-7 w-7 place-items-center rounded-md bg-black/55 text-white opacity-0 transition hover:bg-red-500 group-hover:opacity-100"
+          title="删除画布"
+          aria-label="删除画布"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <div className="flex flex-col gap-1 p-3">
+        <div className="truncate text-sm font-semibold text-[#16181d]">
+          {item.name || '未命名画布'}
+        </div>
+        <div className="text-[11px] text-[#8a909b]">
+          {formatRelativeTime(item.updatedAt)}
+          {item.nodeCount != null && <> · {item.nodeCount} 个节点</>}
+        </div>
+      </div>
     </div>
   );
 }

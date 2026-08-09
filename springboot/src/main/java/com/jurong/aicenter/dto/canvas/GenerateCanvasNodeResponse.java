@@ -4,6 +4,9 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.Collections;
+import java.util.List;
+
 /**
  * 画布 generate 端点响应。
  *
@@ -33,4 +36,15 @@ public class GenerateCanvasNodeResponse {
 
     /** 预估积分 */
     private Integer creditsEstimated;
+
+    /**
+     * 本次任务新建的 CanvasNode ID 列表。
+     * 仅在 status=success 时有值。脚本拆解 / 视频抽帧返回这个字段，
+     * 前端只拉这些节点追加到本地 state，不 reload 整张画布（避免把历史节点堆左上角）。
+     */
+    private List<String> createdNodeIds;
+
+    public List<String> getCreatedNodeIds() {
+        return createdNodeIds == null ? Collections.emptyList() : createdNodeIds;
+    }
 }

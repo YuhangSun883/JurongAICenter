@@ -1,6 +1,7 @@
 package com.jurong.aicenter.service;
 
 import com.jurong.aicenter.dto.PageResult;
+import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
 import com.jurong.aicenter.dto.media.MediaListQuery;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
@@ -10,6 +11,18 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 媒体资产 Service 接口（合并版）
+ *
+ * <p>包含三大类：
+ * <ul>
+ *   <li>素材：listAssets / getAsset / uploadAsset / deleteAsset / batchDeleteAssets / renameAsset
+ *   <li>AI 工具回调：recordAiGenerated / deleteAssetsByLibrary
+ *   <li>角色库（同事保留）：listCategories / listAllRoles / listRolesByCategory
+ * </ul>
+ *
+ * <p>资产库的 CRUD（创建/重命名/删除）由独立的 {@link MediaLibraryService} 提供。
+ */
 public interface MediaService {
 
     PageResult<MediaAssetResponse> listAssets(Long userId, MediaListQuery query);
