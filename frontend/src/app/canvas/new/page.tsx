@@ -35,7 +35,8 @@ import {
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent, type PointerEvent } from 'react';
-import { canvasApi, type CanvasNodeType } from '@/api/canvas';
+import { Loader2 } from 'lucide-react';
+import { canvasApi, type CanvasNode, type CanvasNodeType } from '@/api/canvas';
 import { getAccessToken } from '@/lib/auth-store';
 import { cn } from '@/lib/utils';
 import { LoginGate } from '@/components/common/LoginGate';
@@ -45,12 +46,27 @@ type ToolId = 'select' | 'hand' | 'component' | 'template' | 'history' | 'help';
 interface CanvasViewNode {
   id: string;
   type: CanvasNodeType;
+  title?: string;
   x: number;
   y: number;
   content?: string;
   resultUrl?: string;
   /** 每个节点独立的 prompt 输入（不跨节点共享） */
   prompt?: string;
+}
+
+/** API 返回的 CanvasNode → 本地视图节点（加 x/y，补默认值） */
+function toViewNode(n: CanvasNode): CanvasViewNode {
+  return {
+    id: n.id,
+    type: n.type,
+    title: n.title,
+    content: n.content,
+    resultUrl: n.resultUrl,
+    x: n.positionX ?? 0,
+    y: n.positionY ?? 0,
+    prompt: '',
+  };
 }
 
 interface CanvasEdge {
@@ -127,7 +143,7 @@ export default function NewCanvasPage() {
     setCanvasId(urlCanvasId);
     void canvasApi.getCanvasDetail(urlCanvasId)
       .then((detail) => {
-        if (detail?.nodes) setNodes(detail.nodes);
+        if (detail?.nodes) setNodes(detail.nodes.map(toViewNode));
         if (detail?.edges) setEdges(detail.edges);
       })
       .catch((err) => console.warn('[canvas-new] load from URL failed:', err));
@@ -155,6 +171,8 @@ export default function NewCanvasPage() {
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>('');
+  // 2026-08-09 新增:当前节点的提示素材列表(以 image 节点为 key, value 为上传后的素材节点 id 列表)
+  const [promptMaterials, setPromptMaterials] = useState<Record<string, Array<{ id: string; url: string; name?: string }>>>({});
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
 
@@ -186,7 +204,7 @@ export default function NewCanvasPage() {
       const detail = await canvasApi.getCanvasDetail(canvasId);
       // 切换到该画布:设 canvasId + 用 detail.nodes/edges 覆盖本地 state
       setCanvasId(canvasId);
-      if (detail?.nodes) setNodes(detail.nodes);
+      if (detail?.nodes) setNodes(detail.nodes.map(toViewNode));
       if (detail?.edges) setEdges(detail.edges);
     } catch (err) {
       console.warn('[canvas] getCanvasDetail failed:', err);
@@ -239,7 +257,7 @@ export default function NewCanvasPage() {
       // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
       const detail = await canvasApi.getCanvasDetail(canvasId);
       if (detail?.nodes) {
-        setNodes(detail.nodes);
+        setNodes(detail.nodes.map(toViewNode));
       }
       if (detail?.edges) {
         setEdges(detail.edges);
@@ -524,6 +542,62 @@ export default function NewCanvasPage() {
     fileInputRef.current?.click();
   };
 
+  // 2026-08-09 新增:上传提示框素材 — 复用 handleUploadToCanvas + 记录到 promptMaterials
+  const handleUploadMaterial = async () => {
+    if (!activeNodeId) return;
+    const targetNodeId = activeNodeId;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.multiple = true;
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.onchange = async (ev) => {
+      const files = (ev.target as HTMLInputElement).files;
+      document.body.removeChild(input);
+      if (!files || files.length === 0) return;
+      setUploading(true);
+      try {
+        const list = Array.from(files);
+        const newMaterials: Array<{ id: string; url: string; name?: string }> = [];
+        for (const file of list) {
+          const created = await canvasApi.uploadToCanvas(file, canvasId ? { canvasId } : {});
+          newMaterials.push({
+            id: created.id,
+            url: created.resultUrl ?? '',
+            name: file.name,
+          });
+          // 同时作为画布节点插入(以便后续在画布可见 + 可以连线使用)
+          const nextNode: CanvasViewNode = {
+            id: created.id,
+            type: created.type,
+            x: clampNodeX(centeredNodePosition().x),
+            y: clampNodeY(centeredNodePosition().y),
+            content: created.content,
+            resultUrl: created.resultUrl,
+            prompt: '',
+          };
+          setNodes((current) => {
+            if (current.some((n) => n.id === nextNode.id)) return current;
+            return [...current, nextNode];
+          });
+        }
+        // 把新素材加入 active node 的 materials 列表
+        setPromptMaterials((prev) => ({
+          ...prev,
+          [targetNodeId]: [...(prev[targetNodeId] ?? []), ...newMaterials],
+        }));
+      } catch (err: unknown) {
+        console.error('[canvas] upload material error:', err);
+        const msg = err instanceof Error ? err.message : '上传素材失败,请重试';
+        setGenerateError(msg);
+      } finally {
+        setUploading(false);
+      }
+    };
+    input.click();
+  };
+
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
     void handleUploadToCanvas(event.target.files);
     // 重置以便下次选同一文件还能触发 change
@@ -573,6 +647,8 @@ export default function NewCanvasPage() {
         prompt: nodePrompt,
         content: activeNode.content,
         assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
+        // 2026-08-09:提示框中上传的素材 id(换装场景用)
+        materialNodeIds: promptMaterials[activeNode.id]?.map((m) => m.id) ?? [],
       });
 
       // 2. 轮询任务状态（按节点类型分档超时）
@@ -583,7 +659,7 @@ export default function NewCanvasPage() {
       // 后端超时:NewApiClient.chatCompletion = 180s，imagePollTimeoutSec = 600s，videoPollTimeoutSec = 1200s
       const MAX_DURATION =
         activeNode.type === 'text'  ? 200_000 :
-        activeNode.type === 'image' ? 300_000 :
+        activeNode.type === 'image' ? 600_000 :  // 2026-08-09:换装需 5min+,原 300s 不够
         /* video */                  600_000;
       const start = Date.now();
       let lastResult = initial;
@@ -620,6 +696,22 @@ export default function NewCanvasPage() {
         // pending / running 继续轮询
       }
 
+      // 2026-08-09:超时后兑换底重试 1 次(换装经常刚好超时)
+      console.warn('[canvas] 轮询超时，最后兑换底重试 1 次 ...');
+      try {
+        lastResult = await canvasApi.getTask(initial.taskId);
+        if (lastResult.status === 'success' || lastResult.status === 'failed') {
+          // 走上面同个 success 分支逻辑可能不推，因为已经过了 while — 手动处理
+          if (lastResult.status === 'failed') {
+            setGenerateError(`生成失败：${(lastResult as any).message || (lastResult as any).failMessage || lastResult.status}`);
+          } else {
+            setGenerateError('后端已完成，但兑换底重试未拉取新节点。请刷新画布查看。');
+          }
+          return;
+        }
+      } catch (finalErr) {
+        console.error('[canvas] 兑换底重试也失败:', finalErr);
+      }
       setGenerateError('生成超时，请重试');
     } catch (err: any) {
       console.error('[canvas] generate error:', err);
@@ -658,12 +750,13 @@ export default function NewCanvasPage() {
           status?: string;
           text?: string;
           message?: string;
+          createdNodeIds?: string[];
         } = await fetch(`/api/canvas/tasks/${taskId}`, {
           credentials: 'include',
           headers: (() => {
             const t = getAccessToken();
             return t ? { Authorization: `Bearer ${t}` } : {};
-          })(),
+          })() as Record<string, string>,
         }).then((r) => r.json());
 
         if (data.status === 'success') {
@@ -673,29 +766,11 @@ export default function NewCanvasPage() {
               current.map((n) => (n.id === node.id ? { ...n, content: data.text! } : n))
             );
           }
-          // 合并本次新建的节点（帧拼图 / 口播文案文本节点）到本地 state
-          // 不再调 reloadCanvasFromBackend（那会拉整张画布，把历史节点堆左上角）
-          const newIds = data.createdNodeIds ?? [];
-          if (newIds.length > 0) {
-            try {
-              const newNodes = await Promise.all(
-                newIds.map(async (id) => {
-                  const apiNode = await canvasApi.getNode(id);
-                  // 关键映射：后端返回 positionX/positionY，前端 CanvasViewNode 要 x/y
-                  // 没这一步 → 新节点全是 (0,0) 堆左上角 + 拖动计算为 NaN
-                  return {
-                    ...apiNode,
-                    x: apiNode.positionX ?? 0,
-                    y: apiNode.positionY ?? 0,
-                    prompt: '',
-                  } as CanvasViewNode;
-                })
-              );
-              setNodes((current) => [...current, ...newNodes]);
-            } catch (mergeErr) {
-              console.warn('[canvas] merge new nodes failed:', mergeErr);
-            }
-          }
+          // 2026-08-09:换调 reloadCanvasFromBackend
+          //   原因: merge 在某些场景下不生效(可能是 setNodes batching 或 memo 问题)
+          //   reload 从后端重拉全画布节点,保证 UI 同步;新节点都设了 position 不会堆左上角
+          console.log('[canvas] task SUCCESS, reloadCanvasFromBackend activeNodeId=', activeNode?.id);
+          await reloadCanvasFromBackend(activeNode!.id);
           setGenerating(false);
           return;
         }
@@ -1003,6 +1078,7 @@ export default function NewCanvasPage() {
                 nodeY: node.y,
               });
             }}
+            onExpandImage={(image) => setExpandedImage(image)}
           />
         ))
       )}
@@ -1015,6 +1091,9 @@ export default function NewCanvasPage() {
           onChange={(value) => updateNodePrompt(activeNode.id, value)}
           onSubmit={requestGeneration}
           generating={generating}
+          onUploadMaterial={handleUploadMaterial}
+          uploading={uploading}
+          materials={promptMaterials[activeNode.id] ?? []}
         />
       )}
 
@@ -1244,6 +1323,7 @@ function CanvasNodeCard({
   onStartLinkDrag,
   onContextMenu,
   onDragStart,
+  onExpandImage,
 }: {
   node: CanvasViewNode;
   active: boolean;
@@ -1254,6 +1334,8 @@ function CanvasNodeCard({
   onStartLinkDrag: (node: CanvasViewNode, side: 'left' | 'right', event: PointerEvent<HTMLButtonElement>) => void;
   onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
+  /** 双击图片节点放大查看 */
+  onExpandImage: (image: { url: string; title: string }) => void;
 }) {
   const isText = node.type === 'text';
 
@@ -1270,7 +1352,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: node.title || nodeTitle(node.type) });
+                  onExpandImage({ url: node.resultUrl!, title: node.title || nodeTitle(node.type) });
                 }}
     >
       {active && (
@@ -1350,7 +1432,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onExpandImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
                 }}
               />
             </div>
@@ -1380,7 +1462,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onExpandImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
                 }}
               />
             </div>
@@ -1416,6 +1498,9 @@ function PromptComposer({
   onChange,
   onSubmit,
   generating,
+  onUploadMaterial,
+  uploading,
+  materials,
 }: {
   node: CanvasViewNode;
   value: string;
@@ -1423,6 +1508,12 @@ function PromptComposer({
   onChange: (value: string) => void;
   onSubmit: () => void;
   generating?: boolean;
+  /** 点击上传素材: 调起文件选择器, 上传后会自动插入 material */
+  onUploadMaterial: () => void;
+  /** 上传中 flag */
+  uploading?: boolean;
+  /** 当前节点已上传的素材列表(包含缩略图 url) */
+  materials?: Array<{ id: string; url: string; name?: string }>;
 }) {
   const isText = node.type === 'text';
   const isImage = node.type === 'image';
@@ -1462,13 +1553,34 @@ function PromptComposer({
           <List className="h-4 w-4" />
         </div>
       )}
+      {/* 2026-08-09 新增:提示素材 chip 区(点上传按钮后填充) */}
+      {materials && materials.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-2 pt-2">
+          {materials.map((m, idx) => (
+            <div
+              key={m.id}
+              className="group relative flex h-12 w-12 items-center justify-center overflow-hidden rounded-md border border-[#dfe4ea] bg-[#f4f6fa]"
+              title={m.name ?? m.id}
+            >
+              {m.url ? (
+                <img src={m.url} alt={m.name ?? '素材'} className="h-full w-full object-cover" />
+              ) : (
+                <ImageIcon className="h-5 w-5 text-[#9aa6b7]" />
+              )}
+              <span className="absolute left-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-black/60 text-[10px] font-semibold leading-none text-white">
+                {idx + 1}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       <textarea
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         className={cn(
           'h-[118px] w-full resize-none bg-transparent pr-8 text-sm leading-6 text-[#4b5565] outline-none placeholder:text-[#606b7c]',
-          referenceCount > 0 && 'pl-[74px]'
+          (referenceCount > 0 || (materials && materials.length > 0)) && 'pl-[74px]'
         )}
       />
       <div className="absolute right-4 top-4 flex flex-col gap-5 text-[#9aa6b7]">
@@ -1492,8 +1604,14 @@ function PromptComposer({
         >
           <Expand className="h-4 w-4" />
         </button>
-        <button type="button" className="hover:text-[#2f78ff]" title="上传素材">
-          <Upload className="h-4 w-4" />
+        <button
+          type="button"
+          onClick={onUploadMaterial}
+          className="hover:text-[#2f78ff]"
+          title="上传素材"
+          disabled={uploading}
+        >
+          {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
         </button>
         <button type="button" className="hover:text-[#2f78ff]" title="参数列表">
           <List className="h-4 w-4" />
