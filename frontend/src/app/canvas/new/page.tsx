@@ -9,6 +9,7 @@ import {
   Download,
   Expand,
   FileText,
+  Film,
   FolderOpen,
   Grid3X3,
   Hand,
@@ -32,8 +33,10 @@ import {
   Volume2,
 } from 'lucide-react';
 import Link from 'next/link';
-import { useEffect, useState, type ComponentType, type MouseEvent, type PointerEvent } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent, type PointerEvent } from 'react';
 import { canvasApi, type CanvasNodeType } from '@/api/canvas';
+import { getAccessToken } from '@/lib/auth-store';
 import { cn } from '@/lib/utils';
 import { LoginGate } from '@/components/common/LoginGate';
 
@@ -54,6 +57,53 @@ interface CanvasEdge {
   id: string;
   from: string;
   to: string;
+}
+
+function normalizeCanvasNodes(rawNodes: Array<{
+  id: string;
+  type: CanvasNodeType;
+  x?: number;
+  y?: number;
+  positionX?: number;
+  positionY?: number;
+  content?: string;
+  resultUrl?: string;
+  prompt?: string;
+}> | null | undefined): CanvasViewNode[] {
+  return (rawNodes ?? []).map((node) => ({
+    id: node.id,
+    type: node.type,
+    x: node.x ?? node.positionX ?? 0,
+    y: node.y ?? node.positionY ?? 0,
+    content: node.content,
+    resultUrl: node.resultUrl,
+    prompt: node.prompt ?? '',
+  }));
+}
+
+function normalizeCanvasEdges(rawEdges: Array<{
+  id?: string;
+  from?: string;
+  to?: string;
+  fromNode?: string;
+  toNode?: string;
+}> | null | undefined): CanvasEdge[] {
+  const seen = new Set<string>();
+  const result: CanvasEdge[] = [];
+  for (const edge of rawEdges ?? []) {
+    const from = edge.from ?? edge.fromNode;
+    const to = edge.to ?? edge.toNode;
+    if (!from || !to) continue;
+    const id = edge.id ?? `edge_${from}_${to}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push({ id, from, to });
+  }
+  return result;
+}
+
+function isUserCanvas(item: import('@/api/canvas').CanvasListItem) {
+  return item.id !== 'mock_canvas_default' && item.name !== '\u9ed8\u8ba4\u753b\u5e03' && item.name !== '\u699b\u6a3f\ue17b\u9422\u8bf2\u7af7';
 }
 
 interface AddMenuState {
@@ -109,6 +159,32 @@ const TOOLS: Array<{
 
 export default function NewCanvasPage() {
   const [activeTool, setActiveTool] = useState<ToolId>('select');
+  // 当前画布 ID:首次访问 /canvas/new 时为 null,用户点"+新建"或从历史打开画布后会被设置
+  // 之后 createNode / upload 等操作会带上这个 canvasId
+  const [canvasId, setCanvasId] = useState<string | null>(null);
+  const [canvasLoadState, setCanvasLoadState] = useState<'idle' | 'loading' | 'loaded' | 'failed'>('idle');
+  const searchParams = useSearchParams();
+
+  // 从 URL ?canvasId=xxx 读画布 ID,有就调 getCanvasDetail 加载
+  // 触发时机:进入页面 / URL 变化
+  useEffect(() => {
+    const urlCanvasId = searchParams.get('canvasId');
+    if (!urlCanvasId) return;
+    // 已经在加载这个画布了就不重复
+    if (canvasId === urlCanvasId) return;
+    setCanvasId(urlCanvasId);
+    setCanvasLoadState('loading');
+    void canvasApi.getCanvasDetail(urlCanvasId)
+      .then((detail) => {
+        setNodes(normalizeCanvasNodes(detail?.nodes));
+        setEdges(normalizeCanvasEdges(detail?.edges));
+        setCanvasLoadState('loaded');
+      })
+      .catch((err) => {
+        console.warn('[canvas-new] load from URL failed:', err);
+        setCanvasLoadState('failed');
+      });
+  }, [searchParams, canvasId]);
   const [addMenu, setAddMenu] = useState<AddMenuState | null>(null);
   const [nodes, setNodes] = useState<CanvasViewNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
@@ -117,48 +193,170 @@ export default function NewCanvasPage() {
   // const [prompt, setPrompt] = useState('');
   const [zoom, setZoom] = useState(100);
   const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
+  // 阈值拖动:pointerdown 时先记录起始位置,移动超过阈值才真正开始拖动
+  // 这样单击/双击不会被 drag 吃掉了
+  const [dragPending, setDragPending] = useState<{
+    id: string;
+    startX: number;
+    startY: number;
+    nodeX: number;
+    nodeY: number;
+  } | null>(null);
   const [linkDrag, setLinkDrag] = useState<LinkDragState | null>(null);
   const [nodeMenu, setNodeMenu] = useState<NodeContextMenuState | null>(null);
   const [edgeMenu, setEdgeMenu] = useState<EdgeContextMenuState | null>(null);
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>('');
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [uploading, setUploading] = useState(false);
 
-  // 加载本地缓存的连线(刷新不丢)
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
+  // ===== 我的创作 · 历史侧边面板 =====
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+  // ===== 展开图片 modal（双击图片节点触发放大查看） =====
+  const [expandedImage, setExpandedImage] = useState<{ url: string; title: string } | null>(null);
+  const [canvasHistory, setCanvasHistory] = useState<
+    import('@/api/canvas').CanvasListItem[]
+  >([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  const fetchCanvasHistory = async () => {
+    setHistoryLoading(true);
     try {
-      const raw = localStorage.getItem('canvas_edges');
-      if (raw) setEdges(JSON.parse(raw) as CanvasEdge[]);
-    } catch { /* ignore */ }
-  }, []);
+      const list = await canvasApi.listCanvases(1, 50);
+      setCanvasHistory(list.filter(isUserCanvas));
+    } catch (err) {
+      console.warn('[canvas] listCanvases failed:', err);
+      setCanvasHistory([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
 
-  // 连线变化时写 localStorage
+  const openCanvasFromHistory = async (canvasId: string) => {
+    setShowHistoryPanel(false);
+    try {
+      const detail = await canvasApi.getCanvasDetail(canvasId);
+      // 切换到该画布:设 canvasId + 用 detail.nodes/edges 覆盖本地 state
+      setCanvasId(canvasId);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
+    } catch (err) {
+      console.warn('[canvas] getCanvasDetail failed:', err);
+    }
+  }
+
+  /** 隐藏的 <input type="file"> ref，供菜单/画布触发本地选择 */
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // 加载本地缓存的画布节点(刷新不丢，弥补后端没有 getCanvasDetail 入口时的本地持久化)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    localStorage.setItem('canvas_edges', JSON.stringify(edges));
-  }, [edges]);
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState !== 'failed') return;
+    try {
+      const raw = localStorage.getItem(`canvas_nodes_${canvasId}`);
+      if (raw) setNodes(JSON.parse(raw) as CanvasViewNode[]);
+      const rawEdges = localStorage.getItem(`canvas_edges_${canvasId}`);
+      if (rawEdges) setEdges(JSON.parse(rawEdges) as CanvasEdge[]);
+      localStorage.removeItem('canvas_nodes');
+      localStorage.removeItem('canvas_edges');
+    } catch { /* ignore */ }
+  }, [canvasId, canvasLoadState]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
+    const t = setTimeout(() => {
+      localStorage.setItem(`canvas_nodes_${canvasId}`, JSON.stringify(nodes));
+    }, 200);
+    return () => clearTimeout(t);
+  }, [nodes, canvasId, canvasLoadState]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
+    localStorage.setItem(`canvas_edges_${canvasId}`, JSON.stringify(edges));
+  }, [edges, canvasId, canvasLoadState]);
+
+  /**
+   * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
+   * 后端接口是 GET /api/canvas/canvases/{id}，canvasApi.getCanvasDetail 是封装。
+   * 如果当前没有 canvasId（极端情况），则仅刷新当前节点的 content。
+   */
+  const reloadCanvasFromBackend = async (anchorNodeId: string) => {
+    try {
+      // 1) 先拿 anchor 节点的 canvasId（local state 的 CanvasViewNode 没带 canvasId，必须后端查）
+      const nodeResp = await canvasApi.getNode(anchorNodeId);
+      const canvasId = nodeResp?.canvasId;
+      if (!canvasId) {
+        console.warn('[canvas] reloadCanvasFromBackend: node has no canvasId, skip');
+        return;
+      }
+      // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
+      const detail = await canvasApi.getCanvasDetail(canvasId);
+      setCanvasId(canvasId);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
+    } catch (err) {
+      console.warn('[canvas] reloadCanvasFromBackend failed:', err);
+    }
+  };
 
   const activeNode = nodes.find((node) => node.id === activeNodeId) ?? null;
 
   useEffect(() => {
-    if (!dragging) return;
+    if (!dragPending && !dragging) return;
+
+    const DRAG_THRESHOLD = 4; // px — 移动超过这个距离才视为拖动
 
     const onPointerMove = (event: globalThis.PointerEvent) => {
-      setNodes((current) =>
-        current.map((node) =>
-          node.id === dragging.id
-            ? {
-                ...node,
-                x: clampNodeX(event.clientX - dragging.offsetX),
-                y: clampNodeY(event.clientY - dragging.offsetY),
-              }
-            : node
-        )
-      );
+      // 阶段 1: 按下了但还在阈值内 — 等用户移动超 4px 才开始拖
+      if (dragPending && !dragging) {
+        const dx = event.clientX - dragPending.startX;
+        const dy = event.clientY - dragPending.startY;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance < DRAG_THRESHOLD) return; // 不开始拖,让 click/dblclick 正常触发
+
+        // 跨过阈值,提升为正式 drag
+        const newDrag = {
+          id: dragPending.id,
+          offsetX: event.clientX - dragPending.nodeX,
+          offsetY: event.clientY - dragPending.nodeY,
+        };
+        setDragPending(null);
+        setDragging(newDrag);
+        // 同步更新位置(避免首帧跳跃)
+        setNodes((current) =>
+          current.map((node) =>
+            node.id === newDrag.id
+              ? {
+                  ...node,
+                  x: clampNodeX(event.clientX - newDrag.offsetX),
+                  y: clampNodeY(event.clientY - newDrag.offsetY),
+                }
+              : node
+          )
+        );
+        return;
+      }
+
+      // 阶段 2: 正式 drag 中 — 更新节点位置
+      if (dragging) {
+        setNodes((current) =>
+          current.map((node) =>
+            node.id === dragging.id
+              ? {
+                  ...node,
+                  x: clampNodeX(event.clientX - dragging.offsetX),
+                  y: clampNodeY(event.clientY - dragging.offsetY),
+                }
+              : node
+          )
+        );
+      }
     };
 
-    const onPointerUp = () => setDragging(null);
+    const onPointerUp = () => {
+      setDragPending(null);
+      setDragging(null);
+    };
 
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
@@ -166,7 +364,7 @@ export default function NewCanvasPage() {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
     };
-  }, [dragging]);
+  }, [dragPending, dragging]);
 
   useEffect(() => {
     if (!linkDrag) return;
@@ -243,6 +441,7 @@ export default function NewCanvasPage() {
   const addNode = async (type: CanvasNodeType) => {
     const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
     const created = await canvasApi.createNode({
+      canvasId: canvasId ?? undefined,
       type,
       title: nodeTitle(type),
       upstreamIds: source ? [source.id] : undefined,
@@ -328,6 +527,82 @@ export default function NewCanvasPage() {
     setNodeMenu(null);
   };
 
+  // ===== 本地上传：上传文件到画布，抹平建对应类型节点 =====
+
+  const handleUploadToCanvas = async (files: FileList | File[] | null | undefined) => {
+    if (!files || (files as FileList).length === 0) return;
+    const list = Array.from(files as ArrayLike<File>);
+    setUploading(true);
+    try {
+      const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
+      // 多个文件按纵向铺开（第一个从 source 右下方开始，后续每个下移 60px）
+      let offsetIndex = 0;
+      for (const file of list) {
+        const created = await canvasApi.uploadToCanvas(file, canvasId ? { canvasId } : {});
+        const basePos = source
+          ? { x: source.x + 430, y: source.y + offsetIndex * 60 }
+          : centeredNodePosition();
+        const nextNode: CanvasViewNode = {
+          id: created.id,
+          type: created.type,
+          x: clampNodeX(basePos.x),
+          y: clampNodeY(basePos.y),
+          content: created.content,
+          resultUrl: created.resultUrl,
+          prompt: '',
+        };
+        setNodes((current) => [...current, nextNode]);
+        if (source) {
+          setEdges((current) => [
+            ...current,
+            { id: `edge_${source.id}_${nextNode.id}`, from: source.id, to: nextNode.id },
+          ]);
+        }
+        offsetIndex++;
+      }
+      setAddMenu(null);
+    } catch (err: unknown) {
+      console.error('[canvas] upload error:', err);
+      const msg = err instanceof Error ? err.message : '上传失败，请重试';
+      setGenerateError(msg);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const handleUploadClick = () => {
+    setAddMenu(null);
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    void handleUploadToCanvas(event.target.files);
+    // 重置以便下次选同一文件还能触发 change
+    event.target.value = '';
+  };
+
+  const handleDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!isDragOver) setIsDragOver(true);
+  };
+
+  const handleDragLeave = (event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    // 只在离开主容器时取消高亮（避免子元素拖动闪烁）
+    if (event.currentTarget === event.target) setIsDragOver(false);
+  };
+
+  const handleDrop = (event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsDragOver(false);
+    void handleUploadToCanvas(event.dataTransfer.files);
+  };
+
+  // ===== 生成 =====
+
   const requestGeneration = async () => {
     if (!activeNode || generating) return;
     const nodePrompt = (activeNode.prompt ?? '').trim();
@@ -405,9 +680,199 @@ export default function NewCanvasPage() {
     }
   };
 
+  // ===== 视频抽帧描述 / 脚本拆解 =====
+
+  // 顶部工具栏目标节点：只有激活节点是视频时才显示，否则隐藏
+  const videoToolbarTarget =
+    activeNode && activeNode.type === 'video' && activeNode.resultUrl
+      ? activeNode
+      : null;
+
+  type ExtractMode = 'script' | 'frames' | 'both';
+  const handleExtractCaption = async (node: CanvasViewNode | null, mode: ExtractMode) => {
+    if (!node) {
+      setGenerateError('画布里没有视频节点，请先上传一个视频');
+      setGenerating(false);
+      return;
+    }
+    if (!node.resultUrl) {
+      setGenerateError('视频节点还没有视频，请先上传或生成');
+      setGenerating(false);
+      return;
+    }
+    setGenerating(true);
+    setGenerateError('');
+
+    const pollTask = async (taskId: string) => {
+      try {
+        const data: {
+          status?: string;
+          text?: string;
+          message?: string;
+          createdNodeIds?: string[];
+        } = await fetch(`/api/canvas/tasks/${taskId}`, {
+          credentials: 'include',
+          headers: (() => {
+            const t = getAccessToken();
+            const headers: Record<string, string> = {};
+            if (t) headers.Authorization = `Bearer ${t}`;
+            return headers;
+          })(),
+        }).then((r) => r.json());
+
+        if (data.status === 'success') {
+          // 写入视频节点 content（可能是口播文案，也可能是 "已抽帧 N 张" 状态标记）
+          if (data.text) {
+            setNodes((current) =>
+              current.map((n) => (n.id === node.id ? { ...n, content: data.text! } : n))
+            );
+          }
+          // 合并本次新建的节点（帧拼图 / 口播文案文本节点）到本地 state
+          // 不再调 reloadCanvasFromBackend（那会拉整张画布，把历史节点堆左上角）
+          const newIds = data.createdNodeIds ?? [];
+          if (newIds.length > 0) {
+            try {
+              const newNodes = await Promise.all(
+                newIds.map(async (id) => {
+                  const apiNode = await canvasApi.getNode(id);
+                  // 关键映射：后端返回 positionX/positionY，前端 CanvasViewNode 要 x/y
+                  // 没这一步 → 新节点全是 (0,0) 堆左上角 + 拖动计算为 NaN
+                  return {
+                    ...apiNode,
+                    x: apiNode.positionX ?? 0,
+                    y: apiNode.positionY ?? 0,
+                    prompt: '',
+                  } as CanvasViewNode;
+                })
+              );
+              setNodes((current) => [...current, ...newNodes]);
+            } catch (mergeErr) {
+              console.warn('[canvas] merge new nodes failed:', mergeErr);
+            }
+          }
+          setGenerating(false);
+          return;
+        }
+        if (data.status === 'failed') {
+          setGenerateError(`${mode === 'frames' ? '抽帧' : '脚本拆解'}失败: ${data.message || '未知错误'}`);
+          setGenerating(false);
+          return;
+        }
+        // pending / running —— 2 秒后再问
+        setTimeout(() => pollTask(taskId), 2000);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : '轮询失败';
+        setGenerateError(`失败: ${msg}`);
+        setGenerating(false);
+      }
+    };
+
+    try {
+      const token = getAccessToken();
+      const headers: Record<string, string> = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const initial: { taskId?: string; message?: string } = await fetch(
+        `/api/canvas/nodes/${node.id}/extract-caption?fps=1&mode=${mode}`,
+        { method: 'POST', credentials: 'include', headers }
+      ).then((r) => r.json());
+
+      if (!initial?.taskId) {
+        throw new Error(initial?.message || '提交任务失败');
+      }
+      // 开始轮询
+      pollTask(initial.taskId);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : '提交失败';
+      setGenerateError(`失败: ${msg}`);
+      setGenerating(false);
+    }
+  };
+
   return (
     <LoginGate>
-    <main className="relative h-screen min-h-[640px] overflow-hidden bg-[#f1f2f4] text-[#5e6878]">
+    <main
+      className={cn(
+        'relative h-screen min-h-[640px] overflow-auto bg-[#f1f2f4] text-[#5e6878] transition-colors',
+        isDragOver && 'bg-[#eef5ff]'
+      )}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+      onClick={(event) => {
+        // 点击空白处（不是节点、不是节点上方的工具栏按钮）时，清掉 activeNodeId，
+        // 这样顶部工具栏 / PromptComposer 都跟着隐藏。
+        const target = event.target as HTMLElement;
+        if (!target.closest('[data-canvas-node="true"], [data-toolbar="true"]')) {
+          setActiveNodeId(null);
+        }
+      }}
+    >
+      {/* 隐藏的 file input — 菜单/拖拽都通过它选择文件 */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,video/*,audio/*"
+        multiple
+        onChange={handleFileInputChange}
+        className="hidden"
+        aria-hidden
+      />
+
+      {/* 顶部视频操作工具栏：跟随目标视频节点浮动在它上方 */}
+      {videoToolbarTarget && (
+        <div
+          data-toolbar="true"
+          className="pointer-events-auto absolute z-40 flex -translate-x-1/2 gap-1 rounded-xl border border-[#dfe3e8] bg-white/95 px-2 py-1 shadow-[0_8px_22px_rgba(41,48,61,0.10)] backdrop-blur"
+          style={{
+            left: videoToolbarTarget.x + NODE_WIDTH / 2,
+            top: Math.max(8, videoToolbarTarget.y - 48),
+          }}
+        >
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              handleExtractCaption(videoToolbarTarget, 'script');
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-[#4c7eff] hover:bg-[#eef3ff]"
+            title="脚本拆解：用 VL 模型给每帧生成口播文案，输出文本节点"
+          >
+            <FileText className="h-3.5 w-3.5" />
+            <span>脚本拆解</span>
+          </button>
+          <span className="self-center text-[#dfe3e8]">|</span>
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              handleExtractCaption(videoToolbarTarget, 'frames');
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-[#4c7eff] hover:bg-[#eef3ff]"
+            title="视频抽帧：抽取帧缩略图到右侧，输出帧网格"
+          >
+            <ImageIcon className="h-3.5 w-3.5" />
+            <span>视频抽帧</span>
+          </button>
+        </div>
+      )}
+
+      {/* 拖拽高亮提示 */}
+      {isDragOver && (
+        <div className="pointer-events-none absolute inset-3 z-[60] grid place-items-center rounded-2xl border-2 border-dashed border-[#4c8dff] bg-white/40 backdrop-blur-sm">
+          <div className="flex flex-col items-center gap-2 text-[#4c8dff]">
+            <Upload className="h-10 w-10" />
+            <span className="text-base font-semibold">拖拽图片/视频/音频到这里上传</span>
+            <span className="text-xs text-[#7a8aa3]">上传后自动建对应类型节点</span>
+          </div>
+        </div>
+      )}
+
+      {/* 上传中提示 */}
+      {uploading && (
+        <div className="fixed bottom-24 left-1/2 z-50 -translate-x-1/2 rounded-md border border-blue-200 bg-blue-50 px-4 py-2 text-sm text-blue-700 shadow-lg">
+          正在上传并创建节点…
+        </div>
+      )}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_46%,rgba(255,255,255,0.16),transparent_38%)]" />
       {addMenu && (
         <button
@@ -469,6 +934,62 @@ export default function NewCanvasPage() {
       <aside className="absolute left-3 top-1/2 z-40 flex w-[55px] -translate-y-1/2 flex-col items-center overflow-hidden rounded-xl border border-[#e1e4e9] bg-white/95 py-1.5 shadow-[0_10px_26px_rgba(41,48,61,0.10)] backdrop-blur">
         <button
           type="button"
+          onClick={async () => {
+            // 「新建画布」按钮:每次点击都创建一个新画布(后端 createCanvas) + 清空当前节点
+            // 历史列表会自动刷新显示新画布
+            try {
+              const item = await canvasApi.createCanvas({ name: '未命名画布' });
+              setCanvasId(item.id);
+              if (typeof window !== 'undefined') {
+                localStorage.removeItem(`canvas_nodes_${item.id}`);
+                localStorage.removeItem(`canvas_edges_${item.id}`);
+                if (canvasId) {
+                  localStorage.removeItem(`canvas_nodes_${canvasId}`);
+                  localStorage.removeItem(`canvas_edges_${canvasId}`);
+                }
+                localStorage.removeItem('canvas_nodes');
+                localStorage.removeItem('canvas_edges');
+              }
+              setNodes([]);
+              setEdges([]);
+              setActiveNodeId(null);
+              setGenerateError('');
+              // 刷新历史侧栏(异步,失败不阻塞)
+              void fetchCanvasHistory();
+              console.info('[canvas] 新建画布成功: id=' + item.id);
+            } catch (err) {
+              console.warn('[canvas] createCanvas failed, fallback to clear:', err);
+              // 创建失败就只清空本地(降级, 不影响用户继续画)
+              if (typeof window !== 'undefined') {
+                localStorage.removeItem('canvas_nodes');
+                localStorage.removeItem('canvas_edges');
+              }
+              setNodes([]);
+              setEdges([]);
+              setActiveNodeId(null);
+              setGenerateError('');
+            }
+          }}
+          className="grid h-11 w-full place-items-center border-b border-[#eceef1] text-[#74839a] transition hover:bg-[#f4f7ff] hover:text-[#3978ff]"
+          title="新建画布（清空当前画布）"
+          aria-label="新建画布"
+        >
+          <Plus className="h-5 w-5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setShowHistoryPanel(true);
+            void fetchCanvasHistory();
+          }}
+          className="grid h-11 w-full place-items-center border-b border-[#eceef1] text-[#74839a] transition hover:bg-[#f4f7ff] hover:text-[#3978ff]"
+          title="我的创作"
+          aria-label="我的创作"
+        >
+          <History className="h-5 w-5" />
+        </button>
+        <button
+          type="button"
           onClick={openRootMenu}
           className="grid h-11 w-full place-items-center border-b border-[#eceef1] text-[#74839a] transition hover:bg-[#f4f7ff] hover:text-[#3978ff]"
           title="添加卡片"
@@ -517,11 +1038,14 @@ export default function NewCanvasPage() {
             key={node.id}
             node={node}
             active={node.id === activeNodeId}
-            hiddenHandleSide={linkDrag?.sourceId === node.id ? linkDrag.side : null}
+            hiddenHandleSide={linkDrag?.sourceId === node.id ? linkDrag?.side ?? null : null}
             onActivate={() => setActiveNodeId(node.id)}
             onTextChange={(value) => updateNodeContent(node.id, value)}
             onOpenMenu={openNodeMenu}
             onStartLinkDrag={startLinkDrag}
+            onOpenExpanded={(target) => {
+              if (target.resultUrl) setExpandedImage({ url: target.resultUrl, title: nodeTitle(target.type) });
+            }}
             onContextMenu={(event) => {
               event.preventDefault();
               setActiveNodeId(node.id);
@@ -532,10 +1056,14 @@ export default function NewCanvasPage() {
               if (target.closest('[data-no-node-drag="true"],a')) return;
               event.preventDefault();
               setActiveNodeId(node.id);
-              setDragging({
+              // 只记录起始位置,等 pointermove 跨过阈值(4px)才真正开始 drag
+              // 这样单击/双击不会被 drag 吃掉
+              setDragPending({
                 id: node.id,
-                offsetX: event.clientX - node.x,
-                offsetY: event.clientY - node.y,
+                startX: event.clientX,
+                startY: event.clientY,
+                nodeX: node.x,
+                nodeY: node.y,
               });
             }}
           />
@@ -565,7 +1093,106 @@ export default function NewCanvasPage() {
           </button>
         </div>
       )}
-      {addMenu && <AddCanvasMenu menu={addMenu} onAddNode={addNode} />}
+      {addMenu && <AddCanvasMenu menu={addMenu} onAddNode={addNode} onUploadClick={handleUploadClick} />}
+
+      {/* 展开图片 modal（双击图片节点触发） */}
+      {expandedImage && (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 p-8"
+          onClick={() => setExpandedImage(null)}
+        >
+          <div
+            className="relative max-h-[90vh] max-w-[90vw]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setExpandedImage(null)}
+              className="absolute -top-3 -right-3 grid h-9 w-9 place-items-center rounded-full bg-white text-[#4e5a6c] shadow-lg hover:bg-[#f4f7ff]"
+              title="关闭"
+              aria-label="关闭"
+            >
+              ✕
+            </button>
+            <img
+              src={expandedImage.url}
+              alt={expandedImage.title}
+              className="max-h-[90vh] max-w-[90vw] rounded-lg bg-white object-contain"
+            />
+            <div className="mt-3 text-center text-sm text-white/80">
+              {expandedImage.title}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 我的创作 · 侧边面板 */}
+      {showHistoryPanel && (
+        <div
+          className="fixed inset-0 z-[70] flex"
+          onClick={(event) => {
+            // 点击 backdrop 关闭
+            if (event.target === event.currentTarget) {
+              setShowHistoryPanel(false);
+            }
+          }}
+        >
+          <div className="absolute inset-0 bg-black/30" />
+          <div className="relative flex h-full w-[360px] flex-col border-r border-[#e1e4e9] bg-white shadow-2xl">
+            <div className="flex items-center justify-between border-b border-[#eceef1] px-4 py-3">
+              <div className="flex items-center gap-2">
+                <History className="h-4 w-4 text-[#3978ff]" />
+                <span className="text-sm font-semibold text-[#4e5a6c]">我的创作</span>
+                {canvasHistory.length > 0 && (
+                  <span className="rounded-full bg-[#eef3ff] px-2 py-0.5 text-[10px] font-medium text-[#3978ff]">
+                    {canvasHistory.length}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowHistoryPanel(false)}
+                className="grid h-7 w-7 place-items-center rounded text-[#9aa6b7] hover:bg-[#f4f7ff] hover:text-[#4e5a6c]"
+                title="关闭"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-2">
+              {historyLoading ? (
+                <div className="grid place-items-center py-12 text-xs text-[#a8b0bd]">
+                  加载中…
+                </div>
+              ) : canvasHistory.length === 0 ? (
+                <div className="grid place-items-center py-12 text-xs text-[#a8b0bd]">
+                  还没有创作，去画布上传一个素材开始吧
+                </div>
+              ) : (
+                canvasHistory.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => void openCanvasFromHistory(c.id)}
+                    className="block w-full rounded-lg px-3 py-3 text-left transition hover:bg-[#f4f7ff]"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="truncate text-sm font-medium text-[#344256]">
+                        {c.name || '未命名画布'}
+                      </span>
+                      <span className="text-[10px] text-[#a8b0bd]">
+                        {new Date(c.updatedAt).toLocaleDateString()}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[11px] text-[#a8b0bd]">
+                      {c.nodeCount ?? 0} 个节点
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {nodeMenu && (
         <NodeContextMenu
           menu={nodeMenu}
@@ -631,9 +1258,9 @@ function FlowLines({
         if (!from || !to) return null;
 
         const path = connectionPath(
-          to.x >= from.x ? from.x + NODE_WIDTH : from.x,
+          from.x + NODE_WIDTH,           // source: 输出永远在右边（固定）
           from.y + NODE_HEIGHT / 2,
-          to.x >= from.x ? to.x : to.x + NODE_WIDTH,
+          to.x,                          // target: 输入永远在左边（固定）
           to.y + NODE_HEIGHT / 2
         );
 
@@ -678,6 +1305,7 @@ function CanvasNodeCard({
   onTextChange,
   onOpenMenu,
   onStartLinkDrag,
+  onOpenExpanded,
   onContextMenu,
   onDragStart,
 }: {
@@ -688,6 +1316,7 @@ function CanvasNodeCard({
   onTextChange: (value: string) => void;
   onOpenMenu: (node: CanvasViewNode, side: 'left' | 'right') => void;
   onStartLinkDrag: (node: CanvasViewNode, side: 'left' | 'right', event: PointerEvent<HTMLButtonElement>) => void;
+  onOpenExpanded: (node: CanvasViewNode) => void;
   onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
 }) {
@@ -695,13 +1324,23 @@ function CanvasNodeCard({
 
   return (
     <div
+      data-canvas-node="true"
       className={cn('absolute z-30 cursor-grab select-none active:cursor-grabbing', active && 'z-40')}
       style={{ left: node.x, top: node.y, width: NODE_WIDTH }}
       onPointerDown={onDragStart}
       onContextMenu={onContextMenu}
-      onClick={onActivate}
+      onClick={(e) => {
+                  e.stopPropagation();
+                  onActivate();
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  onOpenExpanded(node);
+                }}
     >
-      {active && <NodeTopActions type={node.type} count={(node.content ?? '').trim().length} />}
+      {active && (
+        <NodeTopActions type={node.type} />
+      )}
       <div className="mb-2 flex items-center gap-1 text-xs text-[#778699]">
         {isText ? <FileText className="h-3.5 w-3.5" /> : <ImageIcon className="h-3.5 w-3.5" />}
         <span>{nodeTitle(node.type)}</span>
@@ -752,20 +1391,64 @@ function CanvasNodeCard({
           // 生成成功：按类型渲染 <video> 或 <img>
           // 注意:img/video 不能加 data-no-node-drag="true",否则点击图片区域无法拖动节点
           node.type === 'video' ? (
-            <video
-              src={node.resultUrl}
-              controls
-              className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-black object-contain active:cursor-grabbing"
-              onClick={onActivate}
-            />
+            <div className="relative">
+              <button
+                type="button"
+                data-no-node-drag="true"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(node.resultUrl!, '_blank', 'noopener,noreferrer');
+                }}
+                className="absolute right-1.5 top-1.5 z-10 grid h-9 w-9 place-items-center rounded-lg bg-black/70 text-white shadow-lg ring-1 ring-white/20 hover:bg-black/85 hover:scale-105 transition"
+                title="在新标签页打开原图"
+                aria-label="打开原图"
+              >
+                <Expand className="h-4 w-4" />
+              </button>
+              <video
+                src={node.resultUrl}
+                controls
+                className="h-[220px] min-h-[140px] min-w-[200px] w-[320px] resize overflow-auto cursor-grab rounded-lg border border-[#e0e4ea] bg-black object-contain active:cursor-grabbing"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onActivate();
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  onOpenExpanded(node);
+                }}
+              />
+            </div>
           ) : (
-            <img
-              src={node.resultUrl}
-              alt={nodeTitle(node.type)}
-              draggable={false}
-              className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-white/35 object-contain active:cursor-grabbing"
-              onClick={onActivate}
-            />
+                        <div className="relative">
+              <button
+                type="button"
+                data-no-node-drag="true"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.open(node.resultUrl!, '_blank', 'noopener,noreferrer');
+                }}
+                className="absolute right-1.5 top-1.5 z-10 grid h-9 w-9 place-items-center rounded-lg bg-black/70 text-white shadow-lg ring-1 ring-white/20 hover:bg-black/85 hover:scale-105 transition"
+                title="在新标签页打开原图"
+                aria-label="打开原图"
+              >
+                <Expand className="h-4 w-4" />
+              </button>
+              <img
+                src={node.resultUrl}
+                alt={nodeTitle(node.type)}
+                draggable={false}
+                className="h-[220px] min-h-[140px] min-w-[200px] w-[320px] resize overflow-auto cursor-grab rounded-lg border border-[#e0e4ea] bg-white/35 object-contain active:cursor-grabbing"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onActivate();
+                }}
+                onDoubleClick={(e) => {
+                  e.stopPropagation();
+                  onOpenExpanded(node);
+                }}
+              />
+            </div>
           )
         ) : (
           <button
@@ -785,37 +1468,10 @@ function CanvasNodeCard({
   );
 }
 
-function NodeTopActions({ type, count }: { type: CanvasNodeType; count: number }) {
-  if (type === 'image') {
-    return (
-      <div className="absolute -top-[78px] left-1/2 flex h-10 -translate-x-1/2 items-center gap-3 whitespace-nowrap rounded-md border border-[#e1e5ea] bg-white px-4 text-xs font-medium text-[#4e5a6c] shadow-[0_12px_34px_rgba(52,62,78,0.10)]">
-        <button type="button" data-no-node-drag="true" className="inline-flex items-center gap-1.5 hover:text-[#2f78ff]">
-          <Upload className="h-3.5 w-3.5" />
-          <span>上传</span>
-        </button>
-        <button type="button" data-no-node-drag="true" className="inline-flex items-center gap-1.5 hover:text-[#2f78ff]">
-          <FolderOpen className="h-3.5 w-3.5" />
-          <span>从资产库选择</span>
-        </button>
-      </div>
-    );
-  }
-
-  return (
-    <div className="absolute -top-[78px] left-1/2 flex h-10 -translate-x-1/2 items-center whitespace-nowrap rounded-md border border-[#e1e5ea] bg-white text-xs text-[#4e5a6c] shadow-[0_12px_34px_rgba(52,62,78,0.10)]">
-      <span className="px-4 font-medium">{count} 字</span>
-      <span className="h-5 w-px bg-[#e7e9ee]" />
-      <button type="button" data-no-node-drag="true" className="inline-flex h-full items-center gap-1.5 px-4 text-[#a2abb8] hover:text-[#2f78ff]">
-        <Sparkles className="h-3.5 w-3.5" />
-        <span>帮我写</span>
-      </button>
-      <span className="h-5 w-px bg-[#e7e9ee]" />
-      <button type="button" data-no-node-drag="true" className="inline-flex h-full items-center gap-1.5 px-4 font-medium hover:text-[#2f78ff]">
-        <Expand className="h-3.5 w-3.5" />
-        <span>展开</span>
-      </button>
-    </div>
-  );
+function NodeTopActions({ type }: { type: CanvasNodeType }) {
+  // 不再在节点顶部展示任何按钮（上传 / 从资产库选择 移除）
+  // 需要操作请点开节点或用全局工具栏
+  return null;
 }
 
 function PromptComposer({
@@ -856,6 +1512,7 @@ function PromptComposer({
 
   return (
     <div
+      data-toolbar="true"
       className={cn(
         'absolute z-20 rounded-lg border border-[#dfe4ea] bg-white p-3 shadow-[0_10px_28px_rgba(44,54,70,0.10)]',
         isText ? 'h-[220px]' : 'h-[218px]'
@@ -880,7 +1537,24 @@ function PromptComposer({
         )}
       />
       <div className="absolute right-4 top-4 flex flex-col gap-5 text-[#9aa6b7]">
-        <button type="button" className="hover:text-[#2f78ff]" title="展开">
+        <button type="button" className="hover:text-[#2f78ff]" title="帮我写">
+          <Sparkles className="h-4 w-4" />
+        </button>
+                <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (node.resultUrl) {
+              window.open(node.resultUrl, '_blank', 'noopener,noreferrer');
+            }
+          }}
+          disabled={!node.resultUrl}
+          className={cn(
+            'hover:text-[#2f78ff]',
+            !node.resultUrl && 'cursor-not-allowed text-[#cbd2dc] hover:text-[#cbd2dc]'
+          )}
+          title={node.resultUrl ? '在新标签页打开原图' : '当前节点没有图片可放大'}
+        >
           <Expand className="h-4 w-4" />
         </button>
         <button type="button" className="hover:text-[#2f78ff]" title="上传素材">
@@ -961,9 +1635,11 @@ function PromptComposer({
 function AddCanvasMenu({
   menu,
   onAddNode,
+  onUploadClick,
 }: {
   menu: AddMenuState;
   onAddNode: (type: CanvasNodeType) => void;
+  onUploadClick: () => void;
 }) {
   const { width, height } = viewport();
   const left = clamp(menu.x, 74, width - 210);
@@ -981,7 +1657,7 @@ function AddCanvasMenu({
       <CanvasMenuItem icon={Volume2} label="音频" onClick={() => onAddNode('audio')} />
       <div className="mx-2 my-2 h-px bg-[#edf0f4]" />
       <div className="px-3 pb-1 text-[10px] text-[#9aa5b4]">添加资源</div>
-      <CanvasMenuItem icon={Upload} label="从本地上传" />
+      <CanvasMenuItem icon={Upload} label="从本地上传" onClick={onUploadClick} />
       <CanvasMenuItem icon={FolderOpen} label="从资产库选择" />
     </div>
   );
