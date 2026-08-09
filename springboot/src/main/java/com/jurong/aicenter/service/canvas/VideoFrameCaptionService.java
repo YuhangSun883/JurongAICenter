@@ -139,40 +139,10 @@ public class VideoFrameCaptionService {
             boolean needCaption = "script".equals(mode) || "both".equals(mode);
             String content = "";
 
-            // ④ caption(只 script/both 才需要)
-                        // ④a 先做 ASR 提取口播原文(增强功能,失败不影响主流程)
-            Map<Integer, String> dubMap = new java.util.HashMap<>();
-            try {
-                Path tempVideoDir = frames.get(0).path().getParent();
-                Path audioFile = tempVideoDir.resolve("audio.wav");
-                Path extracted = videoFrameExtractor.extractAudio(node.getResultUrl(), audioFile);
-                if (extracted != null) {
-                    byte[] audioBytes = java.nio.file.Files.readAllBytes(extracted);
-                    List<Map<String, Object>> segments = newApiClient.audioTranscribe(audioBytes, "audio/wav");
-                    // 把 segments 按帧时间映射:每帧 [t-0.5, t+0.5] 区间内的口播拼接
-                    for (int i = 0; i < frames.size(); i++) {
-                        double t = frames.get(i).timestampSeconds();
-                        StringBuilder dubBuilder = new StringBuilder();
-                        for (Map<String, Object> seg : segments) {
-                            // 注意:命名加 seg 前缀,避免和外层方法的 start/end 变量冲突
-                            double segStart = (double) seg.get("start");
-                            double segEnd = (double) seg.get("end");
-                            double segMid = (segStart + segEnd) / 2.0;
-                            if (segMid >= t - 0.5 && segMid <= t + 0.5) {
-                                if (dubBuilder.length() > 0) dubBuilder.append(" ");
-                                dubBuilder.append((String) seg.get("text"));
-                            }
-                        }
-                        if (dubBuilder.length() > 0) {
-                            dubMap.put(i, dubBuilder.toString());
-                        }
-                    }
-                    log.info("[video-caption] ASR 完成: {} 个 segments,映射到 {}/{} 帧",
-                        segments.size(), dubMap.size(), frames.size());
-                }
-            } catch (Exception asrErr) {
-                log.warn("[video-caption] ASR 失败(非致命): {}", asrErr.getMessage());
-            }
+            // 2026-08-09 14:43 暂时去掉 ASR 口播提取
+            //   原因:ASR 依赖 NewAPI 音频转写,目前没可用通道
+            //   后续装本地 whisper 后再加回
+            Map<Integer, String> dubMap = java.util.Collections.emptyMap();
 
             if (needCaption) {
                 // 批量 caption:每 CAPTION_BATCH_SIZE 帧打一次 NewAPI(一次传多张图)
@@ -241,8 +211,25 @@ public class VideoFrameCaptionService {
                     captions.addAll(br);
                 }
 
+                // 2026-08-09 fix: VL 全部 batch 失败时,标 task FAILED 而不是 SUCCESS
+                // (之前 3 个 batch 全 503 但 task 还标 SUCCESS,导致空 text 节点,误导用户)
+                long failedCount = captions.stream()
+                    .filter(c -> "__FAILED__".equals(c.get("camera")))
+                    .count();
+                if (!captions.isEmpty() && failedCount == captions.size()) {
+                    failTask(task, node,
+                        "VL 视觉模型全部失败(" + failedCount + "/" + captions.size() + "),NewAPI 视觉模型不可达");
+                    log.error("[video-caption] taskId={} 全 {}/{} 帧 VL 失败,task 已标 FAILED",
+                        taskId, failedCount, captions.size());
+                    return;  // 跳出 handleExtractCaption,不再走 SUCCESS 路径
+                }
+                if (failedCount > 0) {
+                    log.warn("[video-caption] taskId={} 部分帧 VL 失败 {}/{},降级为 SUCCESS 包含 __FAILED__ 标记",
+                        taskId, failedCount, captions.size());
+                }
+
                 // 拼口播文案模板
-                content = assembleScript(frames, captions, dubMap);
+                content = assembleScript(frames, captions);
                 node.setContent(content);
                 task.setTextResult(content);
             } else {
@@ -483,7 +470,9 @@ public class VideoFrameCaptionService {
         textNode.setUserId(videoNode.getUserId());
         textNode.setCanvasId(videoNode.getCanvasId());
         textNode.setType("text");
-        textNode.setTitle("口播文案");
+        textNode.setTitle("脚本拆解");
+        // 2026-08-09 15:08 恢复:脚本拆解生成的 text 节点,前端完整展示
+        //   content = assembleScript 输出的完整脚本(含【节奏】【ShotXX】+各帧运镜/动作)
         textNode.setContent(scriptText == null || scriptText.isBlank() ? "(空)" : scriptText);
         textNode.setPositionX(baseX);
         textNode.setPositionY(baseY + yOffset);
@@ -600,7 +589,7 @@ public class VideoFrameCaptionService {
      *   【Shot02】运镜:推近 动作:xxx
      *   ...
      */
-    private String assembleScript(List<FrameMeta> frames, List<Map<String, String>> captions, Map<Integer, String> dubMap) {
+    private String assembleScript(List<FrameMeta> frames, List<Map<String, String>> captions) {
         StringBuilder sb = new StringBuilder();
         sb.append("【节奏】").append(frames.size()).append("s 视频节奏,每 1 秒一个镜头。\n");
         int successCount = 0;
@@ -618,11 +607,7 @@ public class VideoFrameCaptionService {
             } else {
                 sb.append("运镜:").append(camera).append(" 动作:").append(action);
             }
-            // 添加口播(ASR 提取的原文)
-            String dubText = dubMap == null ? null : dubMap.get(i);
-            if (dubText != null && !dubText.isBlank()) {
-                sb.append(" 口播:\"").append(dubText).append("\"");
-            }
+            // 2026-08-09 14:43 去掉 ASR 口播提取(暂时不需要)
             if (!"__FAILED__".equals(camera) && !"__SKIPPED__".equals(camera)) {
                 successCount++;
             }
