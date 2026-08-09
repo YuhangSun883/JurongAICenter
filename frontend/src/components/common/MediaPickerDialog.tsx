@@ -164,8 +164,12 @@ export function MediaPickerDialog({
 
   // ============ 派生 ============
   const showUploadedHere = activeTopTab === 'assets' && (source === '全部' || source === '我上传的');
+  // 已入库素材的 URL 集合，用于和本地上传素材去重
+  const assetUrls = new Set(assets.map((a) => a.url));
   const visiblePickedCount =
-    (showUploadedHere ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id)).length : 0) +
+    (showUploadedHere
+      ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id) && !assetUrls.has(u.url)).length
+      : 0) +
     (activeTopTab === 'assets'
       ? assets.filter((a) => pickedIds.has(String(a.id))).length
       : roles.filter((r) => pickedIds.has(String(r.id))).length);
@@ -186,7 +190,9 @@ export function MediaPickerDialog({
   }
 
   function handleConfirm() {
-    const uploadedPicked = uploadedFiles.filter((u) => pickedIds.has(u.id));
+    // 本地上传但尚未入库的素材（已入库的会在 assets 中处理）
+    const assetUrlSet = new Set(assets.map((a) => a.url));
+    const uploadedPicked = uploadedFiles.filter((u) => pickedIds.has(u.id) && !assetUrlSet.has(u.url));
     const assetPicked: PickedMedia[] = assets
       .filter((a) => pickedIds.has(String(a.id)))
       .map((a) => ({ id: String(a.id), type: a.type as 'image' | 'video' | 'audio', url: a.url, name: a.name }));
@@ -194,14 +200,7 @@ export function MediaPickerDialog({
       .filter((r) => pickedIds.has(String(r.id)))
       .map((r) => ({ id: String(r.id), type: 'image' as const, url: r.imageUrl, name: r.name }));
     const all = [...uploadedPicked, ...assetPicked, ...rolePicked];
-    const seen = new Set<string>();
-    const deduped = all.filter((m) => {
-      const k = `${m.name}_${m.url.length || 0}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-    onConfirm?.(deduped);
+    onConfirm?.(all);
     onClose();
   }
 
@@ -497,39 +496,43 @@ function AssetsView({
               iconClassName="h-8 w-8"
             />
 
-            {/* 用户已上传的(本地 blob URL,不来自服务器) */}
-            {showUploaded && uploadedFiles.filter((u) => u.type === tabToType[tab]).map((a) => {
-              const selected = pickedIds.has(a.id);
-              return (
-                <div
-                  key={`local-${a.id}`}
-                  className={cn(
-                    'group relative aspect-square cursor-pointer overflow-hidden rounded-xl border bg-bg-card text-left transition',
-                    selected ? 'border-brand ring-2 ring-brand/30' : 'border-bg-line hover:border-brand/50'
-                  )}
-                  onClick={() => onToggle(a.id)}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
-                  {selected && (
-                    <span className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-brand text-white shadow-glow">
-                      <Check className="h-3 w-3" />
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    onClick={(e) => { e.stopPropagation(); onAskRemove(a.id); }}
-                    className="absolute left-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-black/60 text-white opacity-0 transition hover:bg-rose-600 group-hover:opacity-100"
-                    aria-label="删除素材"
+            {/* 用户已上传但尚未入库的素材（本地 blob URL） */}
+            {/* 已通过服务器上传的素材会同时出现在 assets 中，这里需要去重 */}
+            {showUploaded && uploadedFiles
+              .filter((u) => u.type === tabToType[tab])
+              .filter((u) => !assets.some((a) => a.url === u.url))
+              .map((a) => {
+                const selected = pickedIds.has(a.id);
+                return (
+                  <div
+                    key={`local-${a.id}`}
+                    className={cn(
+                      'group relative aspect-square cursor-pointer overflow-hidden rounded-xl border bg-bg-card text-left transition',
+                      selected ? 'border-brand ring-2 ring-brand/30' : 'border-bg-line hover:border-brand/50'
+                    )}
+                    onClick={() => onToggle(a.id)}
                   >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                  <div className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-2 py-1 text-[10px] text-white">
-                    {a.name}
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
+                    {selected && (
+                      <span className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-brand text-white shadow-glow">
+                        <Check className="h-3 w-3" />
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onAskRemove(a.id); }}
+                      className="absolute left-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-black/60 text-white opacity-0 transition hover:bg-rose-600 group-hover:opacity-100"
+                      aria-label="删除素材"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                    <div className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-2 py-1 text-[10px] text-white">
+                      {a.name}
+                    </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
 
             {/* 服务端素材 */}
             {assets.map((a) => {
@@ -558,7 +561,7 @@ function AssetsView({
             })}
 
             {/* 空状态 */}
-            {assets.length === 0 && uploadedFiles.filter((u) => u.type === tabToType[tab]).length === 0 && (
+            {assets.length === 0 && uploadedFiles.filter((u) => u.type === tabToType[tab] && !assetUrls.has(u.url)).length === 0 && (
               <div className="col-span-full grid place-items-center py-10 text-center text-xs text-fg-subtle">
                 没有匹配的素材
               </div>

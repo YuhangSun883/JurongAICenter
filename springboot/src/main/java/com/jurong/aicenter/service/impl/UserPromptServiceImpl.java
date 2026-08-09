@@ -25,7 +25,7 @@ public class UserPromptServiceImpl implements UserPromptService {
 
     @Override
     @Transactional
-    public UserPromptResponse savePrompt(String email, String prompt) {
+    public UserPromptResponse savePrompt(String email, String title, String prompt) {
         // 查找是否已存在相同的提示词
         LambdaQueryWrapper<UserPrompt> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(UserPrompt::getEmail, email)
@@ -45,6 +45,7 @@ public class UserPromptServiceImpl implements UserPromptService {
         // 新增
         UserPrompt newPrompt = new UserPrompt();
         newPrompt.setEmail(email);
+        newPrompt.setTitle(normalizeTitle(title, prompt));
         newPrompt.setPrompt(prompt);
         newPrompt.setUseCount(1);
         newPrompt.setCreatedAt(LocalDateTime.now());
@@ -52,6 +53,24 @@ public class UserPromptServiceImpl implements UserPromptService {
         userPromptRepository.insert(newPrompt);
         log.info("保存新提示词: email={}, promptId={}", email, newPrompt.getId());
         return toResponse(newPrompt);
+    }
+
+    @Override
+    @Transactional
+    public UserPromptResponse updatePrompt(Long id, String email, String title, String prompt) {
+        UserPrompt existing = userPromptRepository.selectById(id);
+        if (existing == null) {
+            throw new BusinessException(ErrorCode.NOT_FOUND, "提示词不存在");
+        }
+        if (!existing.getEmail().equals(email)) {
+            throw new BusinessException(ErrorCode.FORBIDDEN, "无权限访问");
+        }
+        existing.setTitle(normalizeTitle(title, prompt));
+        existing.setPrompt(prompt);
+        existing.setUpdatedAt(LocalDateTime.now());
+        userPromptRepository.updateById(existing);
+        log.info("编辑提示词: id={}, email={}", id, email);
+        return toResponse(existing);
     }
 
     @Override
@@ -87,9 +106,22 @@ public class UserPromptServiceImpl implements UserPromptService {
         log.info("删除提示词: id={}, email={}", id, email);
     }
 
+    /**
+     * 规范化标题：为空时截取 prompt 前 50 字符作为标题
+     */
+    private String normalizeTitle(String title, String prompt) {
+        if (title != null && !title.trim().isEmpty()) {
+            return title.trim();
+        }
+        if (prompt == null) return "";
+        String trimmed = prompt.trim();
+        return trimmed.length() > 50 ? trimmed.substring(0, 50) + "…" : trimmed;
+    }
+
     private UserPromptResponse toResponse(UserPrompt prompt) {
         return new UserPromptResponse(
             prompt.getId(),
+            prompt.getTitle(),
             prompt.getPrompt(),
             prompt.getUseCount(),
             prompt.getCreatedAt()

@@ -14,6 +14,9 @@ public class UserPrompt {
     @TableId(type = IdType.AUTO)
     private Long id;
 
+    /** 提示词标题 */
+    private String title;
+
     /** 用户邮箱（关联 users 表 email 字段） */
     private String email;
 

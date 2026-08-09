@@ -47,22 +47,23 @@ public interface MediaService {
                            String mimeType, Long sizeBytes, String objectKey,
                            String sourceTool, String sourceTaskId);
 
+    /**
+     * 收藏图片 → 存入"我的资产"库（media_assets + MinIO）。
+     * 不单独用 favorites/ 目录，直接按 media/{userId}/{yyyy-MM}/{uuid}.{ext} 存。
+     *
+     * @param userId      用户 ID
+     * @param imageBytes  图片字节
+     * @param mimeType    MIME 类型（image/png、image/jpeg 等）
+     * @param displayName 用户可见的文件名（可为 null，默认自动生成）
+     * @return 资产响应（含 assetId、URL、名称、类型、大小）
+     */
+    MediaAssetResponse saveFavoriteAsAsset(Long userId, byte[] imageBytes, String mimeType, String displayName);
+
+    /**
+     * 通过 userId + sourceTaskId + filename（name 字段）反查 AI 产物的 objectKey。
+     * 找不到则返回 null。
+     */
+    String lookupAiMediaObjectKey(Long userId, String sourceTaskId, String filename);
+
     void deleteAssetsByLibrary(Long userId, Long libraryId);
-
-    // ==================== 角色库（同事保留，给画布/Agent 用） ====================
-
-    /**
-     * 拉所有角色分类（用于前端下拉）
-     */
-    List<Map<String, String>> listCategories();
-
-    /**
-     * 按分类拉角色列表
-     */
-    List<MediaRoleDto> listRolesByCategory(String category);
-
-    /**
-     * 拉全部角色（不分页，量小）
-     */
-    List<MediaRoleDto> listAllRoles();
 }

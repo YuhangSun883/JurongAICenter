@@ -685,4 +685,91 @@ public class NewApiClient {
         if (dataUri.startsWith("data:image/webp")) return "image/webp";
         return "image/png"; // 默认 png
     }
+
+    /**
+     * 图生视频（asset_url 引用版）：调 NewAPI /v1/videos，用 JSON body + image_urls。
+     *
+     * <p>与 {@link #submitVideo} 区别：不传 multipart file，直接用已上传资产的 asset_url 引用。
+     * 用于 "上传资产 → 轮询 active → 引用 asset_url 提交视频" 流程。
+     *
+     * @param prompt     用户提示词
+     * @param assetUrl   已 active 的资产 URL
+     * @param model      模型名（null 用默认 doubao-seedance-2.0）
+     * @param duration   视频时长（秒）
+     * @param resolution 分辨率，如 480P
+     * @return NewAPI 返回的 task_id
+     */
+    public String submitVideoWithAsset(String prompt, String assetUrl, String model,
+                                       int duration, String resolution) {
+        try {
+            String useModel = model != null ? model : "doubao-seedance-2.0";
+            Map<String, Object> body = new HashMap<>();
+            body.put("model", useModel);
+            body.put("prompt", prompt);
+            body.put("duration", String.valueOf(duration));
+            body.put("resolution", resolution);
+            body.put("image_urls", List.of(assetUrl));
+
+            JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(Duration.ofSeconds(600))
+                .onErrorMap(WebClientResponseException.class, e -> {
+                    String respBody = e.getResponseBodyAsString();
+                    log.error("NewAPI /v1/videos (asset) failed: {} body={}", e.getStatusCode(), respBody);
+                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "视频任务提交失败(asset): " + e.getStatusCode() + " | " + respBody);
+                })
+                .block();
+
+            if (response == null) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 视频提交(asset)返回空");
+            }
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
+            if (taskId.isEmpty()) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI 响应里没找到 task_id: " + response);
+            }
+            log.info("NewAPI video task submitted (asset): {} (assetUrl={}, duration={}s, resolution={})",
+                taskId, assetUrl, duration, resolution);
+            return taskId;
+        } catch (Exception e) {
+            if (e instanceof BusinessException) throw e;
+            log.error("NewAPI submitVideoWithAsset failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    /**
+     * 语音转写（ASR）：将音频字节转为带时间戳的文本段。
+     *
+     * <p>注意：当前为占位实现，NewAPI 的 ASR 端点尚未对接。
+     * 调用方（VideoFrameCaptionService）有 try-catch 包裹，会降级为无口播字幕。
+     *
+     * @param audioBytes 音频字节（WAV）
+     * @param mimeType   MIME 类型，如 audio/wav
+     * @return 转写段列表，每段含 start/end/text 字段
+     */
+    public List<Map<String, Object>> audioTranscribe(byte[] audioBytes, String mimeType) {
+        throw new UnsupportedOperationException("audioTranscribe 尚未实现：NewAPI ASR 端点未对接");
+    }
+
+    /**
+     * 视觉描述批处理：对一批图片 URL 生成镜头描述（camera + action）。
+     *
+     * <p>注意：当前为占位实现，NewAPI 的视觉描述端点尚未对接。
+     * 调用方（VideoFrameCaptionService）有 try-catch 包裹，会降级为失败字幕。
+     *
+     * @param imageUrls 图片 URL 列表
+     * @param prompt    描述提示词
+     * @return 每张图的描述 Map（camera/action）
+     */
+    public List<Map<String, String>> visionCaptionBatch(List<String> imageUrls, String prompt) {
+        throw new UnsupportedOperationException("visionCaptionBatch 尚未实现：NewAPI 视觉描述端点未对接");
+    }
 }

@@ -62,14 +62,7 @@
   @apply rounded-md bg-brand/15 px-1.5 py-0.5 text-brand-700;
 }
 
-/* contenteditable placeholder: 通过 is-empty 类控制显示 */
-[contenteditable].is-empty::before {
-  content: attr(data-placeholder);
-  float: left;
-  color: #b8bdc7;
-  pointer-events: none;
-  height: 0;
-}
+/* contenteditable placeholder: 已由 ImageWorkbench 中的条件渲染替代（避免与真实文本重叠） */
 
 /* 弹窗可缩放：右下角显示 ↘ 拖拽手柄 */
 .resizable-dialog {

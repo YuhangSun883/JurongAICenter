@@ -5,12 +5,20 @@ const API = '/api/prompts';
 
 /** 保存提示词请求 */
 export interface SavePromptParams {
+  title?: string;
+  prompt: string;
+}
+
+/** 编辑提示词请求 */
+export interface UpdatePromptParams {
+  title?: string;
   prompt: string;
 }
 
 /** 提示词响应 */
 export interface UserPromptResult {
   id: number;
+  title: string;
   prompt: string;
   useCount: number;
   createdAt: string;
@@ -22,6 +30,16 @@ export interface UserPromptResult {
 export async function savePrompt(params: SavePromptParams): Promise<UserPromptResult> {
   return request<UserPromptResult>(API, {
     method: 'POST',
+    body: params,
+  });
+}
+
+/**
+ * 编辑提示词
+ */
+export async function updatePrompt(id: number, params: UpdatePromptParams): Promise<UserPromptResult> {
+  return request<UserPromptResult>(`${API}/${id}`, {
+    method: 'PUT',
     body: params,
   });
 }

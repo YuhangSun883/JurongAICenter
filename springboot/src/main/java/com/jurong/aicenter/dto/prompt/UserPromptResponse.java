@@ -16,6 +16,8 @@ public class UserPromptResponse {
 
     private Long id;
 
+    private String title;
+
     private String prompt;
 
     private Integer useCount;

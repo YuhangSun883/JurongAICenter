@@ -1,6 +1,7 @@
 package com.jurong.aicenter.controller;
 
 import com.jurong.aicenter.dto.prompt.SavePromptRequest;
+import com.jurong.aicenter.dto.prompt.UpdatePromptRequest;
 import com.jurong.aicenter.dto.prompt.UserPromptResponse;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
@@ -39,7 +40,23 @@ public class UserPromptController {
         }
         String email = principal.email();
         log.info("保存提示词: email={}, promptLen={}", email, request.getPrompt().length());
-        return userPromptService.savePrompt(email, request.getPrompt());
+        return userPromptService.savePrompt(email, request.getTitle(), request.getPrompt());
+    }
+
+    /**
+     * 编辑提示词
+     */
+    @PutMapping("/{id}")
+    public UserPromptResponse updatePrompt(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @PathVariable Long id,
+            @Valid @RequestBody UpdatePromptRequest request) {
+        if (principal == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "请先登录");
+        }
+        String email = principal.email();
+        log.info("编辑提示词: email={}, id={}", email, id);
+        return userPromptService.updatePrompt(id, email, request.getTitle(), request.getPrompt());
     }
 
     /**

@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Coins,
   Download,
+  Edit2,
   FolderOpen,
   Image as ImageIcon,
   Layers3,
@@ -29,7 +30,7 @@ import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { cn } from '@/lib/utils';
-import { imageApi, promptApi } from '@/api';
+import { imageApi, mediaApi, promptApi } from '@/api';
 import type { UserPromptResult } from '@/api/prompt';
 
 /** 图片生成超时时间：5 分钟（300 秒） */
@@ -49,12 +50,19 @@ const RESOLUTIONS: ImageResolution[] = ['1K', '2K', '4K'];
 const FORMATS: ImageFormat[] = ['JPEG', 'PNG'];
 
 /** 技能分类：决定生成图片的主要方向 */
+interface ReferenceSlot {
+  label: string;
+  optional?: boolean;
+}
 interface SkillItem {
   id: string;
   name: string;
   description: string;
   tag: string; // 注入到提示词中的标签
   category?: string; // 所属分类名称（搜索菜单中使用）
+  referenceSlots?: ReferenceSlot[]; // 技能专属的参考图片槽位
+  maxReferences?: number; // 最大参考图片数
+  hintText?: string; // 上传图片的提示文字
 }
 interface SkillCategory {
   id: string;
@@ -67,30 +75,59 @@ const SKILL_CATEGORIES: SkillCategory[] = [
     id: 'character',
     name: '人物',
     skills: [
-      { id: 'face-3view', name: '脸部三视图', description: '生成正视、侧脸、半侧脸参考', tag: '[脸部三视图]' },
-      { id: 'character-4view', name: '人物四视图', description: '生成全身三视图与脸部特写', tag: '[人物四视图]' },
-      { id: 'model-face-swap', name: '模特换脸', description: '模特脸部替换为其他人物', tag: '[模特换脸]' },
-      { id: 'face-fusion', name: '人脸融合', description: '融合两张人脸生成全新虚拟头像资产', tag: '[人脸融合]' },
+      { id: 'face-3view', name: '脸部三视图', description: '生成正视、侧脸、半侧脸参考', tag: '[脸部三视图]',
+        referenceSlots: [{ label: '添加人脸参考图' }], maxReferences: 3,
+        hintText: '上传一张清晰的人脸照片，AI 将生成三视图参考。' },
+      { id: 'character-4view', name: '人物四视图', description: '生成全身三视图与脸部特写', tag: '[人物四视图]',
+        referenceSlots: [{ label: '添加人物照片' }], maxReferences: 4,
+        hintText: '上传人物全身照片，AI 将生成四视图与脸部特写。' },
+      { id: 'model-face-swap', name: '模特换脸', description: '模特脸部替换为其他人物', tag: '[模特换脸]',
+        referenceSlots: [{ label: '添加模特', optional: true }, { label: '添加目标人脸' }], maxReferences: 2,
+        hintText: '上传模特图和目标人脸图，实现换脸效果。' },
+      { id: 'face-fusion', name: '人脸融合', description: '融合两张人脸生成全新虚拟头像资产', tag: '[人脸融合]',
+        referenceSlots: [{ label: '添加人脸A' }, { label: '添加人脸B' }], maxReferences: 2,
+        hintText: '上传两张人脸照片，AI 将融合生成全新虚拟头像。' },
     ],
   },
   {
     id: 'product',
     name: '商品',
     skills: [
-      { id: 'one-click-outfit', name: '一键换衣', description: '替换模特身上的服装衣物', tag: '[一键换衣]' },
-      { id: 'product-display', name: '商品展示', description: '商品多角度展示图生成', tag: '[商品展示]' },
-      { id: 'model-pose', name: '模特姿势', description: '生成多种模特姿势姿态', tag: '[模特姿势]' },
-      { id: 'background-replace', name: '背景替换', description: '替换商品图中的背景', tag: '[背景替换]' },
+      { id: 'one-click-outfit', name: '一键换衣', description: '替换模特身上的服装衣物', tag: '[一键换衣]',
+        referenceSlots: [
+          { label: '添加模特' },
+          { label: '添加上衣', optional: true },
+          { label: '添加裤子', optional: true },
+          { label: '添加包', optional: true },
+        ], maxReferences: 6,
+        hintText: '上传模特图，服装图，一键模特换衣' },
+      { id: 'product-display', name: '商品展示', description: '商品多角度展示图生成', tag: '[商品展示]',
+        referenceSlots: [{ label: '添加商品图' }], maxReferences: 9,
+        hintText: '上传商品图片，AI 将生成多角度展示效果图。' },
+      { id: 'model-pose', name: '模特姿势', description: '生成多种模特姿势姿态', tag: '[模特姿势]',
+        referenceSlots: [{ label: '添加模特照片' }], maxReferences: 9,
+        hintText: '上传模特照片，AI 将生成多种姿势姿态。' },
+      { id: 'background-replace', name: '背景替换', description: '替换商品图中的背景', tag: '[背景替换]',
+        referenceSlots: [{ label: '添加商品图' }, { label: '添加背景参考', optional: true }], maxReferences: 9,
+        hintText: '上传商品图和目标背景，AI 将智能替换背景。' },
     ],
   },
   {
     id: 'enhance',
     name: '增强',
     skills: [
-      { id: 'hd-enhance', name: '高清增强', description: '提升图片清晰度与细节', tag: '[高清增强]' },
-      { id: 'style-transfer', name: '风格迁移', description: '艺术风格迁移与渲染', tag: '[风格迁移]' },
-      { id: 'lighting', name: '光影增强', description: '增强图片光影效果', tag: '[光影增强]' },
-      { id: 'color-grade', name: '调色风格', description: '电影级调色风格处理', tag: '[调色风格]' },
+      { id: 'hd-enhance', name: '高清增强', description: '提升图片清晰度与细节', tag: '[高清增强]',
+        referenceSlots: [{ label: '添加待增强图片' }], maxReferences: 9,
+        hintText: '上传需要高清增强的图片，AI 将提升细节与清晰度。' },
+      { id: 'style-transfer', name: '风格迁移', description: '艺术风格迁移与渲染', tag: '[风格迁移]',
+        referenceSlots: [{ label: '添加原图' }, { label: '添加风格参考' }], maxReferences: 9,
+        hintText: '上传原图和风格参考图，AI 将进行艺术风格迁移。' },
+      { id: 'lighting', name: '光影增强', description: '增强图片光影效果', tag: '[光影增强]',
+        referenceSlots: [{ label: '添加待处理图片' }], maxReferences: 9,
+        hintText: '上传图片，AI 将增强光影效果，打造电影级视觉。' },
+      { id: 'color-grade', name: '调色风格', description: '电影级调色风格处理', tag: '[调色风格]',
+        referenceSlots: [{ label: '添加待调色图片' }], maxReferences: 9,
+        hintText: '上传图片，AI 将进行电影级调色风格处理。' },
     ],
   },
 ];
@@ -192,10 +229,15 @@ export function ImageWorkbench() {
 
   // 提示词相关状态
   const [showSavePromptDialog, setShowSavePromptDialog] = useState(false); // 保存提示词弹窗
+  const [showEditPromptDialog, setShowEditPromptDialog] = useState(false); // 编辑提示词弹窗
+  const [editingPromptId, setEditingPromptId] = useState<number | null>(null); // 正在编辑的提示词 ID
+  const [editingTitle, setEditingTitle] = useState(''); // 编辑中的标题
+  const [editingContent, setEditingContent] = useState(''); // 编辑中的内容
   const [showMyPromptsDialog, setShowMyPromptsDialog] = useState(false); // 我的提示词弹窗
   const [myPrompts, setMyPrompts] = useState<UserPromptResult[]>([]); // 我的提示词列表
   const [loadingPrompts, setLoadingPrompts] = useState(false); // 加载提示词中
-  const [savingPrompt, setSavingPrompt] = useState(false); // 保存提示词中
+  const [savingPrompt, setSavingPrompt] = useState(false); // 保存/更新提示词中
+  const [saveTitleInput, setSaveTitleInput] = useState(''); // 保存弹窗中的标题输入
 
   // 技能选择相关状态
   const [selectedSkill, setSelectedSkill] = useState<SkillItem | null>(null); // 当前选中的技能
@@ -286,15 +328,128 @@ export function ImageWorkbench() {
     setShowNewConfirm(false);
   }, []);
 
-  // 选择技能：注入到提示词开头，并决定生成方向
+  // 选择技能：在编辑器中插入芯片，并决定生成方向
+  // 使用 DOM Range 操作替换正在输入的 "/xxx" 文本，确保中文输入法、HTML 实体、
+  // 多个文本节点等场景下都能可靠地把 "/" 和技能名替换为芯片
   const selectSkill = useCallback((skill: SkillItem) => {
     setSelectedSkill(skill);
-    // 将技能标签注入到提示词中
-    setPrompt((prev) => {
-      // 先移除已有的技能标签（[xxx]格式）
-      const cleaned = prev.replace(/^\[.*?\]\s*/, '').replace(/\/\w*\s*/, '');
-      return `${skill.tag} ${cleaned}`.trim();
+    // 切换技能时清空已上传的参考图片
+    setReferences([]);
+    setReferencedImages([]);
+
+    const editor = editorRef.current;
+    if (!editor) {
+      setPrompt((prev) => {
+        const cleaned = prev.replace(/^\[.*?\]\s*/, '').replace(/\/\w*\s*/, '');
+        return `${skill.tag} ${cleaned}`.trim();
+      });
+      return;
+    }
+
+    // 先移除已有的技能芯片
+    editor.querySelectorAll('[data-skill-chip]').forEach((el) => el.remove());
+
+    // 读取一次文本节点快照，避免后续 DOM 操作影响查找
+    const textNodes: Text[] = [];
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let node: Node | null = walker.nextNode();
+    while (node) {
+      const t = node as Text;
+      if (t.data.length > 0) textNodes.push(t);
+      node = walker.nextNode();
+    }
+
+    // 构建芯片 DOM（不再使用 innerHTML 拼接，避免实体编码问题）
+    const chip = document.createElement('span');
+    chip.contentEditable = 'false';
+    chip.setAttribute('data-skill-chip', skill.id);
+    chip.setAttribute('data-skill-name', skill.name);
+    chip.setAttribute('data-skill-tag', skill.tag);
+    chip.className =
+      'inline-flex items-center gap-1 rounded-md border border-[#c7d4ff] bg-[#eef3ff] px-2 py-0.5 align-middle mx-0.5 text-xs leading-5 font-semibold text-[#3677ff] shadow-sm';
+    const icon = document.createElement('span');
+    icon.className = 'text-[#3677ff]';
+    icon.textContent = '✦';
+    const label = document.createElement('span');
+    label.textContent = skill.name;
+    chip.appendChild(icon);
+    chip.appendChild(label);
+    const trailingSpace = document.createTextNode('\u00A0');
+
+    // 找到最后一个未被芯片包裹的 "/" 所在的文本节点
+    let slashNode: Text | null = null;
+    let slashOffset = -1;
+    for (let i = textNodes.length - 1; i >= 0; i--) {
+      const t = textNodes[i];
+      const idx = t.data.lastIndexOf('/');
+      if (idx !== -1) {
+        slashNode = t;
+        slashOffset = idx;
+        break;
+      }
+    }
+
+    if (slashNode) {
+      // 计算需要被替换的 "查询文本"（包含 "/" 和后面直到空格/标签/末尾的字符）
+      const beforeText = slashNode.data.substring(0, slashOffset);
+      const after = slashNode.data.substring(slashOffset + 1);
+      const queryMatch = after.match(/^[^\s<]*/);
+      const queryLen = queryMatch ? queryMatch[0].length : 0;
+      const afterQuery = after.substring(queryLen);
+
+      // 用 Range 精确替换：从 "/" 开始到查询文本结束
+      const replaceRange = document.createRange();
+      replaceRange.setStart(slashNode, slashOffset);
+      replaceRange.setEnd(slashNode, slashOffset + 1 + queryLen);
+      replaceRange.deleteContents();
+
+      // 在替换位置依次插入：芯片 + 尾随空格 + 原始查询之后的文本
+      const insertFrag = document.createDocumentFragment();
+      insertFrag.appendChild(chip);
+      insertFrag.appendChild(trailingSpace);
+      if (afterQuery) {
+        insertFrag.appendChild(document.createTextNode(afterQuery));
+      }
+      replaceRange.insertNode(insertFrag);
+
+      // 如果 "/" 之前没有其他文本且 slashNode 已空，移除该空文本节点
+      if (!beforeText && slashNode.parentNode) {
+        slashNode.parentNode.removeChild(slashNode);
+      }
+    } else {
+      // 找不到 "/"，在编辑器开头插入芯片
+      const frag = document.createDocumentFragment();
+      frag.appendChild(chip);
+      frag.appendChild(trailingSpace);
+      if (editor.firstChild) {
+        editor.insertBefore(frag, editor.firstChild);
+      } else {
+        editor.appendChild(frag);
+      }
+    }
+
+    // 更新 prompt（移除旧技能标签与可能残留的 "/xxx"）
+    const text = editor.innerText || '';
+    const cleaned = text
+      .replace(/\/[^\s<]*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    setPrompt(`${skill.tag} ${cleaned}`.trim());
+
+    // 重新聚焦编辑器并将光标移到末尾
+    requestAnimationFrame(() => {
+      editor.focus();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+      // 触发一次 input 事件以同步 referencedImages 等派生状态
+      const inputEvent = new Event('input', { bubbles: true });
+      editor.dispatchEvent(inputEvent);
     });
+
     setShowSkillPanel(false);
     setShowSlashMenu(false);
     setSlashQuery('');
@@ -417,8 +572,9 @@ export function ImageWorkbench() {
     if (!trimmedPrompt) return;
     setSavingPrompt(true);
     try {
-      await promptApi.savePrompt({ prompt: trimmedPrompt });
+      await promptApi.savePrompt({ title: saveTitleInput.trim() || undefined, prompt: trimmedPrompt });
       setShowSavePromptDialog(false);
+      setSaveTitleInput('');
       // 刷新我的提示词列表
       loadMyPrompts();
     } catch (err) {
@@ -426,7 +582,38 @@ export function ImageWorkbench() {
     } finally {
       setSavingPrompt(false);
     }
-  }, [prompt, loadMyPrompts]);
+  }, [prompt, saveTitleInput, loadMyPrompts]);
+
+  /** 打开编辑提示词弹窗 */
+  const handleOpenEditPrompt = useCallback((item: UserPromptResult) => {
+    setEditingPromptId(item.id);
+    setEditingTitle(item.title || '');
+    setEditingContent(item.prompt);
+    setShowEditPromptDialog(true);
+  }, []);
+
+  /** 保存编辑后的提示词 */
+  const handleUpdatePrompt = useCallback(async () => {
+    if (editingPromptId == null) return;
+    const trimmedContent = editingContent.trim();
+    if (!trimmedContent) return;
+    setSavingPrompt(true);
+    try {
+      await promptApi.updatePrompt(editingPromptId, {
+        title: editingTitle.trim() || undefined,
+        prompt: trimmedContent,
+      });
+      setShowEditPromptDialog(false);
+      setEditingPromptId(null);
+      setEditingTitle('');
+      setEditingContent('');
+      loadMyPrompts();
+    } catch (err) {
+      console.error('编辑提示词失败:', err);
+    } finally {
+      setSavingPrompt(false);
+    }
+  }, [editingPromptId, editingTitle, editingContent, loadMyPrompts]);
 
   /** 使用提示词（点击"我的提示词"中的某条提示词时触发） */
   const handleUsePrompt = useCallback(async (item: UserPromptResult) => {
@@ -438,11 +625,12 @@ export function ImageWorkbench() {
     // 使用次数+1
     try {
       await promptApi.usePrompt(item.id);
-      // 刷新列表
       loadMyPrompts();
     } catch (err) {
       console.error('更新提示词使用次数失败:', err);
     }
+    // 关闭"我的提示词"弹窗，用户继续编辑
+    setShowMyPromptsDialog(false);
   }, [loadMyPrompts]);
 
   /** 删除提示词 */
@@ -519,7 +707,9 @@ export function ImageWorkbench() {
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   }, []);
 
-  const remainingRefs = Math.max(0, MAX_REFS - references.length);
+  // 根据当前选中的技能获取最大参考图片数
+  const currentMaxRefs = selectedSkill?.maxReferences ?? MAX_REFS;
+  const remainingRefs = Math.max(0, currentMaxRefs - references.length);
   const queued = tasks.filter((task) => task.status === 'queued').length;
   const running = tasks.filter((task) => task.status === 'running').length;
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
@@ -564,19 +754,35 @@ export function ImageWorkbench() {
   // 只要有提示词文本或引用图片即可提交
   const canSubmit = (prompt.trim().length > 0 || referencedImages.length > 0) && !submitting && !generating;
 
-  function handleUploadFiles(files: FileList | null): PickedMedia[] {
-    if (!files) return [];
-    const existingFingerprints = new Set(materials.map((material) => `${material.name}_${material.size ?? material.url.length}`));
+  async function handleUploadFiles(files: FileList | null): Promise<PickedMedia[]> {
+    if (!files || files.length === 0) return [];
     const fresh: GlobalMaterial[] = [];
 
-    Array.from(files).forEach((file) => {
+    for (const file of Array.from(files)) {
       const fingerprint = `${file.name}_${file.size}`;
-      if (existingFingerprints.has(fingerprint)) return;
-      existingFingerprints.add(fingerprint);
-      fresh.push(mediaToPicked(file));
-    });
+      // 已存在则跳过
+      if (materials.some((m) => `${m.name}_${m.size ?? m.url.length}` === fingerprint)) continue;
 
-    addMaterials(fresh);
+      try {
+        // 调用后端 API 上传到 MinIO + 写入 media_assets 表
+        const result = await mediaApi.uploadAsset(file);
+        fresh.push({
+          id: nanoid(10),
+          type: file.type.startsWith('video') ? 'video' : file.type.startsWith('audio') ? 'audio' : 'image',
+          url: result.url, // 使用 MinIO 返回的 URL
+          name: file.name,
+          size: file.size,
+        });
+      } catch (err) {
+        console.error('[ImageWorkbench] upload failed:', file.name, err);
+        // 失败时回退到本地 blob URL，保证可用性
+        fresh.push(mediaToPicked(file));
+      }
+    }
+
+    if (fresh.length > 0) {
+      addMaterials(fresh);
+    }
     return fresh;
   }
 
@@ -591,7 +797,7 @@ export function ImageWorkbench() {
         existingFingerprints.add(fingerprint);
         return true;
       });
-      return [...current, ...fresh].slice(0, MAX_REFS);
+      return [...current, ...fresh].slice(0, currentMaxRefs);
     });
   }
 
@@ -833,7 +1039,7 @@ export function ImageWorkbench() {
 
           <div className="mx-3 flex min-h-0 flex-1 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc]">
             <div className="flex items-center justify-between px-4 pt-4 text-xs text-[#737985]">
-              <span>{references.length} / {MAX_REFS}</span>
+              {!selectedSkill?.referenceSlots && <span>{references.length} / {currentMaxRefs}</span>}
               <div className="flex items-center gap-3 text-[#a4aab5]">
                 <button
                   type="button"
@@ -859,43 +1065,151 @@ export function ImageWorkbench() {
               </div>
             </div>
 
-            <div className="mt-4 flex min-h-[92px] items-start gap-3 px-4">
-              {references.length > 0 && (
-                <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
-                  {references.map((reference, index) => (
-                    <div
-                      key={reference.id}
-                      className="group/ref relative h-[60px] w-[60px] flex-none overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3]"
-                      title={reference.name}
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={reference.url} alt={reference.name} className="h-full w-full object-cover" />
-                      <span className="absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-black/65 px-1 text-[10px] font-semibold leading-4 text-white">
-                        {index + 1}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setReferences((current) => current.filter((item) => item.id !== reference.id))}
-                        className="absolute right-1 top-1 hidden h-4 w-4 place-items-center rounded-full bg-black/55 text-[10px] leading-none text-white group-hover/ref:grid"
-                        aria-label={`移除 ${reference.name}`}
-                      >
-                        x
-                      </button>
-                    </div>
-                  ))}
+            {/* 技能选中时：显示带标签的上传槽位 + 技能 Banner */}
+            {selectedSkill?.referenceSlots && selectedSkill.referenceSlots.length > 0 ? (
+              <div className="mt-4 px-4">
+                {/* 参考图片计数 */}
+                <div className="mb-3 flex items-center justify-between">
+                  <span className="text-xs text-[#737985]">
+                    {references.length} / {currentMaxRefs}
+                  </span>
                 </div>
-              )}
-              <AddMaterialCard
-                disabled={remainingRefs === 0}
-                onClick={() => setPickerOpen(true)}
-                label="点击添加"
-                className="ml-auto h-[72px] w-[72px] flex-none rounded-lg border-[#eceef2] bg-[#f9fafb] text-[10px] text-[#747b87] hover:border-[#d7defc] hover:text-[#4d73ff]"
-                iconClassName="h-5 w-5"
-                labelClassName="mt-1 text-[10px]"
-              />
-            </div>
+                {/* 带标签的上传槽位 */}
+                <div className="mb-3 flex flex-wrap gap-2">
+                  {selectedSkill.referenceSlots.map((slot, idx) => {
+                    const ref = references[idx];
+                    return (
+                      <div key={idx} className="flex flex-col items-start gap-1">
+                        {ref ? (
+                          <div className="group/ref relative h-[60px] w-[60px] overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3]">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={ref.url} alt={ref.name} className="h-full w-full object-cover" />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReferences((current) => {
+                                  const next = [...current];
+                                  next[idx] = null as unknown as PickedMedia;
+                                  // remove null entries and truncate
+                                  return next.filter((r) => r !== null).slice(0, currentMaxRefs);
+                                });
+                              }}
+                              className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-black/55 text-[10px] leading-none text-white"
+                              aria-label={`移除 ${ref.name}`}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setPickerOpen(true)}
+                            className="grid h-[60px] w-[60px] place-items-center rounded-lg border-2 border-dashed border-[#d7dbe3] bg-[#f9fafb] text-[#a4aab5] transition-colors hover:border-[#3677ff] hover:bg-[#f5f8ff] hover:text-[#3677ff]"
+                          >
+                            <Plus className="h-5 w-5" />
+                          </button>
+                        )}
+                        <span className="text-[10px] text-[#737985]">
+                          {slot.label}
+                          {slot.optional && <span className="ml-0.5 text-[#b8bdc7]">(可选)</span>}
+                        </span>
+                      </div>
+                    );
+                  })}
+                  {/* 额外上传槽位（超过预定义槽位后继续添加） */}
+                  {references.length > selectedSkill.referenceSlots.length &&
+                    references.slice(selectedSkill.referenceSlots.length).map((ref, idx) => {
+                      const actualIdx = selectedSkill.referenceSlots!.length + idx;
+                      return (
+                        <div key={`extra-${idx}`} className="flex flex-col items-start gap-1">
+                          <div className="group/ref relative h-[60px] w-[60px] overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3]">
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={ref.url} alt={ref.name} className="h-full w-full object-cover" />
+                            <button
+                              type="button"
+                              onClick={() => setReferences((current) => current.filter((_, i) => i !== actualIdx))}
+                              className="absolute right-1 top-1 grid h-4 w-4 place-items-center rounded-full bg-black/55 text-[10px] leading-none text-white"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  {/* 继续添加按钮 */}
+                  {remainingRefs > 0 && (
+                    <AddMaterialCard
+                      disabled={remainingRefs === 0}
+                      onClick={() => setPickerOpen(true)}
+                      label="添加图片"
+                      className="h-[60px] w-[60px] rounded-lg border-[#eceef2] bg-[#f9fafb] text-[10px] text-[#747b87] hover:border-[#d7defc] hover:text-[#4d73ff]"
+                      iconClassName="h-5 w-5"
+                      labelClassName="mt-0.5 text-[10px]"
+                    />
+                  )}
+                </div>
+
+                {/* 技能 Banner */}
+                <div className="flex items-start gap-2 rounded-lg bg-[#f0f3ff] px-3 py-2">
+                  <Sparkles className="mt-0.5 h-3.5 w-3.5 flex-none text-[#3677ff]" />
+                  <div className="min-w-0">
+                    <span className="text-xs font-medium text-[#3677ff]">
+                      {selectedSkill.name}
+                    </span>
+                    {selectedSkill.hintText && (
+                      <span className="ml-1 text-[11px] text-[#737985]">
+                        {selectedSkill.hintText}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* 无技能选中时：保持原来的参考图片区域 */
+              <div className="mt-4 flex min-h-[92px] items-start gap-3 px-4">
+                {references.length > 0 && (
+                  <div className="flex min-w-0 flex-1 gap-2 overflow-x-auto pb-1">
+                    {references.map((reference, index) => (
+                      <div
+                        key={reference.id}
+                        className="group/ref relative h-[60px] w-[60px] flex-none overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3]"
+                        title={reference.name}
+                      >
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={reference.url} alt={reference.name} className="h-full w-full object-cover" />
+                        <span className="absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-black/65 px-1 text-[10px] font-semibold leading-4 text-white">
+                          {index + 1}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setReferences((current) => current.filter((item) => item.id !== reference.id))}
+                          className="absolute right-1 top-1 hidden h-4 w-4 place-items-center rounded-full bg-black/55 text-[10px] leading-none text-white group-hover/ref:grid"
+                          aria-label={`移除 ${reference.name}`}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <AddMaterialCard
+                  disabled={remainingRefs === 0}
+                  onClick={() => setPickerOpen(true)}
+                  label="点击添加"
+                  className="ml-auto h-[72px] w-[72px] flex-none rounded-lg border-[#eceef2] bg-[#f9fafb] text-[10px] text-[#747b87] hover:border-[#d7defc] hover:text-[#4d73ff]"
+                  iconClassName="h-5 w-5"
+                  labelClassName="mt-1 text-[10px]"
+                />
+              </div>
+            )}
 
             <div ref={editorContainerRef} className="relative mt-1 flex min-h-0 flex-1 px-4 pb-4">
+              {/* 灰色提示词占位符：编辑器无内容时显示，有内容时隐藏 */}
+              {prompt.length === 0 && (
+                <div className="pointer-events-none absolute left-4 top-2 text-sm leading-7 text-[#b8bdc7] select-none">
+                  输入 / 选择技能，输入 @ 引用参考图片
+                </div>
+              )}
               {/* contenteditable 编辑器：支持文本和图片引用芯片 */}
               <div
                 ref={editorRef}
@@ -1555,20 +1869,44 @@ export function ImageWorkbench() {
       {showSavePromptDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
           <div className="w-[480px] rounded-xl bg-white p-6 shadow-xl">
-            <div className="mb-4 flex items-center gap-2">
-              <Save className="h-5 w-5 text-[#3677ff]" />
-              <h3 className="text-base font-semibold text-[#1a1d26]">保存提示词</h3>
+            <div className="mb-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Save className="h-5 w-5 text-[#3677ff]" />
+                <h3 className="text-base font-semibold text-[#1a1d26]">保存提示词</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setShowSavePromptDialog(false); setSaveTitleInput(''); }}
+                className="rounded-md p-1 text-[#9ca2ad] hover:bg-[#f3f4f6]"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
             <p className="mb-3 text-sm text-[#6b7280]">
               将当前输入的提示词保存到"我的提示词"，方便下次快速使用
             </p>
-            <div className="mb-4 max-h-40 overflow-y-auto rounded-lg border border-[#e4e5e9] bg-[#f7f8fa] p-3 text-sm text-[#1a1d26]">
-              {prompt.trim() || <span className="text-[#9ca2ad]">暂无提示词内容</span>}
+            <div className="mb-3">
+              <label className="mb-1 block text-sm text-[#6b7280]">标题</label>
+              <input
+                type="text"
+                value={saveTitleInput}
+                onChange={(e) => setSaveTitleInput(e.target.value)}
+                placeholder="为提示词命名（可选）"
+                maxLength={50}
+                className="h-9 w-full rounded-lg border border-[#e4e5e9] bg-white px-3 text-sm text-[#1a1d26] outline-none placeholder:text-[#b8bdc7] focus:border-[#3677ff]"
+              />
+            </div>
+            <div className="mb-4">
+              <label className="mb-1 block text-sm text-[#6b7280]">内容</label>
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-[#e4e5e9] bg-[#f7f8fa] p-3 text-sm text-[#1a1d26]">
+                {prompt.trim() || <span className="text-[#9ca2ad]">暂无提示词内容</span>}
+              </div>
             </div>
             <div className="flex justify-end gap-3">
               <button
                 type="button"
-                onClick={() => setShowSavePromptDialog(false)}
+                onClick={() => { setShowSavePromptDialog(false); setSaveTitleInput(''); }}
                 className="rounded-md border border-[#e4e5e9] px-4 py-2 text-sm text-[#6b7280] hover:bg-[#f3f4f6]"
               >
                 取消
@@ -1581,6 +1919,67 @@ export function ImageWorkbench() {
               >
                 {savingPrompt && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
                 保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 编辑提示词弹窗 */}
+      {showEditPromptDialog && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/30 backdrop-blur-[2px]">
+          <div className="w-[480px] rounded-xl bg-white p-6 shadow-xl">
+            <div className="mb-4 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Save className="h-5 w-5 text-[#3677ff]" />
+                <h3 className="text-base font-semibold text-[#1a1d26]">编辑提示词</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setShowEditPromptDialog(false); setEditingPromptId(null); }}
+                className="rounded-md p-1 text-[#9ca2ad] hover:bg-[#f3f4f6]"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="mb-3">
+              <label className="mb-1 block text-sm text-[#6b7280]">标题</label>
+              <input
+                type="text"
+                value={editingTitle}
+                onChange={(e) => setEditingTitle(e.target.value)}
+                placeholder="为提示词命名（可选）"
+                maxLength={50}
+                className="h-9 w-full rounded-lg border border-[#e4e5e9] bg-white px-3 text-sm text-[#1a1d26] outline-none placeholder:text-[#b8bdc7] focus:border-[#3677ff]"
+              />
+            </div>
+            <div className="mb-4">
+              <label className="mb-1 block text-sm text-[#6b7280]">内容</label>
+              <textarea
+                value={editingContent}
+                onChange={(e) => setEditingContent(e.target.value)}
+                placeholder="输入提示词内容"
+                rows={5}
+                className="w-full resize-none rounded-lg border border-[#e4e5e9] bg-[#f7f8fa] p-3 text-sm text-[#1a1d26] outline-none placeholder:text-[#9ca2ad] focus:border-[#3677ff]"
+              />
+            </div>
+            <div className="flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => { setShowEditPromptDialog(false); setEditingPromptId(null); }}
+                className="rounded-md border border-[#e4e5e9] px-4 py-2 text-sm text-[#6b7280] hover:bg-[#f3f4f6]"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleUpdatePrompt}
+                disabled={!editingContent.trim() || savingPrompt}
+                className="flex items-center gap-1 rounded-md bg-[#3677ff] px-4 py-2 text-sm font-medium text-white hover:bg-[#2a67e6] disabled:opacity-50"
+              >
+                {savingPrompt && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                保存修改
               </button>
             </div>
           </div>
@@ -1624,37 +2023,33 @@ export function ImageWorkbench() {
                   {myPrompts.map((item) => (
                     <li
                       key={item.id}
-                      className="group flex items-start gap-3 rounded-lg border border-[#eceef2] bg-white p-3 transition-colors hover:border-[#3677ff] hover:bg-[#f5f8ff]"
+                      className="group flex items-start gap-3 rounded-lg border border-[#eceef2] bg-white p-3 transition-colors hover:border-[#3677ff] hover:bg-[#f5f8ff] cursor-pointer"
+                      onClick={() => handleUsePrompt(item)}
                     >
                       <div className="min-w-0 flex-1">
-                        <p className="text-sm text-[#1a1d26] line-clamp-2">{item.prompt}</p>
-                        <div className="mt-1.5 flex items-center gap-3 text-xs text-[#9ca2ad]">
-                          <span className="inline-flex items-center gap-1">
-                            <Play className="h-3 w-3" />
-                            使用 {item.useCount} 次
-                          </span>
-                          <span>
-                            {new Date(item.createdAt).toLocaleString('zh-CN', {
-                              year: 'numeric',
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="truncate text-sm font-medium text-[#1a1d26]">{item.title || '未命名'}</span>
+                          <span className="flex-none text-[11px] text-[#9ca2ad]">
+                            {new Date(item.createdAt).toLocaleDateString('zh-CN', {
                               month: '2-digit',
                               day: '2-digit',
-                              hour: '2-digit',
-                              minute: '2-digit',
                             })}
                           </span>
                         </div>
+                        <p className="mt-1 text-xs text-[#6b7280] line-clamp-2">{item.prompt}</p>
                       </div>
                       <div className="flex flex-none items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
                         <button
                           type="button"
-                          onClick={() => handleUsePrompt(item)}
-                          className="rounded-md bg-[#3677ff] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#2a67e6]"
+                          onClick={(e) => { e.stopPropagation(); handleOpenEditPrompt(item); }}
+                          className="rounded-md p-1.5 text-[#9ca2ad] hover:bg-[#f0f3ff] hover:text-[#3677ff]"
+                          title="编辑"
                         >
-                          使用
+                          <Edit2 className="h-3.5 w-3.5" />
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDeletePrompt(item.id)}
+                          onClick={(e) => { e.stopPropagation(); handleDeletePrompt(item.id); }}
                           className="rounded-md p-1.5 text-[#9ca2ad] hover:bg-[#fef0f0] hover:text-[#ef4444]"
                           title="删除"
                         >
