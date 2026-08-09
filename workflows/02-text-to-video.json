@@ -1,0 +1,18 @@
+{
+  "1": {
+    "class_type": "JurongTextToVideoV2",
+    "inputs": {
+      "audio": null,
+      "prompt": "{{prompt}}",
+      "model": "doubao-seedance-2.0",
+      "duration": "4",
+      "resolution": "480P",
+      "seed": 0,
+      "camera_control": "none",
+      "aspect_ratio": "16:9",
+      "fps": "24",
+      "negative_prompt": "",
+      "max_retry": 2
+    }
+  }
+}

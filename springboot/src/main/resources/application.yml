@@ -1,0 +1,98 @@
+# ============================================================
+# JWT 配置(HS256,密钥至少 32 字节)
+# 生产环境务必用环境变量覆盖:JWT_SECRET=xxx,别把密钥写进 yml 提交到 git
+# ============================================================
+jwt:
+  secret: ${JWT_SECRET:dev-only-secret-please-change-in-production-32bytes-min}
+  access-token-expiry: 2h
+  refresh-token-expiry: 7d
+  issuer: jurong-aicenter
+
+spring:
+  profiles:
+    active: dev
+  application:
+    name: aicenter
+  main:
+    allow-circular-references: true   # V8 资产库：MediaService ↔ MediaLibraryService 循环依赖
+  jackson:
+    default-property-inclusion: non_null
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 200MB       # 单文件最大（视频上传需要）
+      max-request-size: 220MB    # 整个 multipart 请求最大
+  mvc:
+    throw-exception-if-no-handler-found: false
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.jurong.aicenter.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    root: INFO
+    com.jurong.aicenter: DEBUG
+    com.baomidou.mybatisplus: WARN
+
+# ============================================================
+# LLM 配置（画布文本润色 / Agent 对话共用）
+# ============================================================
+llm:
+  model: deepseek-v4-flash       # 模型名（NewAPI /v1/models 返回）
+  max-tokens: 2048                # 最大输出 token
+  system-prompt: |
+    你是一个专业的文案润色师。请保持核心信息和意图不变，改善表达使文字更有感染力，适合用于电商详情页、社交媒体等场景。输出纯文本，不要使用 markdown 格式。
+  image-poll-timeout-sec: 600    # ComfyUI text-to-image 超时（10 分钟）
+  video-poll-timeout-sec: 1800   # NewAPI 视频生成超时（30 分钟）
+
+# 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
+canvas:
+  workflows-dir: D:/ymWork/JurongAICenter/workflows/
+  # 画布节点的默认模型参数（最便宜档位，节省测试费用）
+  defaults:
+    image-model: gpt-image-2-1k
+    image-size: 1024x1024    # ComfyUI 最小可用尺寸（512 不被节点接受）
+    image-quality: low        # 最低质量（节省点数）
+    video-model: doubao-seedance-2.0
+    video-duration: 4         # 秒，最小
+    video-resolution: 480P     # 最小分辨率
+    video-enable-prompt-optimize: true
+
+# aicoming-video-proxy（资产 CRUD 直连 proxy 8080，视频生成走 NewAPI）
+# 参考 Assets-API 参考手册 §2：资产端点必须直连 proxy，走 NewAPI 会 404
+# token 复用 newapi.token（手册 §1：客户端只认 NEWAPI_TOKEN）
+aicoming:
+  proxy:
+    base-url: http://192.140.163.161:8080
+    token: ${newapi.token}
