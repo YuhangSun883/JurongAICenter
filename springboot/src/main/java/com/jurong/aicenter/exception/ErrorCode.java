@@ -1,66 +1,46 @@
 package com.jurong.aicenter.exception;
 
-import lombok.Getter;
-
-/**
- * 错误码分段约定：
- * Auth: 1xxx
- * User: 2xxx
- * Generation: 3xxx
- * Workflow: 4xxx
- * Billing: 5xxx（Phase 8）
- * Common: 9xxx
- */
-@Getter
 public enum ErrorCode {
-
-    // Common (9xxx)
     SUCCESS(0, "success"),
-    INTERNAL_ERROR(9999, "服务器内部错误"),
-    INVALID_PARAM(9001, "参数无效"),
-    UNAUTHORIZED(9401, "未登录"),
-    FORBIDDEN(9403, "无权限"),
-    NOT_FOUND(9404, "资源不存在"),
+    INTERNAL_ERROR(9999, "internal error"),
+    INVALID_PARAM(9001, "invalid param"),
+    UNAUTHORIZED(9401, "unauthorized"),
+    FORBIDDEN(9403, "forbidden"),
+    NOT_FOUND(9404, "not found"),
 
-    // Auth (1xxx)
-    EMAIL_ALREADY_EXISTS(1001, "邮箱已被注册"),
-    INVALID_CREDENTIALS(1002, "邮箱或密码错误"),
-    TOKEN_EXPIRED(1101, "Token 已过期"),
-    INVALID_TOKEN(1102, "Token 无效"),
+    EMAIL_ALREADY_EXISTS(1001, "email already exists"),
+    INVALID_CREDENTIALS(1002, "invalid credentials"),
+    TOKEN_EXPIRED(1101, "token expired"),
+    INVALID_TOKEN(1102, "invalid token"),
 
-    // User (2xxx)
-    USER_NOT_FOUND(2001, "用户不存在"),
-    USER_DISABLED(2002, "用户已禁用"),
+    USER_NOT_FOUND(2001, "user not found"),
+    USER_DISABLED(2002, "user disabled"),
 
-    // Generation (3xxx)
-    WORKFLOW_INVALID(3001, "工作流 JSON 不合法"),
-    COMFYUI_UNREACHABLE(3002, "ComfyUI 服务不可达"),
-    COMFYUI_REJECTED(3003, "ComfyUI 拒绝请求"),
-    QUOTA_INSUFFICIENT(3004, "配额不足"),
-    JOB_NOT_READY(3005, "任务未完成，无法获取结果"),
-    JOB_ALREADY_TERMINAL(3006, "任务已是终态"),
-    NEWAPI_UNREACHABLE(3007, "NewAPI 服务不可达"),
-    NEWAPI_TASK_FAILED(3008, "NewAPI 视频任务失败"),
-    NEWAPI_TASK_TIMEOUT(3009, "NewAPI 视频任务超时"),
-    NEWAPI_VIDEO_URL_MISSING(3010, "NewAPI 响应中未找到视频 URL"),
+    WORKFLOW_INVALID(3001, "workflow invalid"),
+    COMFYUI_UNREACHABLE(3002, "comfyui unreachable"),
+    COMFYUI_REJECTED(3003, "comfyui rejected"),
+    QUOTA_INSUFFICIENT(3004, "quota insufficient"),
+    JOB_NOT_READY(3005, "job not ready"),
+    JOB_ALREADY_TERMINAL(3006, "job already terminal"),
+    NEWAPI_UNREACHABLE(3007, "newapi unreachable"),
+    NEWAPI_TASK_FAILED(3008, "newapi task failed"),
+    NEWAPI_TASK_TIMEOUT(3009, "newapi task timeout"),
+    NEWAPI_VIDEO_URL_MISSING(3010, "newapi video url missing"),
 
-    // Workflow (4xxx)
-    WORKFLOW_NOT_FOUND(4001, "工作流不存在"),
-    WORKFLOW_ACCESS_DENIED(4002, "无权访问此工作流"),
+    WORKFLOW_NOT_FOUND(4001, "workflow not found"),
+    WORKFLOW_ACCESS_DENIED(4002, "workflow access denied"),
 
-    // Billing (5xxx) — Phase 8
-    BILLING_NOT_ENABLED(5001, "计费模块未启用"),
+    BILLING_NOT_ENABLED(5001, "billing not enabled"),
 
-    // Admin (6xxx) — Phase 9 模块
-    ADMIN_OPERATION_DENIED(6001, "管理员操作被拒绝"),                     // 通用兜底
-    ADMIN_CANNOT_CHANGE_OWN_ROLE(6002, "不能修改自己的角色"),              // 禁改自己
-    ADMIN_CANNOT_DISABLE_SELF(6003, "不能禁用自己的账号"),                  // 禁禁自己
-    GROUP_NAME_DUPLICATE(6004, "分组名称已存在"),
-    GROUP_IS_DEFAULT_CANNOT_DELETE(6005, "默认分组不可删除"),
-    GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "默认分组的 is_default 不可关闭"),
-    USER_ALREADY_IN_GROUP(6007, "用户已在该分组中"),
-    USER_NOT_IN_GROUP(6008, "用户不在该分组中"),
-    INVALID_ROLE_VALUE(6009, "角色取值必须是 USER 或 ADMIN"),
+    ADMIN_OPERATION_DENIED(6001, "admin operation denied"),
+    ADMIN_CANNOT_CHANGE_OWN_ROLE(6002, "cannot change own role"),
+    ADMIN_CANNOT_DISABLE_SELF(6003, "cannot disable self"),
+    GROUP_NAME_DUPLICATE(6004, "group name duplicate"),
+    GROUP_IS_DEFAULT_CANNOT_DELETE(6005, "default group cannot be deleted"),
+    GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "default group cannot be unset"),
+    USER_ALREADY_IN_GROUP(6007, "user already in group"),
+    USER_NOT_IN_GROUP(6008, "user not in group"),
+    INVALID_ROLE_VALUE(6009, "invalid role value"),
 
     // Media (7xxx) — 资产库 / 素材
     MEDIA_LIBRARY_NAME_DUPLICATE(7001, "资产库名称已存在"),
@@ -82,5 +62,13 @@ public enum ErrorCode {
     ErrorCode(int code, String message) {
         this.code = code;
         this.message = message;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public String getMessage() {
+        return message;
     }
 }

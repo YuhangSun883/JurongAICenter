@@ -35,8 +35,7 @@ import {
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent, type PointerEvent } from 'react';
-import { Loader2 } from 'lucide-react';
-import { canvasApi, type CanvasNode, type CanvasNodeType } from '@/api/canvas';
+import { canvasApi, type CanvasNodeType } from '@/api/canvas';
 import { getAccessToken } from '@/lib/auth-store';
 import { cn } from '@/lib/utils';
 import { LoginGate } from '@/components/common/LoginGate';
@@ -73,6 +72,53 @@ interface CanvasEdge {
   id: string;
   from: string;
   to: string;
+}
+
+function normalizeCanvasNodes(rawNodes: Array<{
+  id: string;
+  type: CanvasNodeType;
+  x?: number;
+  y?: number;
+  positionX?: number;
+  positionY?: number;
+  content?: string;
+  resultUrl?: string;
+  prompt?: string;
+}> | null | undefined): CanvasViewNode[] {
+  return (rawNodes ?? []).map((node) => ({
+    id: node.id,
+    type: node.type,
+    x: node.x ?? node.positionX ?? 0,
+    y: node.y ?? node.positionY ?? 0,
+    content: node.content,
+    resultUrl: node.resultUrl,
+    prompt: node.prompt ?? '',
+  }));
+}
+
+function normalizeCanvasEdges(rawEdges: Array<{
+  id?: string;
+  from?: string;
+  to?: string;
+  fromNode?: string;
+  toNode?: string;
+}> | null | undefined): CanvasEdge[] {
+  const seen = new Set<string>();
+  const result: CanvasEdge[] = [];
+  for (const edge of rawEdges ?? []) {
+    const from = edge.from ?? edge.fromNode;
+    const to = edge.to ?? edge.toNode;
+    if (!from || !to) continue;
+    const id = edge.id ?? `edge_${from}_${to}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push({ id, from, to });
+  }
+  return result;
+}
+
+function isUserCanvas(item: import('@/api/canvas').CanvasListItem) {
+  return item.id !== 'mock_canvas_default' && item.name !== '\u9ed8\u8ba4\u753b\u5e03' && item.name !== '\u699b\u6a3f\ue17b\u9422\u8bf2\u7af7';
 }
 
 interface AddMenuState {
@@ -131,6 +177,7 @@ export default function NewCanvasPage() {
   // 当前画布 ID:首次访问 /canvas/new 时为 null,用户点"+新建"或从历史打开画布后会被设置
   // 之后 createNode / upload 等操作会带上这个 canvasId
   const [canvasId, setCanvasId] = useState<string | null>(null);
+  const [canvasLoadState, setCanvasLoadState] = useState<'idle' | 'loading' | 'loaded' | 'failed'>('idle');
   const searchParams = useSearchParams();
 
   // 从 URL ?canvasId=xxx 读画布 ID,有就调 getCanvasDetail 加载
@@ -141,12 +188,17 @@ export default function NewCanvasPage() {
     // 已经在加载这个画布了就不重复
     if (canvasId === urlCanvasId) return;
     setCanvasId(urlCanvasId);
+    setCanvasLoadState('loading');
     void canvasApi.getCanvasDetail(urlCanvasId)
       .then((detail) => {
-        if (detail?.nodes) setNodes(detail.nodes.map(toViewNode));
-        if (detail?.edges) setEdges(detail.edges);
+        setNodes(normalizeCanvasNodes(detail?.nodes));
+        setEdges(normalizeCanvasEdges(detail?.edges));
+        setCanvasLoadState('loaded');
       })
-      .catch((err) => console.warn('[canvas-new] load from URL failed:', err));
+      .catch((err) => {
+        console.warn('[canvas-new] load from URL failed:', err);
+        setCanvasLoadState('failed');
+      });
   }, [searchParams, canvasId]);
   const [addMenu, setAddMenu] = useState<AddMenuState | null>(null);
   const [nodes, setNodes] = useState<CanvasViewNode[]>([]);
@@ -171,8 +223,6 @@ export default function NewCanvasPage() {
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>('');
-  // 2026-08-09 新增:当前节点的提示素材列表(以 image 节点为 key, value 为上传后的素材节点 id 列表)
-  const [promptMaterials, setPromptMaterials] = useState<Record<string, Array<{ id: string; url: string; name?: string }>>>({});
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
 
@@ -189,7 +239,7 @@ export default function NewCanvasPage() {
     setHistoryLoading(true);
     try {
       const list = await canvasApi.listCanvases(1, 50);
-      setCanvasHistory(list);
+      setCanvasHistory(list.filter(isUserCanvas));
     } catch (err) {
       console.warn('[canvas] listCanvases failed:', err);
       setCanvasHistory([]);
@@ -204,8 +254,8 @@ export default function NewCanvasPage() {
       const detail = await canvasApi.getCanvasDetail(canvasId);
       // 切换到该画布:设 canvasId + 用 detail.nodes/edges 覆盖本地 state
       setCanvasId(canvasId);
-      if (detail?.nodes) setNodes(detail.nodes.map(toViewNode));
-      if (detail?.edges) setEdges(detail.edges);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
     } catch (err) {
       console.warn('[canvas] getCanvasDetail failed:', err);
     }
@@ -216,29 +266,53 @@ export default function NewCanvasPage() {
 
   // 加载本地缓存的画布节点(刷新不丢，弥补后端没有 getCanvasDetail 入口时的本地持久化)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState !== 'failed') return;
     try {
-      const raw = localStorage.getItem('canvas_nodes');
+      const raw = localStorage.getItem(`canvas_nodes_${canvasId}`);
       if (raw) setNodes(JSON.parse(raw) as CanvasViewNode[]);
-      const rawEdges = localStorage.getItem('canvas_edges');
+      const rawEdges = localStorage.getItem(`canvas_edges_${canvasId}`);
       if (rawEdges) setEdges(JSON.parse(rawEdges) as CanvasEdge[]);
+      localStorage.removeItem('canvas_nodes');
+      localStorage.removeItem('canvas_edges');
     } catch { /* ignore */ }
-  }, []);
+  }, [canvasId, canvasLoadState]);
 
-  // 节点变化时写 localStorage(延迟 200ms 防抖，避免每次拖动都写盘)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
     const t = setTimeout(() => {
-      localStorage.setItem('canvas_nodes', JSON.stringify(nodes));
+      localStorage.setItem(`canvas_nodes_${canvasId}`, JSON.stringify(nodes));
     }, 200);
     return () => clearTimeout(t);
-  }, [nodes]);
+  }, [nodes, canvasId, canvasLoadState]);
 
-  // 连线变化时写 localStorage
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    localStorage.setItem('canvas_edges', JSON.stringify(edges));
-  }, [edges]);
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
+    localStorage.setItem(`canvas_edges_${canvasId}`, JSON.stringify(edges));
+  }, [edges, canvasId, canvasLoadState]);
+
+  /**
+   * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
+   * 后端接口是 GET /api/canvas/canvases/{id}，canvasApi.getCanvasDetail 是封装。
+   * 如果当前没有 canvasId（极端情况），则仅刷新当前节点的 content。
+   */
+  const reloadCanvasFromBackend = async (anchorNodeId: string) => {
+    try {
+      // 1) 先拿 anchor 节点的 canvasId（local state 的 CanvasViewNode 没带 canvasId，必须后端查）
+      const nodeResp = await canvasApi.getNode(anchorNodeId);
+      const canvasId = nodeResp?.canvasId;
+      if (!canvasId) {
+        console.warn('[canvas] reloadCanvasFromBackend: node has no canvasId, skip');
+        return;
+      }
+      // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
+      const detail = await canvasApi.getCanvasDetail(canvasId);
+      setCanvasId(canvasId);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
+    } catch (err) {
+      console.warn('[canvas] reloadCanvasFromBackend failed:', err);
+    }
+  };
 
   /**
    * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
@@ -409,6 +483,7 @@ export default function NewCanvasPage() {
   const addNode = async (type: CanvasNodeType) => {
     const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
     const created = await canvasApi.createNode({
+      canvasId: canvasId ?? undefined,
       type,
       title: nodeTitle(type),
       upstreamIds: source ? [source.id] : undefined,
@@ -540,62 +615,6 @@ export default function NewCanvasPage() {
   const handleUploadClick = () => {
     setAddMenu(null);
     fileInputRef.current?.click();
-  };
-
-  // 2026-08-09 新增:上传提示框素材 — 复用 handleUploadToCanvas + 记录到 promptMaterials
-  const handleUploadMaterial = async () => {
-    if (!activeNodeId) return;
-    const targetNodeId = activeNodeId;
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'image/*';
-    input.multiple = true;
-    input.style.display = 'none';
-    document.body.appendChild(input);
-    input.onchange = async (ev) => {
-      const files = (ev.target as HTMLInputElement).files;
-      document.body.removeChild(input);
-      if (!files || files.length === 0) return;
-      setUploading(true);
-      try {
-        const list = Array.from(files);
-        const newMaterials: Array<{ id: string; url: string; name?: string }> = [];
-        for (const file of list) {
-          const created = await canvasApi.uploadToCanvas(file, canvasId ? { canvasId } : {});
-          newMaterials.push({
-            id: created.id,
-            url: created.resultUrl ?? '',
-            name: file.name,
-          });
-          // 同时作为画布节点插入(以便后续在画布可见 + 可以连线使用)
-          const nextNode: CanvasViewNode = {
-            id: created.id,
-            type: created.type,
-            x: clampNodeX(centeredNodePosition().x),
-            y: clampNodeY(centeredNodePosition().y),
-            content: created.content,
-            resultUrl: created.resultUrl,
-            prompt: '',
-          };
-          setNodes((current) => {
-            if (current.some((n) => n.id === nextNode.id)) return current;
-            return [...current, nextNode];
-          });
-        }
-        // 把新素材加入 active node 的 materials 列表
-        setPromptMaterials((prev) => ({
-          ...prev,
-          [targetNodeId]: [...(prev[targetNodeId] ?? []), ...newMaterials],
-        }));
-      } catch (err: unknown) {
-        console.error('[canvas] upload material error:', err);
-        const msg = err instanceof Error ? err.message : '上传素材失败,请重试';
-        setGenerateError(msg);
-      } finally {
-        setUploading(false);
-      }
-    };
-    input.click();
   };
 
   const handleFileInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -755,8 +774,10 @@ export default function NewCanvasPage() {
           credentials: 'include',
           headers: (() => {
             const t = getAccessToken();
-            return t ? { Authorization: `Bearer ${t}` } : {};
-          })() as Record<string, string>,
+            const headers: Record<string, string> = {};
+            if (t) headers.Authorization = `Bearer ${t}`;
+            return headers;
+          })(),
         }).then((r) => r.json());
 
         if (data.status === 'success') {
@@ -766,11 +787,29 @@ export default function NewCanvasPage() {
               current.map((n) => (n.id === node.id ? { ...n, content: data.text! } : n))
             );
           }
-          // 2026-08-09:换调 reloadCanvasFromBackend
-          //   原因: merge 在某些场景下不生效(可能是 setNodes batching 或 memo 问题)
-          //   reload 从后端重拉全画布节点,保证 UI 同步;新节点都设了 position 不会堆左上角
-          console.log('[canvas] task SUCCESS, reloadCanvasFromBackend activeNodeId=', activeNode?.id);
-          await reloadCanvasFromBackend(activeNode!.id);
+          // 合并本次新建的节点（帧拼图 / 口播文案文本节点）到本地 state
+          // 不再调 reloadCanvasFromBackend（那会拉整张画布，把历史节点堆左上角）
+          const newIds = data.createdNodeIds ?? [];
+          if (newIds.length > 0) {
+            try {
+              const newNodes = await Promise.all(
+                newIds.map(async (id) => {
+                  const apiNode = await canvasApi.getNode(id);
+                  // 关键映射：后端返回 positionX/positionY，前端 CanvasViewNode 要 x/y
+                  // 没这一步 → 新节点全是 (0,0) 堆左上角 + 拖动计算为 NaN
+                  return {
+                    ...apiNode,
+                    x: apiNode.positionX ?? 0,
+                    y: apiNode.positionY ?? 0,
+                    prompt: '',
+                  } as CanvasViewNode;
+                })
+              );
+              setNodes((current) => [...current, ...newNodes]);
+            } catch (mergeErr) {
+              console.warn('[canvas] merge new nodes failed:', mergeErr);
+            }
+          }
           setGenerating(false);
           return;
         }
@@ -962,6 +1001,12 @@ export default function NewCanvasPage() {
               const item = await canvasApi.createCanvas({ name: '未命名画布' });
               setCanvasId(item.id);
               if (typeof window !== 'undefined') {
+                localStorage.removeItem(`canvas_nodes_${item.id}`);
+                localStorage.removeItem(`canvas_edges_${item.id}`);
+                if (canvasId) {
+                  localStorage.removeItem(`canvas_nodes_${canvasId}`);
+                  localStorage.removeItem(`canvas_edges_${canvasId}`);
+                }
                 localStorage.removeItem('canvas_nodes');
                 localStorage.removeItem('canvas_edges');
               }
@@ -1058,6 +1103,9 @@ export default function NewCanvasPage() {
             onTextChange={(value) => updateNodeContent(node.id, value)}
             onOpenMenu={openNodeMenu}
             onStartLinkDrag={startLinkDrag}
+            onOpenExpanded={(target) => {
+              if (target.resultUrl) setExpandedImage({ url: target.resultUrl, title: nodeTitle(target.type) });
+            }}
             onContextMenu={(event) => {
               event.preventDefault();
               setActiveNodeId(node.id);
@@ -1321,6 +1369,7 @@ function CanvasNodeCard({
   onTextChange,
   onOpenMenu,
   onStartLinkDrag,
+  onOpenExpanded,
   onContextMenu,
   onDragStart,
   onExpandImage,
@@ -1332,6 +1381,7 @@ function CanvasNodeCard({
   onTextChange: (value: string) => void;
   onOpenMenu: (node: CanvasViewNode, side: 'left' | 'right') => void;
   onStartLinkDrag: (node: CanvasViewNode, side: 'left' | 'right', event: PointerEvent<HTMLButtonElement>) => void;
+  onOpenExpanded: (node: CanvasViewNode) => void;
   onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
   /** 双击图片节点放大查看 */
@@ -1352,7 +1402,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  onExpandImage({ url: node.resultUrl!, title: node.title || nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
     >
       {active && (
@@ -1432,7 +1482,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  onExpandImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
               />
             </div>
@@ -1462,7 +1512,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  onExpandImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
               />
             </div>

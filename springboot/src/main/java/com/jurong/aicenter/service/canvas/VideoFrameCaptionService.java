@@ -1,5 +1,9 @@
 package com.jurong.aicenter.service.canvas;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jurong.aicenter.client.NewApiClient;
+import com.jurong.aicenter.dto.canvas.NodeConnection;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.entity.CanvasNode;
 import com.jurong.aicenter.entity.CanvasTask;
@@ -27,6 +31,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +100,24 @@ public class VideoFrameCaptionService {
     private static final long CAPTION_STAGGER_MS = 50;
     private final ObjectMapper objectMapper;
 
+    public VideoFrameCaptionService(VideoFrameExtractor extractor,
+                                    NewApiClient newApiClient,
+                                    StorageService storageService,
+                                    CanvasTaskRepository taskRepository,
+                                    CanvasNodeRepository nodeRepository,
+                                    @Qualifier("captionExecutor") Executor captionExecutor,
+                                    VideoFrameExtractor videoFrameExtractor,
+                                    ObjectMapper objectMapper) {
+        this.extractor = extractor;
+        this.newApiClient = newApiClient;
+        this.storageService = storageService;
+        this.taskRepository = taskRepository;
+        this.nodeRepository = nodeRepository;
+        this.captionExecutor = captionExecutor;
+        this.videoFrameExtractor = videoFrameExtractor;
+        this.objectMapper = objectMapper;
+    }
+
     /**
      * 异步入口。被 CanvasServiceImpl.extractAndCaption() 调用。
      */
@@ -139,10 +163,40 @@ public class VideoFrameCaptionService {
             boolean needCaption = "script".equals(mode) || "both".equals(mode);
             String content = "";
 
-            // 2026-08-09 14:43 暂时去掉 ASR 口播提取
-            //   原因:ASR 依赖 NewAPI 音频转写,目前没可用通道
-            //   后续装本地 whisper 后再加回
-            Map<Integer, String> dubMap = java.util.Collections.emptyMap();
+            // ④ caption(只 script/both 才需要)
+                        // ④a 先做 ASR 提取口播原文(增强功能,失败不影响主流程)
+            Map<Integer, String> dubMap = new java.util.HashMap<>();
+            try {
+                Path tempVideoDir = frames.get(0).path().getParent();
+                Path audioFile = tempVideoDir.resolve("audio.wav");
+                Path extracted = videoFrameExtractor.extractAudio(node.getResultUrl(), audioFile);
+                if (extracted != null) {
+                    byte[] audioBytes = java.nio.file.Files.readAllBytes(extracted);
+                    List<Map<String, Object>> segments = newApiClient.audioTranscribe(audioBytes, "audio/wav");
+                    // 把 segments 按帧时间映射:每帧 [t-0.5, t+0.5] 区间内的口播拼接
+                    for (int i = 0; i < frames.size(); i++) {
+                        double t = frames.get(i).timestampSeconds();
+                        StringBuilder dubBuilder = new StringBuilder();
+                        for (Map<String, Object> seg : segments) {
+                            // 注意:命名加 seg 前缀,避免和外层方法的 start/end 变量冲突
+                            double segStart = (double) seg.get("start");
+                            double segEnd = (double) seg.get("end");
+                            double segMid = (segStart + segEnd) / 2.0;
+                            if (segMid >= t - 0.5 && segMid <= t + 0.5) {
+                                if (dubBuilder.length() > 0) dubBuilder.append(" ");
+                                dubBuilder.append((String) seg.get("text"));
+                            }
+                        }
+                        if (dubBuilder.length() > 0) {
+                            dubMap.put(i, dubBuilder.toString());
+                        }
+                    }
+                    log.info("[video-caption] ASR 完成: {} 个 segments,映射到 {}/{} 帧",
+                        segments.size(), dubMap.size(), frames.size());
+                }
+            } catch (Exception asrErr) {
+                log.warn("[video-caption] ASR 失败(非致命): {}", asrErr.getMessage());
+            }
 
             if (needCaption) {
                 // 批量 caption:每 CAPTION_BATCH_SIZE 帧打一次 NewAPI(一次传多张图)
@@ -322,11 +376,19 @@ public class VideoFrameCaptionService {
             return;
         }
 
+        CanvasNode frameGridNode = null;
         if (needFrames) {
-            createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            if (frameGridNode != null) {
+                connectNodes(videoNode, "frames", frameGridNode, "video");
+            }
         }
         if (needText) {
-            createScriptTextSidecar(videoNode, scriptText, needFrames, createdIds);
+            CanvasNode parent = needFrames && frameGridNode != null ? frameGridNode : videoNode;
+            CanvasNode textNode = createScriptTextSidecar(videoNode, scriptText, needFrames, createdIds);
+            if (textNode != null) {
+                connectNodes(parent, "text", textNode, needFrames ? "frames" : "video");
+            }
         }
     }
 
@@ -362,6 +424,7 @@ public class VideoFrameCaptionService {
 
         log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}",
             videoNode.getId(), node.getId());
+        return node;
     }
 
     /**
@@ -453,7 +516,7 @@ public class VideoFrameCaptionService {
      * 如果已经有帧网格(text 节点应该放在帧网格下方而不是同一行)，
      * 位置会下移一整行的距离。
      */
-    private void createScriptTextSidecar(CanvasNode videoNode, String scriptText,
+    private CanvasNode createScriptTextSidecar(CanvasNode videoNode, String scriptText,
                                           boolean hasFrameGrid, java.util.List<String> createdIds) {
         final int Y_STEP = 240;
         final int COLS = 4;
@@ -484,6 +547,82 @@ public class VideoFrameCaptionService {
 
         log.info("[video-sidecar-script] OK: videoNodeId={}, textNodeId={}, hasFrameGrid={}",
             videoNode.getId(), textNode.getId(), hasFrameGrid);
+        return textNode;
+    }
+
+    private void connectNodes(CanvasNode from, String fromPort, CanvasNode to, String toPort) {
+        if (from == null || to == null) {
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        from.setDownstreamIds(appendConnection(from.getDownstreamIds(), new NodeConnection(fromPort, to.getId())));
+        from.setUpdatedAt(now);
+        nodeRepository.updateById(from);
+
+        to.setUpstreamIds(appendConnection(to.getUpstreamIds(), new NodeConnection(toPort, from.getId())));
+        to.setUpdatedAt(now);
+        nodeRepository.updateById(to);
+    }
+
+    private String appendConnection(String rawJson, NodeConnection conn) {
+        if (conn == null || conn.getNodeId() == null || conn.getNodeId().isBlank()) {
+            return rawJson;
+        }
+        List<NodeConnection> conns = new ArrayList<>();
+        if (rawJson != null && !rawJson.isBlank()) {
+            conns.addAll(parseConnections(rawJson));
+        }
+        boolean exists = conns.stream().anyMatch(c ->
+            c != null
+                && conn.getNodeId().equals(c.getNodeId())
+                && ((conn.getPort() == null && c.getPort() == null)
+                || (conn.getPort() != null && conn.getPort().equals(c.getPort()))));
+        if (!exists) {
+            conns.add(conn);
+        }
+        return serializeConnections(conns);
+    }
+
+    private List<NodeConnection> parseConnections(String json) {
+        if (json == null || json.isBlank()) {
+            return Collections.emptyList();
+        }
+        try {
+            List<NodeConnection> parsed = objectMapper.readValue(json, new TypeReference<List<NodeConnection>>() {});
+            return parsed == null ? Collections.emptyList() : parsed;
+        } catch (Exception e) {
+            try {
+                List<String> old = objectMapper.readValue(json, new TypeReference<List<String>>() {});
+                List<NodeConnection> converted = new ArrayList<>();
+                for (String id : old) {
+                    if (id != null && !id.isBlank()) {
+                        converted.add(new NodeConnection("default", id));
+                    }
+                }
+                return converted;
+            } catch (Exception ignore) {
+                log.warn("[video-sidecar] parseConnections failed: {}", e.getMessage());
+                return Collections.emptyList();
+            }
+        }
+    }
+
+    private String serializeConnections(List<NodeConnection> conns) {
+        if (conns == null || conns.isEmpty()) {
+            return null;
+        }
+        List<NodeConnection> clean = conns.stream()
+            .filter(c -> c != null && c.getNodeId() != null && !c.getNodeId().isBlank())
+            .toList();
+        if (clean.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(clean);
+        } catch (Exception e) {
+            log.warn("[video-sidecar] serializeConnections failed: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -589,7 +728,8 @@ public class VideoFrameCaptionService {
      *   【Shot02】运镜:推近 动作:xxx
      *   ...
      */
-    private String assembleScript(List<FrameMeta> frames, List<Map<String, String>> captions) {
+    private String assembleScript(List<FrameMeta> frames, List<Map<String, String>> captions, Map<Integer, String> dubMap) {
+    
         StringBuilder sb = new StringBuilder();
         sb.append("【节奏】").append(frames.size()).append("s 视频节奏,每 1 秒一个镜头。\n");
         int successCount = 0;
@@ -607,7 +747,11 @@ public class VideoFrameCaptionService {
             } else {
                 sb.append("运镜:").append(camera).append(" 动作:").append(action);
             }
-            // 2026-08-09 14:43 去掉 ASR 口播提取(暂时不需要)
+            // 添加口播(ASR 提取的原文)
+            String dubText = dubMap == null ? null : dubMap.get(i);
+            if (dubText != null && !dubText.isBlank()) {
+                sb.append(" 口播:\"").append(dubText).append("\"");
+            }
             if (!"__FAILED__".equals(camera) && !"__SKIPPED__".equals(camera)) {
                 successCount++;
             }

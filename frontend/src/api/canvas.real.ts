@@ -8,6 +8,7 @@ import type {
   CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
+  UpdateCanvasRequest,
   UpdateCanvasNodeRequest,
   UploadToCanvasOptions,
 } from './canvas';
@@ -42,6 +43,14 @@ export function createCanvas(req: CreateCanvasRequest): Promise<CanvasListItem> 
   return request<CanvasListItem>(`${API}/canvases`, { method: 'POST', body: req });
 }
 
+export function updateCanvas(canvasId: string, req: UpdateCanvasRequest): Promise<CanvasListItem> {
+  return request<CanvasListItem>(`${API}/canvases/${canvasId}`, { method: 'PATCH', body: req });
+}
+
+export async function deleteCanvas(canvasId: string): Promise<void> {
+  await request<{ canvasId: string; status: string }>(`${API}/canvases/${canvasId}`, { method: 'DELETE' });
+}
+
 /** 我的画布列表("我的创作"侧边面板用) */
 export function listCanvases(page = 1, pageSize = 50): Promise<CanvasListItem[]> {
   return request<CanvasListItem[]>(`${API}/canvases?page=${page}&pageSize=${pageSize}`);
@@ -55,13 +64,6 @@ export function getCanvasDetail(canvasId: string): Promise<CanvasDetail> {
 /** 拿单个节点 */
 export function getNode(nodeId: string): Promise<CanvasNode> {
   return request<CanvasNode>(`${API}/nodes/${nodeId}`);
-}
-
-/** 删除画布（后端级联删节点 + 任务） */
-export function deleteCanvas(canvasId: string): Promise<{ canvasId: string; status: string }> {
-  return request<{ canvasId: string; status: string }>(`${API}/canvases/${canvasId}`, {
-    method: 'DELETE',
-  });
 }
 
 /**
