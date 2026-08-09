@@ -39,9 +39,9 @@ public interface MediaLibraryService {
     com.jurong.aicenter.entity.MediaLibrary getAiLibrary(Long userId);
 
     /**
-     * 拿用户的"我的资产"库
+     * 拿用户的"我的资产"库；没有则自动建一个
      */
-    com.jurong.aicenter.entity.MediaLibrary getUploadLibrary(Long userId);
+    com.jurong.aicenter.entity.MediaLibrary getOrCreateUploadLibrary(Long userId);
 
     /**
      * 拿用户首个 custom 库（按 sort_order 排序）；没有则建一个 "未分类"

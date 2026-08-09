@@ -200,15 +200,25 @@ public class MediaLibraryServiceImpl implements MediaLibraryService {
     }
 
     @Override
-    public MediaLibrary getUploadLibrary(Long userId) {
+    @Transactional(rollbackFor = Exception.class)
+    public MediaLibrary getOrCreateUploadLibrary(Long userId) {
         LambdaQueryWrapper<MediaLibrary> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(MediaLibrary::getUserId, userId)
                .eq(MediaLibrary::getType, TYPE_UPLOADED);
         MediaLibrary lib = libraryRepository.selectOne(wrapper);
-        if (lib == null) {
-            throw new BusinessException(ErrorCode.MEDIA_LIBRARY_NOT_FOUND,
-                "我的资产库未初始化，请联系管理员");
-        }
+        if (lib != null) return lib;
+
+        // 没有"我的资产"库时自动建一个，避免上传时 7002
+        lib = new MediaLibrary();
+        lib.setUserId(userId);
+        lib.setName("我的资产");
+        lib.setType(TYPE_UPLOADED);
+        lib.setIconKey("upload");
+        lib.setSortOrder(10); // 系统库排在前面，留 0 给 system-ai
+        lib.setCreatedAt(LocalDateTime.now());
+        lib.setUpdatedAt(LocalDateTime.now());
+        libraryRepository.insert(lib);
+        log.info("Auto-created '我的资产' library for userId={}: id={}", userId, lib.getId());
         return lib;
     }
 

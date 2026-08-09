@@ -1,12 +1,80 @@
 import type {
+  CanvasListItem,
   CanvasNode,
+  CanvasNodeType,
   CreateCanvasNodeRequest,
+  CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
   UpdateCanvasNodeRequest,
+  UploadToCanvasOptions,
 } from './canvas';
 
 const nodes = new Map<string, CanvasNode>();
+const mockCanvases = new Map<string, CanvasListItem>();
+
+/**
+ * Mock 版的本地上传：按 mime/扩展名猜节点类型，不真上传。
+ * 让前端开发不依赖后端也能跑上传流程。
+ */
+export async function uploadToCanvas(
+  file: File,
+  _opts: UploadToCanvasOptions = {},
+): Promise<CanvasNode> {
+  const type = inferType(file);
+  const now = Date.now();
+  const node: CanvasNode = {
+    id: `canvas_node_${now}_${Math.random().toString(36).slice(2, 7)}`,
+    type,
+    title: file.name || defaultTitle(type),
+    resultUrl: type === 'image' ? 'https://picsum.photos/seed/upload/' + now + '/600/400' : undefined,
+    createdAt: now,
+    updatedAt: now,
+  };
+  nodes.set(node.id, node);
+  return node;
+}
+
+function inferType(file: File): CanvasNodeType {
+  const mime = (file.type || '').toLowerCase();
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  const name = (file.name || '').toLowerCase();
+  if (/\.(jpg|jpeg|png|gif|webp|bmp)$/.test(name)) return 'image';
+  if (/\.(mp4|webm|mov|avi|mkv)$/.test(name)) return 'video';
+  if (/\.(mp3|wav|ogg|m4a|aac)$/.test(name)) return 'audio';
+  return 'image'; // fallback
+}
+
+function defaultTitle(type: CreateCanvasNodeRequest['type']) {
+  const titles = {
+    text: '文本节点',
+    image: '图片节点',
+    video: '视频节点',
+    audio: '音频节点',
+  } satisfies Record<CreateCanvasNodeRequest['type'], string>;
+  return titles[type];
+}
+
+/** Mock:创建一个新画布 */
+export async function createCanvas(req: CreateCanvasRequest): Promise<CanvasListItem> {
+  const now = Date.now();
+  const item: CanvasListItem = {
+    id: `canvas_${now}_${Math.random().toString(36).slice(2, 7)}`,
+    name: req.name,
+    nodeCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+  mockCanvases.set(item.id, item);
+  return item;
+}
+
+/** Mock:列画布 */
+export async function listCanvases(page = 1, pageSize = 50): Promise<CanvasListItem[]> {
+  return Array.from(mockCanvases.values()).slice((page - 1) * pageSize, page * pageSize);
+}
 
 export async function createNode(req: CreateCanvasNodeRequest): Promise<CanvasNode> {
   const now = Date.now();
@@ -65,14 +133,4 @@ export async function getTask(_taskId: string): Promise<GenerateCanvasNodeRespon
     text: '这里是 mock 的轮询响应。',
     creditsEstimated: 0.2,
   };
-}
-
-function defaultTitle(type: CreateCanvasNodeRequest['type']) {
-  const titles = {
-    text: '文本节点',
-    image: '图片节点',
-    video: '视频节点',
-    audio: '音频节点',
-  } satisfies Record<CreateCanvasNodeRequest['type'], string>;
-  return titles[type];
 }

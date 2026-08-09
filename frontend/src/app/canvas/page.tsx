@@ -1,6 +1,11 @@
-import { ArrowRight, ChevronUp, CirclePlay, Plus } from 'lucide-react';
+'use client';
+
+import { ArrowRight, ChevronUp, CirclePlay, Plus, ImageIcon } from 'lucide-react';
 import Link from 'next/link';
+import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/home/Sidebar';
+import { canvasApi, type CanvasListItem } from '@/api/canvas';
 import { cn } from '@/lib/utils';
 
 const TUTORIALS = [
@@ -42,6 +47,36 @@ const COPY_WIDTH: Record<(typeof TUTORIALS)[number]['kind'], string> = {
 };
 
 export default function Page() {
+  const router = useRouter();
+  const [canvasHistory, setCanvasHistory] = useState<CanvasListItem[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
+
+  // 进入页面时拉画布列表
+  useEffect(() => {
+    setHistoryLoading(true);
+    canvasApi.listCanvases(1, 50)
+      .then((list) => setCanvasHistory(list))
+      .catch((err) => console.warn('[canvas-home] listCanvases failed:', err))
+      .finally(() => setHistoryLoading(false));
+  }, []);
+
+  // 「+ 新建」:每次点击都创建一个新画布(后端) → 跳到 /canvas/new 并带上 canvasId
+  const handleNewCanvas = async () => {
+    if (creating) return;
+    setCreating(true);
+    try {
+      const item = await canvasApi.createCanvas({ name: '未命名画布' });
+      // 带上 canvasId 让 /canvas/new 加载这个画布
+      router.push(`/canvas/new?canvasId=${encodeURIComponent(item.id)}`);
+    } catch (err) {
+      console.warn('[canvas-home] createCanvas failed, fallback to /canvas/new:', err);
+      router.push('/canvas/new');
+    } finally {
+      setCreating(false);
+    }
+  };
+
   return (
     <div className="min-h-screen pl-[72px]">
       <Sidebar />
@@ -67,21 +102,102 @@ export default function Page() {
 
           <section className="mt-10">
             <h2 className="text-xl font-bold">我的创作</h2>
-            <div className="mt-5">
-              <Link
-                href="/canvas/new"
-                className="group flex h-[230px] w-[230px] flex-col items-center justify-center rounded-lg border border-[#e0e2e7] bg-white text-[#16181d] shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)]"
-              >
-                <Plus className="h-8 w-8 text-[#8b909b] transition group-hover:text-[#4778ff]" />
-                <span className="mt-5 text-sm font-semibold">新建</span>
-              </Link>
-              <div className="mt-3 pl-2 text-sm font-semibold">开始创作</div>
+            <div className="mt-5 flex flex-wrap gap-5">
+              {/* "+ 新建" 卡片 - 每次点击都创建新画布 */}
+              <div>
+                <button
+                  type="button"
+                  onClick={handleNewCanvas}
+                  disabled={creating}
+                  className="group flex h-[230px] w-[230px] flex-col items-center justify-center rounded-lg border border-[#e0e2e7] bg-white text-[#16181d] shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)] disabled:cursor-wait disabled:opacity-60"
+                  title="新建画布（每次点击都创建一张新画布）"
+                  aria-label="新建画布"
+                >
+                  <Plus className="h-8 w-8 text-[#8b909b] transition group-hover:text-[#4778ff]" />
+                  <span className="mt-5 text-sm font-semibold">{creating ? '创建中...' : '新建'}</span>
+                </button>
+                <div className="mt-3 pl-2 text-sm font-semibold">开始创作</div>
+              </div>
+
+              {/* 已有画布列表(按创建时间倒序,最新在最前) */}
+              {historyLoading ? (
+                <div className="grid h-[230px] w-[230px] place-items-center rounded-lg border border-dashed border-[#e0e2e7] bg-white/60 text-xs text-[#a8b0bd]">
+                  加载中…
+                </div>
+              ) : canvasHistory.length === 0 ? (
+                <div className="grid h-[230px] w-[230px] place-items-center rounded-lg border border-dashed border-[#e0e2e7] bg-white/60 text-xs text-[#a8b0bd]">
+                  还没有创作，去点上方 + 新建一张吧
+                </div>
+              ) : (
+                canvasHistory.map((c) => (
+                  <CanvasCard
+                    key={c.id}
+                    item={c}
+                    onClick={() => router.push(`/canvas/new?canvasId=${encodeURIComponent(c.id)}`)}
+                  />
+                ))
+              )}
             </div>
           </section>
         </div>
       </main>
     </div>
   );
+}
+
+/**
+ * 单个画布卡片(我的创作列表用)
+ * - 缩略图优先用 item.thumbnail(后端有就给);没有就用占位
+ * - 标题:后端的 item.name 或 "未命名画布"
+ * - 时间:相对时间(刚刚/N分钟前/N小时前/yyyy-MM-dd)
+ */
+function CanvasCard({ item, onClick }: { item: CanvasListItem; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex w-[230px] flex-col rounded-lg border border-[#e0e2e7] bg-white text-left shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)]"
+      title={`打开画布: ${item.name || '未命名画布'}`}
+    >
+      <div className="relative h-[160px] w-full overflow-hidden rounded-t-lg bg-[#f3f5f8]">
+        {item.thumbnail ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={item.thumbnail}
+            alt={item.name || '未命名画布'}
+            className="h-full w-full object-cover transition group-hover:scale-[1.02]"
+          />
+        ) : (
+          <div className="grid h-full w-full place-items-center text-[#c8d2dd]">
+            <ImageIcon className="h-10 w-10" />
+            <span className="mt-1 text-[11px]">无预览</span>
+          </div>
+        )}
+      </div>
+      <div className="flex flex-col gap-1 p-3">
+        <div className="truncate text-sm font-semibold text-[#16181d]">
+          {item.name || '未命名画布'}
+        </div>
+        <div className="text-[11px] text-[#8a909b]">
+          {formatRelativeTime(item.updatedAt)}
+          {item.nodeCount != null && <> · {item.nodeCount} 个节点</>}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+/**
+ * 把毫秒时间戳格式化为 "刚刚/N分钟前/N小时前/yyyy-MM-dd"
+ */
+function formatRelativeTime(ms: number): string {
+  const now = Date.now();
+  const diff = now - ms;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 function TutorialCard({ item }: { item: (typeof TUTORIALS)[number] }) {

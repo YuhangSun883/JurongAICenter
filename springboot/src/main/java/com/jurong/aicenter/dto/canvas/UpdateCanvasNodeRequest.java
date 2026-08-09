@@ -1,10 +1,12 @@
 package com.jurong.aicenter.dto.canvas;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import lombok.Data;
 
 import java.util.List;
 
 @Data
+@JsonInclude(JsonInclude.Include.NON_NULL)
 public class UpdateCanvasNodeRequest {
     private String title;
     private String content;
@@ -13,7 +15,9 @@ public class UpdateCanvasNodeRequest {
     private Integer positionX;
     private Integer positionY;
 
-    /** 上游节点 ID 列表（前端传数组，后端存 JSON 字符串到 canvas_nodes.upstream_ids） */
-    private List<String> upstreamIds;
-    private List<String> downstreamIds;
+    /** 上游连接列表（多端口格式） */
+    private List<NodeConnection> upstreamIds;
+
+    /** 下游连接列表（多端口格式） */
+    private List<NodeConnection> downstreamIds;
 }
