@@ -43,6 +43,8 @@ export interface GenerateCanvasNodeRequest {
   prompt: string;
   content?: string;
   assetIds?: string[];
+  /** 2026-08-09:提示框中上传的素材节点 id 列表(换装场景) */
+  materialNodeIds?: string[];
   settings?: Record<string, unknown>;
 }
 
@@ -153,4 +155,8 @@ export const canvasApi = {
   /** 拿单个节点（刷新指定节点用，比如抽帧后刷新 video 节点 content） */
   getNode: (nodeId: string): Promise<CanvasNode> =>
     USE_MOCK ? mock.getNode(nodeId) : real.getNode(nodeId),
+
+  /** 删除画布（级联删节点 + 任务） */
+  deleteCanvas: (canvasId: string): Promise<{ canvasId: string; status: string }> =>
+    USE_MOCK ? mock.deleteCanvas(canvasId) : real.deleteCanvas(canvasId),
 };

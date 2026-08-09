@@ -57,6 +57,13 @@ export function getNode(nodeId: string): Promise<CanvasNode> {
   return request<CanvasNode>(`${API}/nodes/${nodeId}`);
 }
 
+/** 删除画布（后端级联删节点 + 任务） */
+export function deleteCanvas(canvasId: string): Promise<{ canvasId: string; status: string }> {
+  return request<{ canvasId: string; status: string }>(`${API}/canvases/${canvasId}`, {
+    method: 'DELETE',
+  });
+}
+
 /**
  * 本地上传文件到画布：自动建对应类型的画布节点。
  *
