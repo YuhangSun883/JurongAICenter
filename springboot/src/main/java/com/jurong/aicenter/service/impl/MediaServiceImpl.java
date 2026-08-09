@@ -1,6 +1,7 @@
 package com.jurong.aicenter.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.PageResult;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.media.MediaAssetDto;
@@ -25,6 +26,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -298,6 +300,52 @@ public class MediaServiceImpl implements MediaService {
 
     @Override
     @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse saveFavoriteAsAsset(Long userId, byte[] imageBytes, String mimeType, String displayName) {
+        if (imageBytes == null || imageBytes.length == 0) {
+            throw new BusinessException(ErrorCode.MEDIA_FILE_EMPTY);
+        }
+        long size = imageBytes.length;
+        checkSize("image", size);
+
+        String type = "image";
+        String ext = extractExtFromMime(mimeType);
+        String objectKey = buildObjectKey(userId, ext);
+
+        String url;
+        try (ByteArrayInputStream is = new ByteArrayInputStream(imageBytes)) {
+            url = storageService.uploadObject(objectKey, is, mimeType);
+        } catch (Exception e) {
+            log.error("Favorite save upload failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.MEDIA_UPLOAD_FAILED, e.getMessage());
+        }
+
+        Long aiLibId = libraryService.getAiLibrary(userId).getId();
+        // name 字段存储文件名，即 objectKey 的最后一部分 (e.g., 0f8d58d9e36e4721a5497e65f5000f71.png)
+        String name = objectKey.substring(objectKey.lastIndexOf('/') + 1);
+
+        MediaAsset asset = new MediaAsset();
+        asset.setUserId(userId);
+        asset.setLibraryId(aiLibId);
+        asset.setType(type);
+        asset.setSource("ai-generated");
+        asset.setName(name);
+        asset.setMimeType(mimeType);
+        asset.setSizeBytes(size);
+        asset.setObjectKey(objectKey);
+        asset.setSourceTool("favorite");
+        asset.setCreatedAt(LocalDateTime.now());
+        asset.setUpdatedAt(LocalDateTime.now());
+        assetRepository.insert(asset);
+
+        log.info("Favorite saved as asset: id={}, userId={}, libraryId={}, size={}, objectKey={}",
+            asset.getId(), userId, aiLibId, size, objectKey);
+
+        MediaLibrary lib = libraryRepository.selectById(aiLibId);
+        return toResponse(asset, lib != null ? lib.getName() : null);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
     public void deleteAssetsByLibrary(Long userId, Long libraryId) {
         LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
         wrapper.eq(MediaAsset::getUserId, userId).eq(MediaAsset::getLibraryId, libraryId);
@@ -310,6 +358,20 @@ public class MediaServiceImpl implements MediaService {
         }
         log.info("Cascade delete assets by library: userId={}, libraryId={}, count={}",
             userId, libraryId, assets.size());
+    }
+
+    @Override
+    public String lookupAiMediaObjectKey(Long userId, String sourceTaskId, String filename) {
+        if (userId == null || sourceTaskId == null || filename == null) return null;
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId)
+            .eq(MediaAsset::getSourceTaskId, sourceTaskId)
+            .eq(MediaAsset::getName, filename)
+            .eq(MediaAsset::getSource, "ai-generated")
+            .orderByDesc(MediaAsset::getId)
+            .last("LIMIT 1");
+        MediaAsset one = assetRepository.selectOne(wrapper);
+        return one != null ? one.getObjectKey() : null;
     }
 
     private boolean existsByNameInSameLibrary(Long userId, Long libraryId, String name, Long excludeAssetId) {
@@ -471,6 +533,22 @@ public class MediaServiceImpl implements MediaService {
             return "bin";
         }
         return filename.substring(dot + 1).toLowerCase();
+    }
+
+    private String extractExtFromMime(String mimeType) {
+        if (mimeType == null) return "bin";
+        String mime = mimeType.toLowerCase();
+        if (mime.contains("jpeg") || mime.contains("jpg")) return "jpg";
+        if (mime.contains("png")) return "png";
+        if (mime.contains("gif")) return "gif";
+        if (mime.contains("webp")) return "webp";
+        if (mime.contains("bmp")) return "bmp";
+        if (mime.contains("mp4")) return "mp4";
+        if (mime.contains("webm")) return "webm";
+        if (mime.contains("mp3")) return "mp3";
+        if (mime.contains("wav")) return "wav";
+        if (mime.contains("mpeg") || mime.contains("mpeg4")) return "mpeg";
+        return "bin";
     }
 
     private String buildObjectKey(Long userId, String ext) {

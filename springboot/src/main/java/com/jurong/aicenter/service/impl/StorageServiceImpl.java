@@ -14,13 +14,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-/**
- * MinIO 实现 - Phase 4 C 负责完整实现
- *
- * 当前是骨架代码。完整功能待 C 实现。
- */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -32,21 +30,37 @@ public class StorageServiceImpl implements StorageService {
     private String bucket;
 
     @Override
-    public String uploadFile(Long userId, Long jobId, String filename,
-                             InputStream input, String contentType) {
+    public UploadResult uploadAiMedia(Long userId, String ext, InputStream input, String contentType) {
+        String ym = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM"));
+        String suffix = (ext != null && !ext.isBlank()) ? ext : "bin";
+        if (suffix.startsWith(".")) {
+            suffix = suffix.substring(1);
+        }
+        String objectKey = String.format("media/%d/%s/%s.%s",
+            userId, ym, UUID.randomUUID().toString().replace("-", ""), suffix);
         try {
-            String objectKey = String.format("ai-platform/%d/%d/%s", userId, jobId, filename);
             minioClient.putObject(PutObjectArgs.builder()
                 .bucket(bucket)
                 .object(objectKey)
                 .stream(input, -1, 10 * 1024 * 1024)
                 .contentType(contentType)
                 .build());
-            return getPresignedUrl(objectKey, 24);
+            String url = getPresignedUrl(objectKey, 24);
+            return new UploadResult(objectKey, url);
         } catch (Exception e) {
-            log.error("MinIO upload failed: {}", e.getMessage());
+            log.error("MinIO uploadAiMedia failed: {}", e.getMessage());
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Upload failed: " + e.getMessage());
         }
+    }
+
+    @Override
+    public String uploadFile(Long userId, Long jobId, String filename,
+                             InputStream input, String contentType) {
+        // 保持旧接口签名，但存储路径统一改成 media/{userId}/{yyyy-MM}/{uuid}.{ext}
+        String ext = extractExt(filename);
+        UploadResult r = uploadAiMedia(userId, ext, input, contentType);
+        log.info("uploadFile (userId={}, jobId={}, filename={}) → {}", userId, jobId, filename, r.objectKey());
+        return r.url();
     }
 
     @Override
@@ -92,17 +106,18 @@ public class StorageServiceImpl implements StorageService {
         }
     }
 
-    /**
-     * 暴露 MinioClient 实例，供其他服务使用（如列出对象列表）
-     */
     public io.minio.MinioClient getMinioClient() {
         return minioClient;
     }
 
-    /**
-     * 暴露 bucket 名称
-     */
     public String getBucket() {
         return bucket;
+    }
+
+    private String extractExt(String filename) {
+        if (filename == null) return "bin";
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return "bin";
+        return filename.substring(dot + 1).toLowerCase();
     }
 }

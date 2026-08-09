@@ -68,6 +68,12 @@ public class MediaController {
 
     // ==================== 资产库（资产库列表） ====================
 
+    @GetMapping("/libraries")
+    public List<MediaLibraryResponse> listLibraries(@AuthenticationPrincipal AuthenticatedUser user) {
+        requireUser(user);
+        return mediaLibraryService.listLibraries(user.id());
+    }
+
     @GetMapping("/assets")
     public PageResult<MediaAssetResponse> list(
             @AuthenticationPrincipal AuthenticatedUser user,

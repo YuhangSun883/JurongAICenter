@@ -11,29 +11,29 @@ import java.io.InputStream;
  *   - uploadFile: 把 ComfyUI 生成的产物上传到 MinIO，返回永久 URL
  *   - getPresignedUrl: 给前端可访问的 URL
  *
- * Bucket 结构建议：ai-platform/{user_id}/{job_id}/{filename}
+ * Bucket 结构：
+ *   - AI 生成产物 / 收藏图片：media/{userId}/{yyyy-MM}/{uuid}.{ext}
+ *   - 用户自行上传素材：media/{userId}/{yyyy-MM}/{uuid}.{ext}
+ *   （两类统一用 media/ 路径，与"我的资产"目录保持一致）
  */
 public interface StorageService {
 
     /**
-     * 上传文件到 MinIO
-     * @param userId  用户 ID（用于组织路径）
-     * @param jobId   任务 ID（用于组织路径）
-     * @param filename 原始文件名
-     * @param input    文件输入流
-     * @param contentType MIME type (image/png, video/mp4, ...)
-     * @return 公开可访问的 URL
+     * 上传文件到 MinIO（AI 生成产物路径）
+     * 路径规则：media/{userId}/{yyyy-MM}/{uuid}.{ext}
+     *
+     * @return UploadResult 包含 objectKey 和访问 URL
+     */
+    UploadResult uploadAiMedia(Long userId, String ext, InputStream input, String contentType);
+
+    /**
+     * 上传文件到 MinIO（兼容旧接口，内部仍走 media/ 路径）
      */
     String uploadFile(Long userId, Long jobId, String filename,
                       InputStream input, String contentType);
 
     /**
-     * 自定义 objectKey 上传（用于非 (userId, jobId, filename) 标准路径的场景，
-     * 例如画布节点异步任务用 UUID 字符串做 key）
-     * @param objectKey  完整对象 key（如 "canvas/{taskId}/{filename}"）
-     * @param input      文件输入流
-     * @param contentType MIME type
-     * @return 公开可访问的 URL
+     * 自定义 objectKey 上传
      */
     String uploadObject(String objectKey, InputStream input, String contentType);
 
@@ -42,11 +42,10 @@ public interface StorageService {
      */
     void deleteFile(String objectKey);
 
-    /**
-     * C7 - 生成可访问的预签名 URL
-     * @param objectKey  对象 key（如 "ai-platform/3/1/photo.png"）
-     * @param expiryHours 过期时间（小时）
-     * @return 24h 有效期内可访问的 URL
-     */
     String getPresignedUrl(String objectKey, int expiryHours);
+
+    /**
+     * uploadAiMedia 的返回体
+     */
+    record UploadResult(String objectKey, String url) {}
 }

@@ -1,7 +1,7 @@
 // 用户提示词 API
 import * as real from './prompt.real';
 
-export type { SavePromptParams, UserPromptResult } from './prompt.real';
+export type { SavePromptParams, UpdatePromptParams, UserPromptResult } from './prompt.real';
 
 export const promptApi = {
   /**
@@ -9,6 +9,12 @@ export const promptApi = {
    */
   savePrompt: (params: import('./prompt.real').SavePromptParams) =>
     real.savePrompt(params),
+
+  /**
+   * 编辑提示词
+   */
+  updatePrompt: (id: number, params: import('./prompt.real').UpdatePromptParams) =>
+    real.updatePrompt(id, params),
 
   /**
    * 获取当前用户的所有提示词

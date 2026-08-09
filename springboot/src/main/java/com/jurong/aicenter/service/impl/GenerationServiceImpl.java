@@ -489,10 +489,18 @@ public class GenerationServiceImpl implements GenerationService {
                 // 通过 ComfyUI /view 接口下载
                 try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, "output")) {
                     String contentType = inferContentType(filename, "video");
-                    String url = storageService.uploadFile(
-                        job.getUserId(), job.getId(), filename, is, contentType);
-                    urls.add(url);
-                    log.info("job {} uploaded video {} → {}", job.getId(), filename, url);
+                    String ext = extractExt(filename);
+                    StorageService.UploadResult up = storageService.uploadAiMedia(
+                        job.getUserId(), ext, is, contentType);
+                    urls.add(up.url());
+                    log.info("job {} uploaded video {} → {}", job.getId(), filename, up.objectKey());
+                    try {
+                        mediaService.recordAiGenerated(
+                            job.getUserId(), "video", filename, contentType, 0L,
+                            up.objectKey(), "video", String.valueOf(job.getId()));
+                    } catch (Exception e) {
+                        log.warn("recordAiGenerated failed for job {}: {}", job.getId(), e.getMessage());
+                    }
                 }
             } catch (Exception e) {
                 log.warn("job {} download/upload video failed for {}: {}", job.getId(), path, e.getMessage());
@@ -507,7 +515,6 @@ public class GenerationServiceImpl implements GenerationService {
     private void collectUiPaths(Job job, JsonNode ui, List<String> urls) {
         if (ui == null || !ui.isObject()) return;
 
-        // 视频路径在 ui.video_path 数组里
         JsonNode videoPathArr = ui.get("video_path");
         if (videoPathArr == null || !videoPathArr.isArray()) return;
 
@@ -517,12 +524,8 @@ public class GenerationServiceImpl implements GenerationService {
             if (path == null || path.isEmpty()) continue;
 
             try {
-                // 从路径提取文件名和 subfolder
-                // 路径格式: /app/output/jurong_videos/xxx.mp4
                 String filename = path.contains("/") ?
                     path.substring(path.lastIndexOf('/') + 1) : path;
-
-                // 从 /app/output/xxx/yyy.ext 提取 subfolder = xxx
                 String subfolder = "";
                 if (path.contains("/output/")) {
                     String afterOutput = path.substring(path.indexOf("/output/") + 8);
@@ -531,16 +534,21 @@ public class GenerationServiceImpl implements GenerationService {
                         subfolder = afterOutput.substring(0, lastSlash);
                     }
                 }
-
                 log.info("job {} downloading video from ComfyUI ui.video_path: filename={}, subfolder={}", job.getId(), filename, subfolder);
-
-                // 通过 ComfyUI /view 接口下载
                 try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, "output")) {
                     String contentType = inferContentType(filename, "video");
-                    String url = storageService.uploadFile(
-                        job.getUserId(), job.getId(), filename, is, contentType);
-                    urls.add(url);
-                    log.info("job {} uploaded video {} → {}", job.getId(), filename, url);
+                    String ext = extractExt(filename);
+                    StorageService.UploadResult up = storageService.uploadAiMedia(
+                        job.getUserId(), ext, is, contentType);
+                    urls.add(up.url());
+                    log.info("job {} uploaded video (ui) {} → {}", job.getId(), filename, up.objectKey());
+                    try {
+                        mediaService.recordAiGenerated(
+                            job.getUserId(), "video", filename, contentType, 0L,
+                            up.objectKey(), "video", String.valueOf(job.getId()));
+                    } catch (Exception e) {
+                        log.warn("recordAiGenerated failed for job {}: {}", job.getId(), e.getMessage());
+                    }
                 }
             } catch (Exception e) {
                 log.warn("job {} download/upload video failed for {}: {}", job.getId(), path, e.getMessage());
@@ -575,10 +583,18 @@ public class GenerationServiceImpl implements GenerationService {
                 log.info("job {} downloading video (top-level): filename={}, subfolder={}", job.getId(), filename, subfolder);
                 try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, "output")) {
                     String contentType = inferContentType(filename, "video");
-                    String url = storageService.uploadFile(
-                        job.getUserId(), job.getId(), filename, is, contentType);
-                    urls.add(url);
-                    log.info("job {} uploaded video (top-level) {}", job.getId(), url);
+                    String ext = extractExt(filename);
+                    StorageService.UploadResult up = storageService.uploadAiMedia(
+                        job.getUserId(), ext, is, contentType);
+                    urls.add(up.url());
+                    log.info("job {} uploaded video (top-level) {} → {}", job.getId(), filename, up.objectKey());
+                    try {
+                        mediaService.recordAiGenerated(
+                            job.getUserId(), "video", filename, contentType, 0L,
+                            up.objectKey(), "video", String.valueOf(job.getId()));
+                    } catch (Exception e) {
+                        log.warn("recordAiGenerated failed for job {}: {}", job.getId(), e.getMessage());
+                    }
                 }
             } catch (Exception e) {
                 log.warn("job {} download/upload video (top-level) failed for {}: {}", job.getId(), path, e.getMessage());
@@ -594,22 +610,20 @@ public class GenerationServiceImpl implements GenerationService {
             if (filename.isEmpty()) continue;
             String subfolder = item.path("subfolder").asText("");
             String type = item.path("type").asText("output");
-            // ComfyUI 的 type 字段是 output/input/temp，不是 MIME
             String contentType = inferContentType(filename, mediaKind);
 
             try (InputStream is = comfyUIClient.downloadStream(filename, subfolder, type)) {
-                String url = storageService.uploadFile(
-                    job.getUserId(), job.getId(), filename, is, contentType);
-                urls.add(url);
-                log.info("job {} uploaded {} → {}", job.getId(), filename, url);
+                String ext = extractExt(filename);
+                StorageService.UploadResult up = storageService.uploadAiMedia(
+                    job.getUserId(), ext, is, contentType);
+                urls.add(up.url());
+                log.info("job {} uploaded {} → {}", job.getId(), filename, up.objectKey());
 
                 // V8 资产库：AI 完成的素材自动写入 "AI 生成结果" 库
-                String objectKey = String.format("ai-platform/%d/%d/%s",
-                    job.getUserId(), job.getId(), filename);
                 try {
                     mediaService.recordAiGenerated(
                         job.getUserId(), mediaKind, filename, contentType, 0L,
-                        objectKey, "video", String.valueOf(job.getId()));
+                        up.objectKey(), mediaKind, String.valueOf(job.getId()));
                 } catch (Exception e) {
                     log.warn("recordAiGenerated failed for job {}: {}", job.getId(), e.getMessage());
                 }
@@ -633,6 +647,13 @@ public class GenerationServiceImpl implements GenerationService {
         if (lower.endsWith(".wav")) return "audio/wav";
         if (lower.endsWith(".ogg")) return "audio/ogg";
         return "application/octet-stream";
+    }
+
+    private String extractExt(String filename) {
+        if (filename == null) return "bin";
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return "bin";
+        return filename.substring(dot + 1).toLowerCase();
     }
 
     private void markCompleted(Job job, List<String> resultUrls) {
@@ -666,7 +687,8 @@ public class GenerationServiceImpl implements GenerationService {
     /**
      * C8 - 取得任务产物的可访问 URL（24h 签名）。
      * 先做鉴权（getJob 已做），再校验状态必须是 COMPLETED。
-     * object key 拼成 ai-platform/{userId}/{jobId}/{filename}（与 uploadFile 一致）。
+     * AI 产物已统一存到 media/{userId}/{yyyy-MM}/{uuid}.{ext}，
+     * 因此不再按 ai-platform/{userId}/{jobId}/{filename} 拼路径，而是通过资产库按 (userId, sourceTaskId=jobId, name=filename) 反查 objectKey。
      */
     @Override
     public String getResultUrl(Long jobId, Long userId, String filename) {
@@ -678,8 +700,13 @@ public class GenerationServiceImpl implements GenerationService {
         if (filename == null || filename.contains("..") || filename.contains("/")) {
             throw new BusinessException(ErrorCode.INVALID_PARAM, "非法的 filename");
         }
-        String objectKey = String.format("ai-platform/%d/%d/%s",
-            job.getUserId(), job.getId(), filename);
+        // 通过 MediaAsset 表精确查找本次 job 下该文件名的 objectKey
+        String objectKey = mediaService.lookupAiMediaObjectKey(userId, String.valueOf(job.getId()), filename);
+        if (objectKey == null) {
+            // 向后兼容：万一有历史残留的老路径数据，再尝试老路径一次
+            objectKey = String.format("ai-platform/%d/%d/%s", job.getUserId(), job.getId(), filename);
+            log.warn("getResultUrl fallback to legacy path: {}", objectKey);
+        }
         return storageService.getPresignedUrl(objectKey, 24);
     }
 
