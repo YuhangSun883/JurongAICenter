@@ -1,6 +1,7 @@
 package com.jurong.aicenter.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.PageResult;
 import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
@@ -97,21 +98,6 @@ public class MediaServiceImpl implements MediaService {
         Map.of("key", "animal", "label", "动物")
     );
 
-    /** 11 个标准角色分类（同事保留） */
-    private static final List<Map<String, String>> CATEGORIES = List.of(
-        Map.of("key", "face", "label", "逼真人脸"),
-        Map.of("key", "urban-blue", "label", "都市蓝领"),
-        Map.of("key", "urban-silver", "label", "都市银发"),
-        Map.of("key", "kids", "label", "儿童"),
-        Map.of("key", "mom", "label", "精致妈妈"),
-        Map.of("key", "town-young", "label", "小镇青年"),
-        Map.of("key", "town-mid", "label", "小镇中老年"),
-        Map.of("key", "fantasy", "label", "二次元"),
-        Map.of("key", "chinese", "label", "国风"),
-        Map.of("key", "fashion", "label", "时尚模特"),
-        Map.of("key", "animal", "label", "动物")
-    );
-
     // ==================== 素材 ====================
 
     @Override
@@ -145,11 +131,11 @@ public class MediaServiceImpl implements MediaService {
             .map(asset -> toResponse(asset, libraryNameMap.get(asset.getLibraryId())))
             .toList();
 
-        return new PageResult<>(items, total == null ? 0L : total, page, size);
+        return new PageResult<>(items, mpPage.getTotal(), page, size);
     }
 
     @Override
-    public MediaAssetDto getAsset(Long userId, Long assetId) {
+    public MediaAssetResponse getAsset(Long userId, Long assetId) {
         MediaAsset asset = mustGetOwnedAsset(userId, assetId);
         String libraryName = null;
         if (asset.getLibraryId() != null) {
@@ -346,18 +332,6 @@ public class MediaServiceImpl implements MediaService {
         return asset;
     }
 
-    /** 同用户 + 同一 libraryId 下的同名素材数量（排除自己） */
-    private boolean existsByNameInSameLibrary(Long userId, Long libraryId, String name, Long excludeAssetId) {
-        Long count = assetRepository.selectCount(
-            new LambdaQueryWrapper<MediaAsset>()
-                .eq(MediaAsset::getUserId, userId)
-                .eq(MediaAsset::getLibraryId, libraryId)
-                .eq(MediaAsset::getName, name)
-                .ne(MediaAsset::getId, excludeAssetId)
-        );
-        return count != null && count > 0;
-    }
-
     private Long resolveLibraryId(Long userId, Long libraryId) {
         if (libraryId != null) {
             MediaLibrary lib = libraryRepository.selectById(libraryId);
@@ -366,7 +340,7 @@ public class MediaServiceImpl implements MediaService {
             }
             return libraryId;
         }
-        return libraryService.getUploadLibrary(userId).getId();
+        return libraryService.getOrCreateUploadLibrary(userId).getId();
     }
 
     private Map<Long, String> batchLoadLibraryNames(Long userId, List<MediaAsset> assets) {
@@ -417,17 +391,6 @@ public class MediaServiceImpl implements MediaService {
             return storageService.getPresignedUrl(objectKey, 24);
         } catch (Exception e) {
             log.warn("Generate presigned URL failed for object {}: {}", objectKey, e.getMessage());
-            return null;
-        }
-    }
-
-    /** 拼预签名 URL，失败兜底返回 null */
-    private String presign(String objectKey) {
-        if (objectKey == null || objectKey.isBlank()) return null;
-        try {
-            return storageService.getPresignedUrl(objectKey, 24);
-        } catch (Exception e) {
-            log.warn("PresignGet failed: {}", objectKey, e);
             return null;
         }
     }

@@ -1,12 +1,14 @@
 package com.jurong.aicenter.controller;
 
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.VideoGenerationService;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -38,11 +40,12 @@ import java.io.IOException;
  *   <li>{@code DELETE /api/jobs/{id}} 取消/删除任务</li>
  * </ul>
  */
-@Slf4j
 @RestController
 @RequestMapping("/api/video")
 @RequiredArgsConstructor
 public class VideoGenerationController {
+    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
+    private static final Logger log = LoggerFactory.getLogger(VideoGenerationController.class);
 
     private final VideoGenerationService videoGenerationService;
 

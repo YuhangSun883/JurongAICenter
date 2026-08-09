@@ -48,21 +48,4 @@ public interface MediaService {
                            String sourceTool, String sourceTaskId);
 
     void deleteAssetsByLibrary(Long userId, Long libraryId);
-
-    // ==================== 角色库（同事保留，给画布/Agent 用） ====================
-
-    /**
-     * 拉所有角色分类（用于前端下拉）
-     */
-    List<Map<String, String>> listCategories();
-
-    /**
-     * 按分类拉角色列表
-     */
-    List<MediaRoleDto> listRolesByCategory(String category);
-
-    /**
-     * 拉全部角色（不分页，量小）
-     */
-    List<MediaRoleDto> listAllRoles();
 }

@@ -41,4 +41,17 @@ public class CanvasListItem {
             : c.getUpdatedAt().toInstant(ZoneOffset.UTC).toEpochMilli();
         return r;
     }
+
+    /**
+     * 2026-08-09 新增：缩略图 fallback 版本
+     * <p>当 canvas.thumbnail 为空时,调用方传入 fallbackThumb 覆盖（取自画布第一个 image/video 节点的 resultUrl）。</p>
+     * <p>调用方不传 fallbackThumb（传 null）则行为跟 {@link #from(Canvas, int)} 一致。</p>
+     */
+    public static CanvasListItem from(com.jurong.aicenter.entity.Canvas c, int nodeCount, String fallbackThumb) {
+        CanvasListItem r = from(c, nodeCount);
+        if ((r.thumbnail == null || r.thumbnail.isEmpty()) && fallbackThumb != null && !fallbackThumb.isEmpty()) {
+            r.thumbnail = fallbackThumb;
+        }
+        return r;
+    }
 }
