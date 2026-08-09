@@ -120,6 +120,15 @@ export function MediaPickerDialog({
     })();
   }, [open, initialTab]);
 
+  /** 标签 → 类型映射（提到 useEffect 之前，避免引用未定义） */
+  const tabToType: Record<typeof TABS[number], string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
+  /** 源 → API 字段映射（提到 useEffect 之前） */
+  function sourceToApiSource(s: typeof SOURCES[number]): string | undefined {
+    if (s === '我上传的') return 'uploaded';
+    if (s === 'AI生成的') return 'ai-generated';
+    return undefined;
+  }
+
   // 拉素材（库 + 类型 + 来源 + 关键词 + 页码变化时）
   useEffect(() => {
     if (!open) return;
@@ -155,7 +164,6 @@ export function MediaPickerDialog({
 
   // ============ 派生 ============
   const showUploadedHere = activeTopTab === 'assets' && (source === '全部' || source === '我上传的');
-  const tabToType: Record<typeof TABS[number], string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
   const visiblePickedCount =
     (showUploadedHere ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id)).length : 0) +
     (activeTopTab === 'assets'
@@ -163,12 +171,6 @@ export function MediaPickerDialog({
       : roles.filter((r) => pickedIds.has(String(r.id))).length);
 
   if (!open || !mounted) return null;
-
-  function sourceToApiSource(s: typeof SOURCES[number]): string | undefined {
-    if (s === '我上传的') return 'uploaded';
-    if (s === 'AI生成的') return 'ai-generated';
-    return undefined;
-  }
 
   function toggle(id: string) {
     setPickedIds((s) => {
@@ -415,6 +417,7 @@ function AssetsView({
 }) {
   const tabToType: Record<typeof tab, string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
   const showUploaded = source === '全部' || source === '我上传的';
+  const PAGE_SIZE = 24;
 
   return (
     <>

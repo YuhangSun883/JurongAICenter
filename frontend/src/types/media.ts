@@ -5,28 +5,32 @@ export type LibraryType = 'system-uploaded' | 'system-ai' | 'custom';
 export interface MediaLibrary {
   id: number;
   name: string;
-  type: LibraryType;
+  type: LibraryType | string;
   iconKey?: string;
   description?: string;
   sortOrder?: number;
   assetCount?: number;
-  createdAt?: string;
-  updatedAt?: string;
+  createdAt?: string | number;
+  updatedAt?: string | number;
 }
 
 export interface MediaItem {
   id: number;
-  libraryId?: number;
+  libraryId?: number | null;
   libraryName?: string;
   type: MediaType;
   source: MediaSource;
   url: string;
   name: string;
   mimeType?: string;
+  /** 后端字段 sizeBytes，前端可兼容 size */
   size?: number;
+  sizeBytes?: number;
   width?: number;
   height?: number;
+  /** 后端字段 durationSec，前端可兼容 duration */
   duration?: number;
+  durationSec?: number;
   sourceTool?: string;
   sourceTaskId?: string;
   createdAt: string;
@@ -81,7 +85,7 @@ export interface MediaRole {
   imageUrl: string;
   description?: string;
   tags?: string[];
-  createdAt: number;
+  createdAt?: number;
 }
 
 export interface RoleListQuery {

@@ -18,11 +18,16 @@ import java.util.List;
 /**
  * 资产库 REST API。
  *
- * 端点列表：
- *   GET    /api/media/libraries        列出我的所有库（2 个系统库 + custom 库）
+ * <p>端点列表：
+ * <pre>
+ *   GET    /api/media/libraries        列出我的所有库 — 见 MediaController.listLibraries()
  *   POST   /api/media/libraries        新建 custom 库
  *   PATCH  /api/media/libraries/{id}   重命名（系统库不可改）
  *   DELETE /api/media/libraries/{id}   删除 custom 库（连素材一起删）
+ * </pre>
+ *
+ * <p>说明：GET 统一在 MediaController 里（那里也用到 libraries 列表）；
+ * 本 controller 只负责写操作（创建/重命名/删除），与 MediaController 不冲突。
  */
 @RestController
 @RequestMapping("/api/media/libraries")
@@ -30,12 +35,6 @@ import java.util.List;
 public class MediaLibraryController {
 
     private final MediaLibraryService libraryService;
-
-    @GetMapping
-    public List<MediaLibraryResponse> list(@AuthenticationPrincipal AuthenticatedUser user) {
-        requireUser(user);
-        return libraryService.listLibraries(user.id());
-    }
 
     @PostMapping
     public MediaLibraryResponse create(

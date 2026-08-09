@@ -2,7 +2,9 @@ package com.jurong.aicenter.controller;
 
 import com.jurong.aicenter.dto.PageResult;
 import com.jurong.aicenter.dto.media.BatchDeleteAssetsRequest;
+import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
+import com.jurong.aicenter.dto.media.MediaLibraryResponse;
 import com.jurong.aicenter.dto.media.MediaListQuery;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
 import com.jurong.aicenter.dto.media.MediaUploadResponse;
@@ -10,9 +12,11 @@ import com.jurong.aicenter.dto.media.PatchAssetRequest;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
+import com.jurong.aicenter.service.MediaLibraryService;
 import com.jurong.aicenter.service.MediaService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -29,12 +33,40 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 媒体资产 REST API（合并版：资产库 + 素材 + 角色库）
+ *
+ * <p>合并后的接口一览：
+ * <pre>
+ * 资产库
+ *   GET    /api/media/libraries            拉资产库列表（系统默认 + 自定义）
+ *
+ * 素材
+ *   GET    /api/media/assets               分页列表（按 userId 隔离，支持筛选）
+ *   GET    /api/media/assets/{id}          素材详情
+ *   POST   /api/media/assets               上传（multipart/form-data，libraryId 可选）
+ *   PATCH  /api/media/assets/{id}          改名（同库内重名校验）
+ *   DELETE /api/media/assets/{id}          删除（连 MinIO）
+ *   POST   /api/media/assets/batch-delete  批量删除
+ *
+ * 角色库（同事设计，给画布/Agent 用）
+ *   GET    /api/media/roles/categories     拉角色分类
+ *   GET    /api/media/roles                拉角色列表（支持 ?category=xxx）
+ * </pre>
+ *
+ * <p>说明：资产库的 CRUD（创建/重命名/删除）独立在 MediaLibraryController 里，
+ * 路径前缀 /api/media/libraries/*。
+ */
+@Slf4j
 @RestController
 @RequestMapping("/api/media")
 @RequiredArgsConstructor
 public class MediaController {
 
     private final MediaService mediaService;
+    private final MediaLibraryService mediaLibraryService;
+
+    // ==================== 资产库（资产库列表） ====================
 
     @GetMapping("/assets")
     public PageResult<MediaAssetResponse> list(
