@@ -3,6 +3,8 @@ package com.jurong.aicenter.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.PageResult;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
 import com.jurong.aicenter.dto.media.MediaListQuery;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
@@ -84,20 +86,21 @@ public class MediaServiceImpl implements MediaService {
         "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "text/html", "application/xhtml+xml", "image/svg+xml", "application/xml", "text/xml"
     );
-    private static final List<Map<String, String>> CATEGORIES = List.of(
-        Map.of("key", "face", "label", "逼真人脸"),
-        Map.of("key", "urban-blue", "label", "都市蓝领"),
-        Map.of("key", "urban-silver", "label", "都市银发"),
-        Map.of("key", "kids", "label", "儿童"),
-        Map.of("key", "mom", "label", "精致妈妈"),
-        Map.of("key", "town-young", "label", "小镇青年"),
-        Map.of("key", "town-mid", "label", "小镇中老年"),
-        Map.of("key", "fantasy", "label", "二次元"),
-        Map.of("key", "chinese", "label", "国风"),
-        Map.of("key", "fashion", "label", "时尚模特"),
-        Map.of("key", "animal", "label", "动物")
-    );
 
+    /** 11 涓爣鍑嗚鑹插垎绫伙紙鍚屼簨淇濈暀锛?*/
+    private static final List<Map<String, String>> CATEGORIES = List.of(
+        Map.of("key", "face", "label", "閫肩湡浜鸿劯"),
+        Map.of("key", "urban-blue", "label", "閮藉競钃濋"),
+        Map.of("key", "urban-silver", "label", "閮藉競閾跺彂"),
+        Map.of("key", "kids", "label", "鍎跨"),
+        Map.of("key", "mom", "label", "绮捐嚧濡堝"),
+        Map.of("key", "town-young", "label", "灏忛晣闈掑勾"),
+        Map.of("key", "town-mid", "label", "灏忛晣涓€佸勾"),
+        Map.of("key", "fantasy", "label", "二次元"),
+        Map.of("key", "chinese", "label", "鍥介"),
+        Map.of("key", "fashion", "label", "鏃跺皻妯＄壒"),
+        Map.of("key", "animal", "label", "鍔ㄧ墿")
+    );
 
     // ==================== 素材 ====================
 
@@ -392,6 +395,7 @@ public class MediaServiceImpl implements MediaService {
         }
         return asset;
     }
+
 
     private Long resolveLibraryId(Long userId, Long libraryId) {
         if (libraryId != null) {

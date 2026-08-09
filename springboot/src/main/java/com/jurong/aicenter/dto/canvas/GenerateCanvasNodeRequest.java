@@ -38,6 +38,19 @@ public class GenerateCanvasNodeRequest {
      */
     private List<NodeConnection> inputs;
 
+    /**
+     * 2026-08-09 补充:上游节点 id 列表(简单平铺版,前端发送的 assetIds)。
+     * 与 inputs 二选一;换装场景路由优先用这个。
+     */
+    private List<String> assetIds;
+
     /** 模型参数（temperature / size / duration 等），可空 */
     private Map<String, Object> settings;
+
+    /**
+     * 2026-08-09 新增:提示框中上传的素材 image 节点 id 列表。
+     * 换装场景: image 节点 + 有 materials + 有上游 image 输入 → 走 ClothingTransferService
+     * 其他场景: 忽略此字段,走正常生成流程
+     */
+    private List<String> materialNodeIds;
 }

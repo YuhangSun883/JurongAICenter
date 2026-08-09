@@ -94,4 +94,17 @@ public interface CanvasService {
 
     /** 任务状态查询（前端轮询用） */
     GenerateCanvasNodeResponse getTaskStatus(Long userId, String taskId);
+
+    /**
+     * 2026-08-09 新增:换装(clothing transfer)
+     * 从视频节点抽帧,每帧 + 3 张衣服参考图 → NewAPI /v1/images/edits,
+     * 生成 N 张"只换了衣服、主体/背景全不变"的图 + 1 张拼图。
+     *
+     * @param userId          当前用户
+     * @param videoNodeId     视频节点 ID
+     * @param clothingNodeIds 3 个衣服 image 节点的 id,顺序为[正面,背面,模特上身]
+     * @return 立刻返回 pending 状态,前端轮询 /tasks/{taskId}
+     */
+    GenerateCanvasNodeResponse transferClothing(Long userId, String videoNodeId,
+                                                List<String> clothingNodeIds);
 }

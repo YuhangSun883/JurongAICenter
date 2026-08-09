@@ -199,6 +199,29 @@ public class CanvasController {
         return canvasService.getTaskStatus(user.id(), taskId);
     }
 
+    /**
+     * 2026-08-09 新增:换装(clothing transfer)
+     * 路径参数:{id} = 视频节点 ID
+     * 请求 body:{"clothingNodeIds":["衣服正面节点ID","衣服背面节点ID","衣服模特上身节点ID"]}
+     * 返回:pending 状态的任务,前端轮询 /tasks/{taskId} 看进度
+     */
+    @PostMapping("/nodes/{id}/transfer-clothing")
+    public GenerateCanvasNodeResponse transferClothing(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable String id,
+            @RequestBody Map<String, Object> body) {
+        requireUser(user);
+        Object raw = body == null ? null : body.get("clothingNodeIds");
+        if (!(raw instanceof List)) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "clothingNodeIds 必须是数组");
+        }
+        List<String> clothingNodeIds = new java.util.ArrayList<>();
+        for (Object o : (List<?>) raw) {
+            if (o != null) clothingNodeIds.add(o.toString());
+        }
+        return canvasService.transferClothing(user.id(), id, clothingNodeIds);
+    }
+
     private void requireUser(AuthenticatedUser user) {
         if (user == null || user.id() == null) {
             throw new BusinessException(ErrorCode.UNAUTHORIZED);

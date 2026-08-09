@@ -1,5 +1,9 @@
 package com.jurong.aicenter.service.canvas;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jurong.aicenter.client.NewApiClient;
+import com.jurong.aicenter.dto.canvas.NodeConnection;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.entity.CanvasNode;
 import com.jurong.aicenter.entity.CanvasTask;
@@ -27,6 +31,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -93,6 +99,24 @@ public class VideoFrameCaptionService {
     // 错峰:每帧请求前加递增延迟,让 NewAPI 喘口气
     private static final long CAPTION_STAGGER_MS = 50;
     private final ObjectMapper objectMapper;
+
+    public VideoFrameCaptionService(VideoFrameExtractor extractor,
+                                    NewApiClient newApiClient,
+                                    StorageService storageService,
+                                    CanvasTaskRepository taskRepository,
+                                    CanvasNodeRepository nodeRepository,
+                                    @Qualifier("captionExecutor") Executor captionExecutor,
+                                    VideoFrameExtractor videoFrameExtractor,
+                                    ObjectMapper objectMapper) {
+        this.extractor = extractor;
+        this.newApiClient = newApiClient;
+        this.storageService = storageService;
+        this.taskRepository = taskRepository;
+        this.nodeRepository = nodeRepository;
+        this.captionExecutor = captionExecutor;
+        this.videoFrameExtractor = videoFrameExtractor;
+        this.objectMapper = objectMapper;
+    }
 
     /**
      * 异步入口。被 CanvasServiceImpl.extractAndCaption() 调用。
@@ -241,8 +265,25 @@ public class VideoFrameCaptionService {
                     captions.addAll(br);
                 }
 
+                // 2026-08-09 fix: VL 全部 batch 失败时,标 task FAILED 而不是 SUCCESS
+                // (之前 3 个 batch 全 503 但 task 还标 SUCCESS,导致空 text 节点,误导用户)
+                long failedCount = captions.stream()
+                    .filter(c -> "__FAILED__".equals(c.get("camera")))
+                    .count();
+                if (!captions.isEmpty() && failedCount == captions.size()) {
+                    failTask(task, node,
+                        "VL 视觉模型全部失败(" + failedCount + "/" + captions.size() + "),NewAPI 视觉模型不可达");
+                    log.error("[video-caption] taskId={} 全 {}/{} 帧 VL 失败,task 已标 FAILED",
+                        taskId, failedCount, captions.size());
+                    return;  // 跳出 handleExtractCaption,不再走 SUCCESS 路径
+                }
+                if (failedCount > 0) {
+                    log.warn("[video-caption] taskId={} 部分帧 VL 失败 {}/{},降级为 SUCCESS 包含 __FAILED__ 标记",
+                        taskId, failedCount, captions.size());
+                }
+
                 // 拼口播文案模板
-                content = assembleScript(frames, captions, dubMap);
+                content = assembleScript(frames, captions);
                 node.setContent(content);
                 task.setTextResult(content);
             } else {
@@ -335,11 +376,19 @@ public class VideoFrameCaptionService {
             return;
         }
 
+        CanvasNode frameGridNode = null;
         if (needFrames) {
-            createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            if (frameGridNode != null) {
+                connectNodes(videoNode, "frames", frameGridNode, "video");
+            }
         }
         if (needText) {
-            createScriptTextSidecar(videoNode, scriptText, needFrames, createdIds);
+            CanvasNode parent = needFrames && frameGridNode != null ? frameGridNode : videoNode;
+            CanvasNode textNode = createScriptTextSidecar(videoNode, scriptText, needFrames, createdIds);
+            if (textNode != null) {
+                connectNodes(parent, "text", textNode, needFrames ? "frames" : "video");
+            }
         }
     }
 
@@ -375,6 +424,7 @@ public class VideoFrameCaptionService {
 
         log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}",
             videoNode.getId(), node.getId());
+        return node;
     }
 
     /**
@@ -466,7 +516,7 @@ public class VideoFrameCaptionService {
      * 如果已经有帧网格(text 节点应该放在帧网格下方而不是同一行)，
      * 位置会下移一整行的距离。
      */
-    private void createScriptTextSidecar(CanvasNode videoNode, String scriptText,
+    private CanvasNode createScriptTextSidecar(CanvasNode videoNode, String scriptText,
                                           boolean hasFrameGrid, java.util.List<String> createdIds) {
         final int Y_STEP = 240;
         final int COLS = 4;
@@ -483,7 +533,9 @@ public class VideoFrameCaptionService {
         textNode.setUserId(videoNode.getUserId());
         textNode.setCanvasId(videoNode.getCanvasId());
         textNode.setType("text");
-        textNode.setTitle("口播文案");
+        textNode.setTitle("脚本拆解");
+        // 2026-08-09 15:08 恢复:脚本拆解生成的 text 节点,前端完整展示
+        //   content = assembleScript 输出的完整脚本(含【节奏】【ShotXX】+各帧运镜/动作)
         textNode.setContent(scriptText == null || scriptText.isBlank() ? "(空)" : scriptText);
         textNode.setPositionX(baseX);
         textNode.setPositionY(baseY + yOffset);
@@ -495,6 +547,82 @@ public class VideoFrameCaptionService {
 
         log.info("[video-sidecar-script] OK: videoNodeId={}, textNodeId={}, hasFrameGrid={}",
             videoNode.getId(), textNode.getId(), hasFrameGrid);
+        return textNode;
+    }
+
+    private void connectNodes(CanvasNode from, String fromPort, CanvasNode to, String toPort) {
+        if (from == null || to == null) {
+            return;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        from.setDownstreamIds(appendConnection(from.getDownstreamIds(), new NodeConnection(fromPort, to.getId())));
+        from.setUpdatedAt(now);
+        nodeRepository.updateById(from);
+
+        to.setUpstreamIds(appendConnection(to.getUpstreamIds(), new NodeConnection(toPort, from.getId())));
+        to.setUpdatedAt(now);
+        nodeRepository.updateById(to);
+    }
+
+    private String appendConnection(String rawJson, NodeConnection conn) {
+        if (conn == null || conn.getNodeId() == null || conn.getNodeId().isBlank()) {
+            return rawJson;
+        }
+        List<NodeConnection> conns = new ArrayList<>();
+        if (rawJson != null && !rawJson.isBlank()) {
+            conns.addAll(parseConnections(rawJson));
+        }
+        boolean exists = conns.stream().anyMatch(c ->
+            c != null
+                && conn.getNodeId().equals(c.getNodeId())
+                && ((conn.getPort() == null && c.getPort() == null)
+                || (conn.getPort() != null && conn.getPort().equals(c.getPort()))));
+        if (!exists) {
+            conns.add(conn);
+        }
+        return serializeConnections(conns);
+    }
+
+    private List<NodeConnection> parseConnections(String json) {
+        if (json == null || json.isBlank()) {
+            return Collections.emptyList();
+        }
+        try {
+            List<NodeConnection> parsed = objectMapper.readValue(json, new TypeReference<List<NodeConnection>>() {});
+            return parsed == null ? Collections.emptyList() : parsed;
+        } catch (Exception e) {
+            try {
+                List<String> old = objectMapper.readValue(json, new TypeReference<List<String>>() {});
+                List<NodeConnection> converted = new ArrayList<>();
+                for (String id : old) {
+                    if (id != null && !id.isBlank()) {
+                        converted.add(new NodeConnection("default", id));
+                    }
+                }
+                return converted;
+            } catch (Exception ignore) {
+                log.warn("[video-sidecar] parseConnections failed: {}", e.getMessage());
+                return Collections.emptyList();
+            }
+        }
+    }
+
+    private String serializeConnections(List<NodeConnection> conns) {
+        if (conns == null || conns.isEmpty()) {
+            return null;
+        }
+        List<NodeConnection> clean = conns.stream()
+            .filter(c -> c != null && c.getNodeId() != null && !c.getNodeId().isBlank())
+            .toList();
+        if (clean.isEmpty()) {
+            return null;
+        }
+        try {
+            return objectMapper.writeValueAsString(clean);
+        } catch (Exception e) {
+            log.warn("[video-sidecar] serializeConnections failed: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -601,6 +729,7 @@ public class VideoFrameCaptionService {
      *   ...
      */
     private String assembleScript(List<FrameMeta> frames, List<Map<String, String>> captions, Map<Integer, String> dubMap) {
+    
         StringBuilder sb = new StringBuilder();
         sb.append("【节奏】").append(frames.size()).append("s 视频节奏,每 1 秒一个镜头。\n");
         int successCount = 0;

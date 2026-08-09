@@ -8,6 +8,7 @@ import type {
   CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
+  UpdateCanvasRequest,
   UpdateCanvasNodeRequest,
   UploadToCanvasOptions,
 } from './canvas';
@@ -40,6 +41,14 @@ export function getTask(taskId: string): Promise<GenerateCanvasNodeResponse> {
 /** 创建一个新画布(返回 CanvasListItem 含新 canvas id) */
 export function createCanvas(req: CreateCanvasRequest): Promise<CanvasListItem> {
   return request<CanvasListItem>(`${API}/canvases`, { method: 'POST', body: req });
+}
+
+export function updateCanvas(canvasId: string, req: UpdateCanvasRequest): Promise<CanvasListItem> {
+  return request<CanvasListItem>(`${API}/canvases/${canvasId}`, { method: 'PATCH', body: req });
+}
+
+export async function deleteCanvas(canvasId: string): Promise<void> {
+  await request<{ canvasId: string; status: string }>(`${API}/canvases/${canvasId}`, { method: 'DELETE' });
 }
 
 /** 我的画布列表("我的创作"侧边面板用) */

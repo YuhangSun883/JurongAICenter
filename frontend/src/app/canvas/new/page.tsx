@@ -45,6 +45,7 @@ type ToolId = 'select' | 'hand' | 'component' | 'template' | 'history' | 'help';
 interface CanvasViewNode {
   id: string;
   type: CanvasNodeType;
+  title?: string;
   x: number;
   y: number;
   content?: string;
@@ -53,10 +54,71 @@ interface CanvasViewNode {
   prompt?: string;
 }
 
+/** API 返回的 CanvasNode → 本地视图节点（加 x/y，补默认值） */
+function toViewNode(n: CanvasNode): CanvasViewNode {
+  return {
+    id: n.id,
+    type: n.type,
+    title: n.title,
+    content: n.content,
+    resultUrl: n.resultUrl,
+    x: n.positionX ?? 0,
+    y: n.positionY ?? 0,
+    prompt: '',
+  };
+}
+
 interface CanvasEdge {
   id: string;
   from: string;
   to: string;
+}
+
+function normalizeCanvasNodes(rawNodes: Array<{
+  id: string;
+  type: CanvasNodeType;
+  x?: number;
+  y?: number;
+  positionX?: number;
+  positionY?: number;
+  content?: string;
+  resultUrl?: string;
+  prompt?: string;
+}> | null | undefined): CanvasViewNode[] {
+  return (rawNodes ?? []).map((node) => ({
+    id: node.id,
+    type: node.type,
+    x: node.x ?? node.positionX ?? 0,
+    y: node.y ?? node.positionY ?? 0,
+    content: node.content,
+    resultUrl: node.resultUrl,
+    prompt: node.prompt ?? '',
+  }));
+}
+
+function normalizeCanvasEdges(rawEdges: Array<{
+  id?: string;
+  from?: string;
+  to?: string;
+  fromNode?: string;
+  toNode?: string;
+}> | null | undefined): CanvasEdge[] {
+  const seen = new Set<string>();
+  const result: CanvasEdge[] = [];
+  for (const edge of rawEdges ?? []) {
+    const from = edge.from ?? edge.fromNode;
+    const to = edge.to ?? edge.toNode;
+    if (!from || !to) continue;
+    const id = edge.id ?? `edge_${from}_${to}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    result.push({ id, from, to });
+  }
+  return result;
+}
+
+function isUserCanvas(item: import('@/api/canvas').CanvasListItem) {
+  return item.id !== 'mock_canvas_default' && item.name !== '\u9ed8\u8ba4\u753b\u5e03' && item.name !== '\u699b\u6a3f\ue17b\u9422\u8bf2\u7af7';
 }
 
 interface AddMenuState {
@@ -115,6 +177,7 @@ export default function NewCanvasPage() {
   // 当前画布 ID:首次访问 /canvas/new 时为 null,用户点"+新建"或从历史打开画布后会被设置
   // 之后 createNode / upload 等操作会带上这个 canvasId
   const [canvasId, setCanvasId] = useState<string | null>(null);
+  const [canvasLoadState, setCanvasLoadState] = useState<'idle' | 'loading' | 'loaded' | 'failed'>('idle');
   const searchParams = useSearchParams();
 
   // 从 URL ?canvasId=xxx 读画布 ID,有就调 getCanvasDetail 加载
@@ -125,12 +188,17 @@ export default function NewCanvasPage() {
     // 已经在加载这个画布了就不重复
     if (canvasId === urlCanvasId) return;
     setCanvasId(urlCanvasId);
+    setCanvasLoadState('loading');
     void canvasApi.getCanvasDetail(urlCanvasId)
       .then((detail) => {
-        if (detail?.nodes) setNodes(detail.nodes);
-        if (detail?.edges) setEdges(detail.edges);
+        setNodes(normalizeCanvasNodes(detail?.nodes));
+        setEdges(normalizeCanvasEdges(detail?.edges));
+        setCanvasLoadState('loaded');
       })
-      .catch((err) => console.warn('[canvas-new] load from URL failed:', err));
+      .catch((err) => {
+        console.warn('[canvas-new] load from URL failed:', err);
+        setCanvasLoadState('failed');
+      });
   }, [searchParams, canvasId]);
   const [addMenu, setAddMenu] = useState<AddMenuState | null>(null);
   const [nodes, setNodes] = useState<CanvasViewNode[]>([]);
@@ -171,7 +239,7 @@ export default function NewCanvasPage() {
     setHistoryLoading(true);
     try {
       const list = await canvasApi.listCanvases(1, 50);
-      setCanvasHistory(list);
+      setCanvasHistory(list.filter(isUserCanvas));
     } catch (err) {
       console.warn('[canvas] listCanvases failed:', err);
       setCanvasHistory([]);
@@ -186,8 +254,8 @@ export default function NewCanvasPage() {
       const detail = await canvasApi.getCanvasDetail(canvasId);
       // 切换到该画布:设 canvasId + 用 detail.nodes/edges 覆盖本地 state
       setCanvasId(canvasId);
-      if (detail?.nodes) setNodes(detail.nodes);
-      if (detail?.edges) setEdges(detail.edges);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
     } catch (err) {
       console.warn('[canvas] getCanvasDetail failed:', err);
     }
@@ -198,29 +266,53 @@ export default function NewCanvasPage() {
 
   // 加载本地缓存的画布节点(刷新不丢，弥补后端没有 getCanvasDetail 入口时的本地持久化)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState !== 'failed') return;
     try {
-      const raw = localStorage.getItem('canvas_nodes');
+      const raw = localStorage.getItem(`canvas_nodes_${canvasId}`);
       if (raw) setNodes(JSON.parse(raw) as CanvasViewNode[]);
-      const rawEdges = localStorage.getItem('canvas_edges');
+      const rawEdges = localStorage.getItem(`canvas_edges_${canvasId}`);
       if (rawEdges) setEdges(JSON.parse(rawEdges) as CanvasEdge[]);
+      localStorage.removeItem('canvas_nodes');
+      localStorage.removeItem('canvas_edges');
     } catch { /* ignore */ }
-  }, []);
+  }, [canvasId, canvasLoadState]);
 
-  // 节点变化时写 localStorage(延迟 200ms 防抖，避免每次拖动都写盘)
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
     const t = setTimeout(() => {
-      localStorage.setItem('canvas_nodes', JSON.stringify(nodes));
+      localStorage.setItem(`canvas_nodes_${canvasId}`, JSON.stringify(nodes));
     }, 200);
     return () => clearTimeout(t);
-  }, [nodes]);
+  }, [nodes, canvasId, canvasLoadState]);
 
-  // 连线变化时写 localStorage
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    localStorage.setItem('canvas_edges', JSON.stringify(edges));
-  }, [edges]);
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
+    localStorage.setItem(`canvas_edges_${canvasId}`, JSON.stringify(edges));
+  }, [edges, canvasId, canvasLoadState]);
+
+  /**
+   * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
+   * 后端接口是 GET /api/canvas/canvases/{id}，canvasApi.getCanvasDetail 是封装。
+   * 如果当前没有 canvasId（极端情况），则仅刷新当前节点的 content。
+   */
+  const reloadCanvasFromBackend = async (anchorNodeId: string) => {
+    try {
+      // 1) 先拿 anchor 节点的 canvasId（local state 的 CanvasViewNode 没带 canvasId，必须后端查）
+      const nodeResp = await canvasApi.getNode(anchorNodeId);
+      const canvasId = nodeResp?.canvasId;
+      if (!canvasId) {
+        console.warn('[canvas] reloadCanvasFromBackend: node has no canvasId, skip');
+        return;
+      }
+      // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
+      const detail = await canvasApi.getCanvasDetail(canvasId);
+      setCanvasId(canvasId);
+      setNodes(normalizeCanvasNodes(detail?.nodes));
+      setEdges(normalizeCanvasEdges(detail?.edges));
+    } catch (err) {
+      console.warn('[canvas] reloadCanvasFromBackend failed:', err);
+    }
+  };
 
   /**
    * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
@@ -239,7 +331,7 @@ export default function NewCanvasPage() {
       // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
       const detail = await canvasApi.getCanvasDetail(canvasId);
       if (detail?.nodes) {
-        setNodes(detail.nodes);
+        setNodes(detail.nodes.map(toViewNode));
       }
       if (detail?.edges) {
         setEdges(detail.edges);
@@ -391,6 +483,7 @@ export default function NewCanvasPage() {
   const addNode = async (type: CanvasNodeType) => {
     const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
     const created = await canvasApi.createNode({
+      canvasId: canvasId ?? undefined,
       type,
       title: nodeTitle(type),
       upstreamIds: source ? [source.id] : undefined,
@@ -573,6 +666,8 @@ export default function NewCanvasPage() {
         prompt: nodePrompt,
         content: activeNode.content,
         assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
+        // 2026-08-09:提示框中上传的素材 id(换装场景用)
+        materialNodeIds: promptMaterials[activeNode.id]?.map((m) => m.id) ?? [],
       });
 
       // 2. 轮询任务状态（按节点类型分档超时）
@@ -583,7 +678,7 @@ export default function NewCanvasPage() {
       // 后端超时:NewApiClient.chatCompletion = 180s，imagePollTimeoutSec = 600s，videoPollTimeoutSec = 1200s
       const MAX_DURATION =
         activeNode.type === 'text'  ? 200_000 :
-        activeNode.type === 'image' ? 300_000 :
+        activeNode.type === 'image' ? 600_000 :  // 2026-08-09:换装需 5min+,原 300s 不够
         /* video */                  600_000;
       const start = Date.now();
       let lastResult = initial;
@@ -620,6 +715,22 @@ export default function NewCanvasPage() {
         // pending / running 继续轮询
       }
 
+      // 2026-08-09:超时后兑换底重试 1 次(换装经常刚好超时)
+      console.warn('[canvas] 轮询超时，最后兑换底重试 1 次 ...');
+      try {
+        lastResult = await canvasApi.getTask(initial.taskId);
+        if (lastResult.status === 'success' || lastResult.status === 'failed') {
+          // 走上面同个 success 分支逻辑可能不推，因为已经过了 while — 手动处理
+          if (lastResult.status === 'failed') {
+            setGenerateError(`生成失败：${(lastResult as any).message || (lastResult as any).failMessage || lastResult.status}`);
+          } else {
+            setGenerateError('后端已完成，但兑换底重试未拉取新节点。请刷新画布查看。');
+          }
+          return;
+        }
+      } catch (finalErr) {
+        console.error('[canvas] 兑换底重试也失败:', finalErr);
+      }
       setGenerateError('生成超时，请重试');
     } catch (err: any) {
       console.error('[canvas] generate error:', err);
@@ -658,11 +769,14 @@ export default function NewCanvasPage() {
           status?: string;
           text?: string;
           message?: string;
+          createdNodeIds?: string[];
         } = await fetch(`/api/canvas/tasks/${taskId}`, {
           credentials: 'include',
           headers: (() => {
             const t = getAccessToken();
-            return t ? { Authorization: `Bearer ${t}` } : {};
+            const headers: Record<string, string> = {};
+            if (t) headers.Authorization = `Bearer ${t}`;
+            return headers;
           })(),
         }).then((r) => r.json());
 
@@ -887,6 +1001,12 @@ export default function NewCanvasPage() {
               const item = await canvasApi.createCanvas({ name: '未命名画布' });
               setCanvasId(item.id);
               if (typeof window !== 'undefined') {
+                localStorage.removeItem(`canvas_nodes_${item.id}`);
+                localStorage.removeItem(`canvas_edges_${item.id}`);
+                if (canvasId) {
+                  localStorage.removeItem(`canvas_nodes_${canvasId}`);
+                  localStorage.removeItem(`canvas_edges_${canvasId}`);
+                }
                 localStorage.removeItem('canvas_nodes');
                 localStorage.removeItem('canvas_edges');
               }
@@ -983,6 +1103,9 @@ export default function NewCanvasPage() {
             onTextChange={(value) => updateNodeContent(node.id, value)}
             onOpenMenu={openNodeMenu}
             onStartLinkDrag={startLinkDrag}
+            onOpenExpanded={(target) => {
+              if (target.resultUrl) setExpandedImage({ url: target.resultUrl, title: nodeTitle(target.type) });
+            }}
             onContextMenu={(event) => {
               event.preventDefault();
               setActiveNodeId(node.id);
@@ -1003,6 +1126,7 @@ export default function NewCanvasPage() {
                 nodeY: node.y,
               });
             }}
+            onExpandImage={(image) => setExpandedImage(image)}
           />
         ))
       )}
@@ -1015,6 +1139,9 @@ export default function NewCanvasPage() {
           onChange={(value) => updateNodePrompt(activeNode.id, value)}
           onSubmit={requestGeneration}
           generating={generating}
+          onUploadMaterial={handleUploadMaterial}
+          uploading={uploading}
+          materials={promptMaterials[activeNode.id] ?? []}
         />
       )}
 
@@ -1242,8 +1369,10 @@ function CanvasNodeCard({
   onTextChange,
   onOpenMenu,
   onStartLinkDrag,
+  onOpenExpanded,
   onContextMenu,
   onDragStart,
+  onExpandImage,
 }: {
   node: CanvasViewNode;
   active: boolean;
@@ -1252,8 +1381,11 @@ function CanvasNodeCard({
   onTextChange: (value: string) => void;
   onOpenMenu: (node: CanvasViewNode, side: 'left' | 'right') => void;
   onStartLinkDrag: (node: CanvasViewNode, side: 'left' | 'right', event: PointerEvent<HTMLButtonElement>) => void;
+  onOpenExpanded: (node: CanvasViewNode) => void;
   onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
+  /** 双击图片节点放大查看 */
+  onExpandImage: (image: { url: string; title: string }) => void;
 }) {
   const isText = node.type === 'text';
 
@@ -1270,7 +1402,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: node.title || nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
     >
       {active && (
@@ -1350,7 +1482,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
               />
             </div>
@@ -1380,7 +1512,7 @@ function CanvasNodeCard({
                 }}
                 onDoubleClick={(e) => {
                   e.stopPropagation();
-                  setExpandedImage({ url: node.resultUrl!, title: nodeTitle(node.type) });
+                  onOpenExpanded(node);
                 }}
               />
             </div>
@@ -1416,6 +1548,9 @@ function PromptComposer({
   onChange,
   onSubmit,
   generating,
+  onUploadMaterial,
+  uploading,
+  materials,
 }: {
   node: CanvasViewNode;
   value: string;
@@ -1423,6 +1558,12 @@ function PromptComposer({
   onChange: (value: string) => void;
   onSubmit: () => void;
   generating?: boolean;
+  /** 点击上传素材: 调起文件选择器, 上传后会自动插入 material */
+  onUploadMaterial: () => void;
+  /** 上传中 flag */
+  uploading?: boolean;
+  /** 当前节点已上传的素材列表(包含缩略图 url) */
+  materials?: Array<{ id: string; url: string; name?: string }>;
 }) {
   const isText = node.type === 'text';
   const isImage = node.type === 'image';
@@ -1462,13 +1603,34 @@ function PromptComposer({
           <List className="h-4 w-4" />
         </div>
       )}
+      {/* 2026-08-09 新增:提示素材 chip 区(点上传按钮后填充) */}
+      {materials && materials.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-2 pt-2">
+          {materials.map((m, idx) => (
+            <div
+              key={m.id}
+              className="group relative flex h-12 w-12 items-center justify-center overflow-hidden rounded-md border border-[#dfe4ea] bg-[#f4f6fa]"
+              title={m.name ?? m.id}
+            >
+              {m.url ? (
+                <img src={m.url} alt={m.name ?? '素材'} className="h-full w-full object-cover" />
+              ) : (
+                <ImageIcon className="h-5 w-5 text-[#9aa6b7]" />
+              )}
+              <span className="absolute left-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-black/60 text-[10px] font-semibold leading-none text-white">
+                {idx + 1}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       <textarea
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         className={cn(
           'h-[118px] w-full resize-none bg-transparent pr-8 text-sm leading-6 text-[#4b5565] outline-none placeholder:text-[#606b7c]',
-          referenceCount > 0 && 'pl-[74px]'
+          (referenceCount > 0 || (materials && materials.length > 0)) && 'pl-[74px]'
         )}
       />
       <div className="absolute right-4 top-4 flex flex-col gap-5 text-[#9aa6b7]">
@@ -1492,8 +1654,14 @@ function PromptComposer({
         >
           <Expand className="h-4 w-4" />
         </button>
-        <button type="button" className="hover:text-[#2f78ff]" title="上传素材">
-          <Upload className="h-4 w-4" />
+        <button
+          type="button"
+          onClick={onUploadMaterial}
+          className="hover:text-[#2f78ff]"
+          title="上传素材"
+          disabled={uploading}
+        >
+          {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
         </button>
         <button type="button" className="hover:text-[#2f78ff]" title="参数列表">
           <List className="h-4 w-4" />

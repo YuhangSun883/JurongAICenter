@@ -1,5 +1,8 @@
 package com.jurong.aicenter.service.canvas;
 
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.client.ComfyUIClient;
@@ -8,7 +11,6 @@ import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.service.StorageService;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.UrlResource;
@@ -35,10 +37,12 @@ import java.util.Map;
  *
  * 严禁 mock / 占位 / placeholder URL。所有产物必须是真实 API 调用结果。
  */
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class RealCanvasAiService implements CanvasAiService {
+
+    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
+    private static final Logger log = LoggerFactory.getLogger(RealCanvasAiService.class);
 
     private final NewApiClient newApiClient;
     private final ComfyUIClient comfyUIClient;
@@ -201,18 +205,16 @@ public class RealCanvasAiService implements CanvasAiService {
     // ============= 视频生成（真 ComfyUI + 真 NewAPI 调用） =============
 
     @Override
-    public String generateVideo(String prompt, String imageUrl, String upstreamContent) {
-        // 分流：
-        //   - 有上游图片 → 走 NewAPI（图生视频）
-        //     原因：ComfyUI 的 /upload/image 端点不稳定（500 Server got itself in trouble），
-        //     且 NewAPI 本来就是图生视频的实际执行者，多绕一层 ComfyUI 没意义
-        //   - 无上游图片 → 走 ComfyUI workflow 02（纯文生视频，昨实验证可用）
-        if (imageUrl == null || imageUrl.isBlank()) {
-            return generateVideoViaComfyUI(prompt, null, upstreamContent);
+        public String generateVideo(String prompt, String imageUrl, String upstreamContent) {
+        // 2026-08-09:用户确认 ComfyUI 图生视频路径工作正常,统一走 ComfyUI
+        //   - 有上游图片 → workflow 03 (SVD),上传图作为起始帧
+        //   - 无上游图片 → workflow 02(纯文生视频,经验证可用)
+        String imageFilename = null;
+        if (imageUrl != null && !imageUrl.isBlank()) {
+            imageFilename = uploadImageToComfyUiInput(imageUrl);
         }
-        return generateVideoViaNewApi(prompt, imageUrl, upstreamContent);
+        return generateVideoViaComfyUI(prompt, imageFilename, upstreamContent);
     }
-
     /**
      * 图生视频：直接调 NewAPI /v1/videos，绕开 ComfyUI
      * 调用链：MinIO → 字节 → NewAPI → aicoming.top 视频模型 → URL → 下载 → MinIO
