@@ -70,6 +70,9 @@ public enum ErrorCode {
     MEDIA_ASSET_TYPE_INVALID(7011, "素材类型不支持"),
     MEDIA_ASSET_NAME_DUPLICATE(7012, "当前库内已存在同名素材"),
     MEDIA_UPLOAD_FAILED(7020, "文件上传失败"),
+    ASSET_UPLOAD_FAILED(7021, "素材上传失败（aicoming proxy）"),
+    ASSET_NOT_ACTIVE(7022, "素材未激活(aicoming proxy 返回 status=processing,请轮询等到 active)"),
+    ASSET_DELETE_FAILED(7023, "素材删除失败(aicoming proxy)"),
     MEDIA_FILE_TOO_LARGE(7021, "文件超过大小限制"),
     MEDIA_FILE_EMPTY(7022, "文件为空");
 

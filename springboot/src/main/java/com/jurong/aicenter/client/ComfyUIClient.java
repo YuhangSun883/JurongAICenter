@@ -1,10 +1,12 @@
 package com.jurong.aicenter.client;
 
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
@@ -37,10 +39,11 @@ import java.util.UUID;
  *
  * Phase 4 - C 负责实现
  */
-@Slf4j
 @Component
 @RequiredArgsConstructor
 public class ComfyUIClient {
+    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
+    private static final Logger log = LoggerFactory.getLogger(ComfyUIClient.class);
 
     private final WebClient.Builder webClientBuilder;
 
