@@ -1,6 +1,6 @@
 'use client';
 
-import { ArrowRight, ChevronUp, CirclePlay, Plus, ImageIcon } from 'lucide-react';
+import { ArrowRight, ChevronUp, CirclePlay, Plus, ImageIcon, Trash2 } from 'lucide-react';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -51,6 +51,8 @@ export default function Page() {
   const [canvasHistory, setCanvasHistory] = useState<CanvasListItem[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<CanvasListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   // 进入页面时拉画布列表
   useEffect(() => {
@@ -74,6 +76,22 @@ export default function Page() {
       router.push('/canvas/new');
     } finally {
       setCreating(false);
+    }
+  };
+
+  // 删除画布：先弹确认，确认后调 API，删完从本地列表里移除
+  const handleConfirmDelete = async () => {
+    if (!confirmDelete || deleting) return;
+    setDeleting(true);
+    try {
+      await canvasApi.deleteCanvas(confirmDelete.id);
+      setCanvasHistory((prev) => prev.filter((c) => c.id !== confirmDelete.id));
+      setConfirmDelete(null);
+    } catch (err) {
+      console.warn('[canvas-home] deleteCanvas failed:', err);
+      window.alert('删除失败: ' + (err instanceof Error ? err.message : '未知错误'));
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -134,6 +152,7 @@ export default function Page() {
                     key={c.id}
                     item={c}
                     onClick={() => router.push(`/canvas/new?canvasId=${encodeURIComponent(c.id)}`)}
+                    onRequestDelete={() => setConfirmDelete(c)}
                   />
                 ))
               )}
@@ -141,6 +160,68 @@ export default function Page() {
           </section>
         </div>
       </main>
+      {confirmDelete && (
+        <DeleteCanvasModal
+          target={confirmDelete}
+          deleting={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setConfirmDelete(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 删除画布确认弹窗 */
+function DeleteCanvasModal({
+  target,
+  deleting,
+  onConfirm,
+  onCancel,
+}: {
+  target: CanvasListItem;
+  deleting: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-[420px] rounded-xl bg-white p-6 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-2 flex items-center gap-2 text-[#16181d]">
+          <span className="grid h-8 w-8 place-items-center rounded-lg bg-red-50 text-red-500">
+            <Trash2 className="h-4 w-4" />
+          </span>
+          <h3 className="text-base font-semibold">确认删除画布</h3>
+        </div>
+        <p className="mt-1 text-sm leading-6 text-[#5f6876]">
+          画布 <span className="font-medium text-[#16181d]">「{target.name || '未命名画布'}」</span> 将被永久删除,包括其下的
+          {' '}{target.nodeCount ?? 0} 个节点。此操作不可撤销。
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={deleting}
+            className="rounded-md border border-[#e0e2e7] bg-white px-4 py-2 text-sm text-[#4f5969] transition hover:bg-[#f4f7fb] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+            className="rounded-md bg-red-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {deleting ? '删除中…' : '永久删除'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -151,12 +232,18 @@ export default function Page() {
  * - 标题:后端的 item.name 或 "未命名画布"
  * - 时间:相对时间(刚刚/N分钟前/N小时前/yyyy-MM-dd)
  */
-function CanvasCard({ item, onClick }: { item: CanvasListItem; onClick: () => void }) {
+function CanvasCard({ item, onClick, onRequestDelete }: {
+  item: CanvasListItem;
+  onClick: () => void;
+  onRequestDelete: () => void;
+}) {
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onClick}
-      className="group flex w-[230px] flex-col rounded-lg border border-[#e0e2e7] bg-white text-left shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)]"
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
+      className="group relative flex w-[230px] cursor-pointer flex-col rounded-lg border border-[#e0e2e7] bg-white text-left shadow-sm transition hover:border-[#c8d2ff] hover:shadow-[0_14px_30px_rgba(24,31,45,0.08)]"
       title={`打开画布: ${item.name || '未命名画布'}`}
     >
       <div className="relative h-[160px] w-full overflow-hidden rounded-t-lg bg-[#f3f5f8]">
@@ -173,6 +260,16 @@ function CanvasCard({ item, onClick }: { item: CanvasListItem; onClick: () => vo
             <span className="mt-1 text-[11px]">无预览</span>
           </div>
         )}
+        {/* 右上角删除按钮:hover 显示，点走弹窗 */}
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onRequestDelete(); }}
+          className="absolute right-2 top-2 grid h-7 w-7 place-items-center rounded-md bg-black/55 text-white opacity-0 transition hover:bg-red-500 group-hover:opacity-100"
+          title="删除画布"
+          aria-label="删除画布"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
       </div>
       <div className="flex flex-col gap-1 p-3">
         <div className="truncate text-sm font-semibold text-[#16181d]">
@@ -183,7 +280,7 @@ function CanvasCard({ item, onClick }: { item: CanvasListItem; onClick: () => vo
           {item.nodeCount != null && <> · {item.nodeCount} 个节点</>}
         </div>
       </div>
-    </button>
+    </div>
   );
 }
 

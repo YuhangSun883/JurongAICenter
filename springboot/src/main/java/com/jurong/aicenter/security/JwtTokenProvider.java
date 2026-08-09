@@ -1,10 +1,12 @@
 package com.jurong.aicenter.security;
 
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import io.jsonwebtoken.Claims;
 import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -14,9 +16,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
 
-@Slf4j
 @Component
 public class JwtTokenProvider {
+    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
+    private static final Logger log = LoggerFactory.getLogger(JwtTokenProvider.class);
 
     private final SecretKey key;
     private final Duration accessExpiry;

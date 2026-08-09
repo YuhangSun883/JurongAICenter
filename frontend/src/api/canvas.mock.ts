@@ -1,4 +1,5 @@
 import type {
+  CanvasDetail,
   CanvasListItem,
   CanvasNode,
   CanvasNodeType,
@@ -76,6 +77,15 @@ export async function listCanvases(page = 1, pageSize = 50): Promise<CanvasListI
   return Array.from(mockCanvases.values()).slice((page - 1) * pageSize, page * pageSize);
 }
 
+export async function deleteCanvas(canvasId: string): Promise<{ canvasId: string; status: string }> {
+  mockCanvases.delete(canvasId);
+  // 顺带删该画布的所有 mock 节点
+  for (const [id, n] of nodes.entries()) {
+    if (n.canvasId === canvasId) nodes.delete(id);
+  }
+  return { canvasId, status: 'deleted' };
+}
+
 export async function createNode(req: CreateCanvasNodeRequest): Promise<CanvasNode> {
   const now = Date.now();
   const node: CanvasNode = {
@@ -132,5 +142,37 @@ export async function getTask(_taskId: string): Promise<GenerateCanvasNodeRespon
     status: 'success',
     text: '这里是 mock 的轮询响应。',
     creditsEstimated: 0.2,
+  };
+}
+
+/**
+ * Mock 拉画布详情：返回空画布 + 空边
+ * 2026-08-09 补充：canvas.ts 里的 getCanvasDetail 调用需要 mock 实现
+ */
+export async function getCanvasDetail(_canvasId: string): Promise<CanvasDetail> {
+  const now = Date.now();
+  return {
+    id: _canvasId,
+    name: 'mock画布',
+    nodes: [],
+    edges: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Mock 拉单个节点：返回一个 placeholder 节点
+ * 2026-08-09 补充：canvas.ts 里的 getNode 调用需要 mock 实现
+ */
+export async function getNode(nodeId: string): Promise<CanvasNode> {
+  const now = Date.now();
+  return {
+    id: nodeId,
+    type: 'text',
+    title: 'mock 节点',
+    content: '',
+    createdAt: now,
+    updatedAt: now,
   };
 }

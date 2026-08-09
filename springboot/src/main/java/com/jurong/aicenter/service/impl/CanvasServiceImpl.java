@@ -18,6 +18,7 @@ import com.jurong.aicenter.service.MediaService;
 import com.jurong.aicenter.service.canvas.CanvasAiService;
 import com.jurong.aicenter.service.canvas.CanvasAsyncExecutor;
 import com.jurong.aicenter.service.canvas.VideoFrameCaptionService;
+import com.jurong.aicenter.service.canvas.ClothingTransferService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -59,6 +60,7 @@ public class CanvasServiceImpl implements CanvasService {
     private final MediaService mediaService;
     private final ObjectMapper objectMapper;
     private final VideoFrameCaptionService videoFrameCaptionService;
+    private final ClothingTransferService clothingTransferService;
 
     private static final String DEFAULT_CANVAS_NAME = "默认画布";
 
@@ -84,9 +86,31 @@ public class CanvasServiceImpl implements CanvasService {
             new LambdaQueryWrapper<CanvasNode>().in(CanvasNode::getCanvasId, canvasIds)
         ).stream().collect(Collectors.groupingBy(CanvasNode::getCanvasId, Collectors.counting()));
 
+        // 2.5) 2026-08-09 fix: 缩略图 fallback — canvas.thumbnail 为空时,
+        //     查每个画布第一个有 resultUrl 的 image/video 节点(按 createdAt 升序)作为封面
+        Map<String, String> thumbByCanvas = new java.util.HashMap<>();
+        if (!canvasIds.isEmpty()) {
+            List<CanvasNode> firstMedias = nodeRepository.selectList(
+                new LambdaQueryWrapper<CanvasNode>()
+                    .in(CanvasNode::getCanvasId, canvasIds)
+                    .in(CanvasNode::getType, "image", "video")
+                    .isNotNull(CanvasNode::getResultUrl)
+                    .ne(CanvasNode::getResultUrl, "")
+                    .orderByAsc(CanvasNode::getCanvasId, CanvasNode::getCreatedAt)
+            );
+            for (CanvasNode n : firstMedias) {
+                // 每 canvasId 只保留第一个（Map.putIfAbsent）
+                thumbByCanvas.putIfAbsent(n.getCanvasId(), n.getResultUrl());
+            }
+        }
+
         // 3) 转 DTO
         return canvases.stream()
-            .map(c -> CanvasListItem.from(c, countByCanvas.getOrDefault(c.getId(), 0L).intValue()))
+            .map(c -> CanvasListItem.from(
+                c,
+                countByCanvas.getOrDefault(c.getId(), 0L).intValue(),
+                thumbByCanvas.get(c.getId())
+            ))
             .toList();
     }
 
@@ -327,6 +351,39 @@ public class CanvasServiceImpl implements CanvasService {
                 "节点 type=" + node.getType() + " 与请求 type=" + req.getType() + " 不一致");
         }
 
+        // 2026-08-09 新增:换装场景快速路由
+        //   条件: image 节点 + 有上游节点(可以是 1 个 source + N 个衣服,或多个 image 节点被当作 source+materials)
+        //   效果: 不走 generate 常规流程,直接调用 ClothingTransferService
+        if ("image".equalsIgnoreCase(node.getType())
+                && req.getAssetIds() != null && !req.getAssetIds().isEmpty()) {
+            // 收集上游 image 节点 id(自动过滤其他类型)
+            java.util.List<String> imageUpstreamIds = new java.util.ArrayList<>();
+            for (String aid : req.getAssetIds()) {
+                try {
+                    CanvasNode upNode = mustGetOwnedNode(userId, aid);
+                    if ("image".equalsIgnoreCase(upNode.getType())) {
+                        imageUpstreamIds.add(aid);
+                    }
+                } catch (Exception ignore) {}
+            }
+            // 有 materialNodeIds 或 imageUpstreamIds.size() >= 2 → 走换装
+            boolean hasMaterials = req.getMaterialNodeIds() != null && !req.getMaterialNodeIds().isEmpty();
+            if (hasMaterials || imageUpstreamIds.size() >= 2) {
+                // 第 1 个 image 节点作为主体帧,其余 + materialNodeIds 作为衣服参考
+                String sourceNodeId = imageUpstreamIds.get(0);
+                java.util.List<String> materialIds = new java.util.ArrayList<>();
+                if (hasMaterials) materialIds.addAll(req.getMaterialNodeIds());
+                if (imageUpstreamIds.size() > 1) {
+                    materialIds.addAll(imageUpstreamIds.subList(1, imageUpstreamIds.size()));
+                }
+                if (!materialIds.isEmpty()) {
+                    log.info("[generate] 检测到换装场景: nodeId={}, source={}, materials={}",
+                        nodeId, sourceNodeId, materialIds);
+                    return transferClothing(userId, sourceNodeId, materialIds);
+                }
+            }
+        }
+
         // 2. 写任务记录（pending 状态）
         CanvasTask task = new CanvasTask();
         task.setNodeId(nodeId);
@@ -424,6 +481,73 @@ public class CanvasServiceImpl implements CanvasService {
         // 8. 立刻返回 pending，前端轮询 /tasks/{taskId}
         return new GenerateCanvasNodeResponse(
             task.getId(), nodeId, "pending", null, null, null,
+            java.util.Collections.emptyList()
+        );
+    }
+
+    /**
+     * 2026-08-09 新增:换装(Clothing Transfer)
+     * 接收 1 个视频节点 + 3 个衣服 image 节点的 id(顺序:正面/背面/模特上身)
+     * 逐帧调 NewAPI /v1/images/edits,生成 N 张换装图 + 1 张拼图
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GenerateCanvasNodeResponse transferClothing(Long userId, String videoNodeId,
+                                                        java.util.List<String> clothingNodeIds) {
+        // 1. 鉴权 + 拿节点
+        CanvasNode videoNode = mustGetOwnedNode(userId, videoNodeId);
+        // 2026-08-09:源节点可以是 video(抽帧)或 image(本身是拼好的帧网格)
+        if (!"video".equalsIgnoreCase(videoNode.getType())
+                && !"image".equalsIgnoreCase(videoNode.getType())) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "源节点必须是 video 或 image,当前 type=" + videoNode.getType());
+        }
+        if (videoNode.getResultUrl() == null || videoNode.getResultUrl().isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "源节点还没有 resultUrl,请先上传或生成");
+        }
+        // 2. 校验衣服图(现在只要 >=1 张)
+        if (clothingNodeIds == null || clothingNodeIds.isEmpty()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "至少需要 1 张衣服参考图,实际=" + (clothingNodeIds == null ? 0 : clothingNodeIds.size()));
+        }
+        for (String cid : clothingNodeIds) {
+            CanvasNode cn = mustGetOwnedNode(userId, cid);  // 鉴权 + 存在性
+            if (!"image".equalsIgnoreCase(cn.getType())) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM,
+                    "衣服节点 " + cid + " 必须是 image 类型,实际=" + cn.getType());
+            }
+        }
+        for (String cid : clothingNodeIds) {
+            CanvasNode cn = mustGetOwnedNode(userId, cid);  // 鉴权 + 存在性
+            if (!"image".equalsIgnoreCase(cn.getType())) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM,
+                    "衣服节点 " + cid + " 必须是 image 类型,实际=" + cn.getType());
+            }
+        }
+        // 3. 写任务
+        CanvasTask task = new CanvasTask();
+        task.setNodeId(videoNodeId);
+        task.setUserId(userId);
+        task.setType("clothing-transfer");
+        task.setStatus("pending");
+        task.setPrompt("clothingNodeIds=" + String.join(",", clothingNodeIds));
+        taskRepository.insert(task);
+
+        // 4. 视频节点标 running
+        videoNode.setStatus("running");
+        videoNode.setUpdatedAt(LocalDateTime.now());
+        nodeRepository.updateById(videoNode);
+
+        // 5. 异步执行
+        clothingTransferService.executeTransferAsync(task, videoNode, clothingNodeIds, userId);
+
+        log.info("Canvas clothing-transfer task created: taskId={}, videoNodeId={}, userId={}, clothingNodeIds={}",
+            task.getId(), videoNodeId, userId, clothingNodeIds);
+
+        // 6. 立刻返回 pending
+        return new GenerateCanvasNodeResponse(
+            task.getId(), videoNodeId, "pending", null, null, null,
             java.util.Collections.emptyList()
         );
     }

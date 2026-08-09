@@ -229,9 +229,19 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         try {
             result = newApiClient.pollVideo(taskId);
         } catch (BusinessException e) {
-            // NewAPI 暂时不可达，下次重试（不打 error，避免刷屏）
+            // 2026-08-09 fix: 400 (任务不存在)时标 FAILED,避免僵尸 job 每 2 秒打一次 NewAPI
+            String errMsg = e.getMessage() == null ? "" : e.getMessage();
+            boolean taskGone = errMsg.contains("400") || errMsg.toLowerCase().contains("not found") || errMsg.toLowerCase().contains("task does not exist");
+            if (taskGone) {
+                log.error("[I2V-POLL] job {} NewAPI 任务不存在 (taskId={}),标 FAILED: {}",
+                    job.getId(), taskId, errMsg);
+                markFailed(job, "NewAPI task not found: " + errMsg);
+                cleanupAsset(job);
+                return;
+            }
+            // 其他错误(503/网络问题等)继续重试
             log.warn("[I2V-POLL] job {} 查询 NewAPI 失败 (下次重试): taskId={}, err={}",
-                job.getId(), taskId, e.getMessage());
+                job.getId(), taskId, errMsg);
             return;
         }
         if (result == null) {

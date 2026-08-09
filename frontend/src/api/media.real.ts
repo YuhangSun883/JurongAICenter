@@ -9,6 +9,7 @@ import type {
   MediaUploadResponse,
   PatchAssetRequest,
   RoleCategory,
+  RoleListQuery,
 } from '@/types/media';
 import type { PageResult } from '@/types/api';
 import { getAccessToken } from '@/lib/auth-store';
