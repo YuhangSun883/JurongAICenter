@@ -111,7 +111,22 @@ public class ImageController {
         // base64 data URI（data:image/png;base64,...）可直接在网页 <img src> 中显示
         String base64DataUri = convertToBase64DataUri(originalData);
 
-        // 3. 构造响应：imageUrl 为 base64 data URI，可直接在网页中显示
+        // 3. 入库到 media_assets（type=image, source=ai-generated, sourceTool=image）
+        //    这样预览窗口的图片会进入任务队列（用户切走再回来也能看到历史）
+        try {
+            int commaIdx = base64DataUri.indexOf(',');
+            String mimeType = base64DataUri.startsWith("data:image/png") ? "image/png" : "image/jpeg";
+            if (commaIdx != -1) {
+                byte[] imageBytes = Base64.getDecoder().decode(base64DataUri.substring(commaIdx + 1));
+                MediaAssetResponse saved = mediaService.recordGeneratedImage(userId, imageBytes, mimeType);
+                log.info("AI 生成图片已入库: assetId={}, url={}", saved.getId(), saved.getUrl());
+            }
+        } catch (Exception e) {
+            // 入库失败不影响主流程（生成已成功），仅记录告警
+            log.warn("AI 生成图片入库失败（不影响生成结果）: {}", e.getMessage());
+        }
+
+        // 4. 构造响应：imageUrl 为 base64 data URI，可直接在网页中显示
         ImageGenerateResponse response = new ImageGenerateResponse(
             base64DataUri,
             "gpt-image-2-2k",
@@ -189,13 +204,12 @@ public class ImageController {
     }
 
     // ==================== 图片收藏功能 ====================
-    // 收藏 = 把图片作为一条素材资产入库到"我的资产"库。
-    // MinIO 存储路径：media/{userId}/{yyyy-MM}/{uuid}.{ext}
-    // （与用户上传素材共用 media/ 路径，不再单独用 favorites/ 目录）
+    // 收藏 = 把"AI 生成"记录（source_tool='image'）标记为"已收藏"（source_tool='favorite'），
+    // 不再额外上传/复制图片（避免 MinIO 重复存储）。
 
     /**
      * 收藏图片接口
-     * 将 base64 图片数据上传到 MinIO（media/ 路径），并写入 media_assets 表（sourceTool=favorite，库="我的资产"）。
+     * 把已存在的 AI 生成图片的 source_tool 改为 'favorite'（不复制图片）。
      */
     @PostMapping("/favorite")
     public FavoriteImageResponse favoriteImage(
@@ -206,36 +220,19 @@ public class ImageController {
         }
 
         Long userId = principal.id();
-        String imageData = request.getImageData();
-        log.info("用户 {} 收藏图片: dataLen={}", userId, imageData.length());
+        String objectKey = request.getObjectKey();
+        log.info("用户 {} 收藏图片: objectKey={}", userId, objectKey);
 
-        // 解析 base64 data URI，提取图片字节和 MIME 类型
-        String mimeType = "image/png";
-        byte[] imageBytes;
-
-        if (imageData.startsWith("data:image/")) {
-            int semicolonIdx = imageData.indexOf(";");
-            int commaIdx = imageData.indexOf(",");
-            if (semicolonIdx != -1 && commaIdx != -1) {
-                mimeType = imageData.substring(5, semicolonIdx); // image/png
-            }
-            String b64Data = imageData.substring(commaIdx + 1);
-            imageBytes = Base64.getDecoder().decode(b64Data);
-        } else {
-            imageBytes = Base64.getDecoder().decode(imageData);
-        }
-
-        // 入库（"我的资产"库 + MinIO media/ 路径）
-        MediaAssetResponse asset = mediaService.saveFavoriteAsAsset(userId, imageBytes, mimeType, null);
-        log.info("收藏图片已入库为资产: userId={}, assetId={}, library={}, url={}",
-            userId, asset.getId(), asset.getLibraryName(), asset.getUrl());
+        // 修改已有记录的 source_tool（不复制图片）
+        MediaAssetResponse asset = mediaService.markAsFavorite(userId, objectKey);
+        log.info("收藏图片已标记: userId={}, assetId={}, sourceTool={}, url={}",
+            userId, asset.getId(), asset.getSourceTool(), asset.getUrl());
 
         long createdAtMs = asset.getCreatedAt() != null
             ? java.sql.Timestamp.valueOf(asset.getCreatedAt()).getTime()
             : System.currentTimeMillis();
-        // id 用 assetId:asset.getId()（字符串化），这样 unfavorite 删除时可直接按 assetId 走 mediaService.deleteAsset
         return new FavoriteImageResponse(
-            String.valueOf(asset.getId()),
+            asset.getObjectKey(),
             asset.getUrl(),
             createdAtMs
         );
@@ -263,12 +260,14 @@ public class ImageController {
         q.setPage(1);
         q.setPageSize(1000);
         PageResult<MediaAssetResponse> page = mediaService.listAssets(userId, q);
-        // 收藏入库时 source=ai-generated + sourceTool=favorite，但为了兼容"所有 AI 生成结果也算收藏"，
-        // 这里只要是图片 AI 生成资产就都返回（用户在 AI 工作台收藏 Tab 能看到自己的 AI 产物）。
+        // 收藏 Tab 仅展示被显式收藏过的图片：type=image + source=ai-generated + sourceTool=favorite
+        // 预览 Tab 里的图（sourceTool=image）不会出现在收藏 Tab 中
         List<FavoriteImageResponse> result = page.getItems().stream()
-            .filter(a -> "ai-generated".equals(a.getSource()) && "image".equals(a.getType()))
+            .filter(a -> "ai-generated".equals(a.getSource())
+                && "image".equals(a.getType())
+                && "favorite".equals(a.getSourceTool()))
             .map(a -> new FavoriteImageResponse(
-                String.valueOf(a.getId()),
+                a.getObjectKey(),
                 a.getUrl(),
                 a.getCreatedAt() != null ? java.sql.Timestamp.valueOf(a.getCreatedAt()).getTime() : 0L
             ))
@@ -278,8 +277,8 @@ public class ImageController {
     }
 
     /**
-     * 取消收藏：删除对应的媒体资产（连 MinIO 对象一起删）。
-     * id = String(assetId)，即 favoriteImage 返回的 FavoriteImageResponse.id。
+     * 取消收藏：把 source_tool 改回 'image'（不删除图片，不删除 asset 记录）。
+     * objectKey 即 favoriteImage 请求中的 objectKey。
      */
     @DeleteMapping("/favorite")
     public java.util.Map<String, Object> unfavoriteImage(
@@ -290,18 +289,13 @@ public class ImageController {
         }
 
         Long userId = principal.id();
-        Long assetId;
-        try {
-            assetId = Long.valueOf(objectKey);
-        } catch (NumberFormatException e) {
-            // 兼容老版本：传 MinIO objectKey 的情况，尝试反查 assetId 然后删
-            log.warn("unfavorite: objectKey is not numeric asset id: {}, fallback to asset deletion", objectKey);
-            throw new BusinessException(ErrorCode.INVALID_PARAM, "收藏 ID 格式错误");
+        if (objectKey == null || objectKey.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "objectKey 不能为空");
         }
-
-        log.info("用户 {} 取消收藏: assetId={}", userId, assetId);
-        mediaService.deleteAsset(userId, assetId);
-        log.info("取消收藏成功: assetId={}", assetId);
+        log.info("用户 {} 取消收藏: objectKey={}", userId, objectKey);
+        MediaAssetResponse asset = mediaService.unmarkAsFavorite(userId, objectKey);
+        log.info("取消收藏成功: assetId={}, objectKey={}, sourceTool={}",
+            asset.getId(), objectKey, asset.getSourceTool());
         return java.util.Map.of("success", true);
     }
 }

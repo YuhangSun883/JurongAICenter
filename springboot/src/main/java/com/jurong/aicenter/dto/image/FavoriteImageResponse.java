@@ -10,8 +10,8 @@ import lombok.Data;
 @AllArgsConstructor
 public class FavoriteImageResponse {
 
-    /** 收藏图片的唯一标识（MinIO objectKey） */
-    private String id;
+    /** MinIO objectKey（用于取消收藏时传给后端） */
+    private String objectKey;
 
     /** MinIO 中存储的可访问 URL */
     private String url;

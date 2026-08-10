@@ -1082,4 +1082,26 @@ public class NewApiClient {
         if (s.length() <= maxLen) return s;
         return s.substring(0, maxLen) + "...(truncated, totalLen=" + s.length() + ")";
     }
+
+    /**
+     * 下载图片 URL 并转为 data URI（data:image/xxx;base64,...）
+     * 用于 NewAPI 中转服务器无法访问公网 URL 时，直接内嵌 base64。
+     */
+    private String downloadAsDataUri(String url) {
+        org.springframework.http.ResponseEntity<byte[]> entity = WebClient.builder()
+            .defaultHeader("User-Agent", "JurongAI/1.0")
+            .codecs(c -> c.defaultCodecs().maxInMemorySize(20 * 1024 * 1024))
+            .build()
+            .get().uri(url).retrieve()
+            .toEntity(byte[].class)
+            .timeout(Duration.ofSeconds(30))
+            .block();
+        if (entity == null || entity.getBody() == null || entity.getBody().length == 0) {
+            throw new RuntimeException("downloaded empty body: " + url);
+        }
+        MediaType ct = entity.getHeaders().getContentType();
+        String mimeType = ct != null ? ct.toString() : "image/png";
+        String b64 = Base64.getEncoder().encodeToString(entity.getBody());
+        return "data:" + mimeType + ";base64," + b64;
+    }
 }

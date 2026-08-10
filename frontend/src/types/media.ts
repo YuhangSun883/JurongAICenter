@@ -21,6 +21,8 @@ export interface MediaItem {
   type: MediaType;
   source: MediaSource;
   url: string;
+  /** MinIO 对象 key，前端用于按内容去重（url 预签名每次不同，不稳定） */
+  objectKey?: string;
   name: string;
   mimeType?: string;
   /** 后端字段 sizeBytes，前端可兼容 size */

@@ -25,6 +25,7 @@ public class MediaAssetResponse {
     private Integer height;
     private BigDecimal durationSec;
     private String url;
+    private String objectKey;
     private String sourceTool;
     private String sourceTaskId;
     private LocalDateTime createdAt;
