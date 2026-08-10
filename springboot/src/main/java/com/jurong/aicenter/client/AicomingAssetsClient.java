@@ -55,10 +55,10 @@ public class AicomingAssetsClient {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${aicoming.proxy.base-url}")
+    @Value("${newapi.base-url}")
     private String baseUrl;
 
-    @Value("${aicoming.proxy.token}")
+    @Value("${newapi.token}")
     private String token;
 
     public AicomingAssetsClient(WebClient.Builder webClientBuilder) {
