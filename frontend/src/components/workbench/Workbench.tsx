@@ -25,6 +25,7 @@ import { nanoid } from 'nanoid';
 import { useWorkbenchStore } from '@/store/workbench';
 import { useTaskPolling } from '@/hooks/useTaskPolling';
 import { videoApi } from '@/api/video';
+import { mediaApi } from '@/api/media';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
@@ -154,6 +155,77 @@ export function Workbench() {
       .then((res) => useWorkbenchStore.getState().setTasks(res.items))
       .catch(() => undefined);
   }, []);
+
+  /**
+   * Agent 模块跳转过来的预填：
+   *   URL 参数：
+   *     prefill=true
+   *     prompt=xxx
+   *     attachmentIds=assetId1,assetId2
+   *
+   * 行为：
+   *   1. 自动填入 prompt（即 script）
+   *   2. 自动把 attachmentIds 加到 selectedReferences
+   */
+  const prefillAppliedRef = useRef(false);
+  useEffect(() => {
+    if (prefillAppliedRef.current) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('prefill') !== 'true') {
+      prefillAppliedRef.current = true;
+      return;
+    }
+    // 1) 填 prompt
+    const p = params.get('prompt');
+    if (p) {
+      useWorkbenchStore.getState().setScript(p);
+    }
+    // 2) 加素材到 references
+    const idsStr = params.get('attachmentIds');
+    if (idsStr) {
+      const ids = idsStr.split(',').filter(Boolean);
+      if (ids.length > 0) {
+        (async () => {
+          const picked: ReferenceMedia[] = [];
+          for (const id of ids) {
+            try {
+              // getAsset 期望 number，但 URL 里来的是 string
+              const numericId = Number(id);
+              if (!Number.isFinite(numericId)) continue;
+              const asset = await mediaApi.getAsset(numericId);
+              if (asset) {
+                picked.push({
+                  id: String(asset.id),
+                  url: asset.url,
+                  type: (asset.type as 'image' | 'video' | 'audio') || 'image',
+                  name: asset.name,
+                  // ReferenceMedia 需要 token 字段，placeholder
+                  token: '',
+                });
+              }
+            } catch (e) {
+              console.warn('[Workbench] failed to load prefill asset', id, e);
+            }
+          }
+          if (picked.length > 0) {
+            setSelectedReferences((prev) => [...prev, ...picked]);
+            addMaterials(picked.map((p) => ({
+              id: p.id,
+              url: p.url,
+              type: p.type,
+              name: p.name,
+            })));
+          }
+        })();
+      }
+    }
+    // 清掉 URL 参数
+    if (typeof window.history?.replaceState === 'function') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    prefillAppliedRef.current = true;
+  }, [addMaterials]);
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
   const queued = tasks.filter((task) => task.status === 'queued').length;

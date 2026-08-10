@@ -58,6 +58,20 @@ export interface AgentSendResponse {
   creditsUsed: number;
   /** 预估本轮消耗（流式完成后会被实际值覆盖） */
   creditsEstimated: number;
+  /** LLM 决定的工具调用（可选）。存在时前端弹确认框让用户决定是否跳转。 */
+  toolCall?: AgentToolCall;
+}
+
+/** LLM 工具调用（Agent 返回的跳转建议） */
+export interface AgentToolCall {
+  /** 动作名（jump-to-image / jump-to-video / jump-to-image-edit / ...） */
+  action: string;
+  /** 用户意图文本（会作为目标模块的 prompt 预填） */
+  prompt: string;
+  /** AI 简短解释（可空） */
+  reason?: string;
+  /** 携带的素材 ID（前端跳转时作为 query 参数） */
+  attachmentIds?: string[];
 }
 
 /** 列表查询会话 */

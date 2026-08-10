@@ -30,6 +30,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -358,6 +359,55 @@ public class MediaServiceImpl implements MediaService {
         }
         log.info("Cascade delete assets by library: userId={}, libraryId={}, count={}",
             userId, libraryId, assets.size());
+    }
+
+    @Override
+    public List<String> getImageUrlsByIds(Long userId, List<String> ids) {
+        if (userId == null || ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId)
+               .eq(MediaAsset::getType, "image")
+               .in(MediaAsset::getId, ids);
+        List<MediaAsset> assets = assetRepository.selectList(wrapper);
+        if (assets == null || assets.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> urls = assets.stream()
+                .map(MediaAsset::getObjectKey)
+                .filter(Objects::nonNull)
+                .filter(s -> !s.isBlank())
+                .map(key -> storageService.getPresignedUrl(key, 24))
+                .filter(Objects::nonNull)
+                .filter(s -> !s.isBlank())
+                .distinct()
+                .collect(Collectors.toList());
+        log.debug("Agent getImageUrlsByIds: userId={}, inputIds={}, imageUrls={}",
+            userId, ids.size(), urls.size());
+        return urls;
+    }
+
+    @Override
+    public List<MediaAsset> getAssetsByIds(Long userId, List<String> ids) {
+        if (userId == null || ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId).in(MediaAsset::getId, ids);
+        List<MediaAsset> assets = assetRepository.selectList(wrapper);
+        if (assets == null) {
+            return Collections.emptyList();
+        }
+        log.debug("Agent getAssetsByIds: userId={}, inputIds={}, assets={}",
+            userId, ids.size(), assets.size());
+        return assets;
+    }
+
+    @Override
+    public String getPresignedUrl(String objectKey, int hours) {
+        if (objectKey == null || objectKey.isBlank()) return null;
+        return storageService.getPresignedUrl(objectKey, hours);
     }
 
     @Override
