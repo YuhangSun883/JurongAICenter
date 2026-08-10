@@ -27,6 +27,18 @@ interface Props {
   onPaid?: () => void;
 }
 
+const FALLBACK_CREDIT_PACKAGES: CreditPackage[] = [
+  { id: 'pkg-50', price: 50, credits: 50 },
+  { id: 'pkg-75', price: 75, credits: 75, highlighted: true },
+  { id: 'pkg-150', price: 150, credits: 150 },
+  { id: 'pkg-225', price: 225, credits: 225 },
+  { id: 'pkg-450', price: 450, credits: 450 },
+  { id: 'pkg-882', price: 882, credits: 900 },
+  { id: 'pkg-1960', price: 1960, credits: 2000 },
+  { id: 'pkg-4900', price: 4900, credits: 5000 },
+  { id: 'pkg-9800', price: 9800, credits: 10000 },
+];
+
 export function BuyCreditsDialog({ open, onClose, onPaid }: Props) {
   const [mounted, setMounted] = useState(false);
   const [pkgs, setPkgs] = useState<CreditPackage[]>([]);
@@ -55,12 +67,16 @@ export function BuyCreditsDialog({ open, onClose, onPaid }: Props) {
     setOrder(null);
     agentApi.listCreditPackages()
       .then((arr) => {
-        setPkgs(arr);
+        const nextPackages = arr.length > 0 ? arr : FALLBACK_CREDIT_PACKAGES;
+        setPkgs(nextPackages);
         // 默认选中第一个 highlighted 的包
-        const h = arr.find((p) => p.highlighted);
+        const h = nextPackages.find((p) => p.highlighted) ?? nextPackages[0];
         if (h) setSelectedId(h.id);
       })
-      .catch(() => setPkgs([]))
+      .catch(() => {
+        setPkgs(FALLBACK_CREDIT_PACKAGES);
+        setSelectedId(FALLBACK_CREDIT_PACKAGES[0].id);
+      })
       .finally(() => setLoading(false));
   }, [open]);
 

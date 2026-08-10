@@ -78,6 +78,12 @@ interface NodeContextMenuState {
   nodeId: string;
 }
 
+interface EdgeContextMenuState {
+  x: number;
+  y: number;
+  edgeId: string;
+}
+
 type NodeContextAction = 'save' | 'copy' | 'duplicate' | 'paste' | 'delete';
 
 const NODE_WIDTH = 320;
@@ -113,9 +119,25 @@ export default function NewCanvasPage() {
   const [dragging, setDragging] = useState<{ id: string; offsetX: number; offsetY: number } | null>(null);
   const [linkDrag, setLinkDrag] = useState<LinkDragState | null>(null);
   const [nodeMenu, setNodeMenu] = useState<NodeContextMenuState | null>(null);
+  const [edgeMenu, setEdgeMenu] = useState<EdgeContextMenuState | null>(null);
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>('');
+
+  // 加载本地缓存的连线(刷新不丢)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = localStorage.getItem('canvas_edges');
+      if (raw) setEdges(JSON.parse(raw) as CanvasEdge[]);
+    } catch { /* ignore */ }
+  }, []);
+
+  // 连线变化时写 localStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem('canvas_edges', JSON.stringify(edges));
+  }, [edges]);
 
   const activeNode = nodes.find((node) => node.id === activeNodeId) ?? null;
 
@@ -281,6 +303,11 @@ export default function NewCanvasPage() {
     setActiveNodeId((current) => (current === nodeId ? null : current));
   };
 
+  const deleteEdge = (edgeId: string) => {
+    setEdges((current) => current.filter((edge) => edge.id !== edgeId));
+    setEdgeMenu(null);
+  };
+
   const handleNodeMenuAction = (action: NodeContextAction) => {
     if (!nodeMenu) return;
     const node = nodes.find((item) => item.id === nodeMenu.nodeId);
@@ -304,8 +331,11 @@ export default function NewCanvasPage() {
   const requestGeneration = async () => {
     if (!activeNode || generating) return;
     const nodePrompt = (activeNode.prompt ?? '').trim();
-    if (!nodePrompt) {
-      setGenerateError('请先输入提示词');
+    const upstreamCount = edges.filter((edge) => edge.to === activeNode.id).length;
+    // 有上游节点:允许空 prompt(后端 mergePrompts 会用上游内容 fallback)
+    // 无上游节点:必须输入 prompt(否则 AI 端没东西可加工)
+    if (!nodePrompt && upstreamCount === 0) {
+      setGenerateError('请先输入提示词，或从节点左侧/右侧 + 拖一个上游节点来引用');
       return;
     }
     setGenerating(true);
@@ -323,9 +353,12 @@ export default function NewCanvasPage() {
 
       // 2. 轮询任务状态（按节点类型分档超时）
       const POLL_INTERVAL = 2000;
-      // 文本：60s；图片：300s（5 分钟，gpt-image 实际需要）；视频：600s（10 分钟）
+      // 文本：200s（NewAPI 润色需时 60-180s，frontend 要多给点 buffer）
+      // 图片：300s（5 分钟，gpt-image 实际需要）
+      // 视频：600s（10 分钟，NewAPI waitForVideo 允许更长）
+      // 后端超时:NewApiClient.chatCompletion = 180s，imagePollTimeoutSec = 600s，videoPollTimeoutSec = 1200s
       const MAX_DURATION =
-        activeNode.type === 'text'  ? 60_000 :
+        activeNode.type === 'text'  ? 200_000 :
         activeNode.type === 'image' ? 300_000 :
         /* video */                  600_000;
       const start = Date.now();
@@ -717,11 +750,11 @@ function CanvasNodeCard({
           />
         ) : node.resultUrl ? (
           // 生成成功：按类型渲染 <video> 或 <img>
+          // 注意:img/video 不能加 data-no-node-drag="true",否则点击图片区域无法拖动节点
           node.type === 'video' ? (
             <video
               src={node.resultUrl}
               controls
-              data-no-node-drag="true"
               className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-black object-contain active:cursor-grabbing"
               onClick={onActivate}
             />
@@ -729,7 +762,7 @@ function CanvasNodeCard({
             <img
               src={node.resultUrl}
               alt={nodeTitle(node.type)}
-              data-no-node-drag="true"
+              draggable={false}
               className="h-[220px] w-[320px] cursor-grab rounded-lg border border-[#e0e4ea] bg-white/35 object-contain active:cursor-grabbing"
               onClick={onActivate}
             />

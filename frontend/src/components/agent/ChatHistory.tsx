@@ -1,8 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { Edit, Plus, PanelLeftClose, PanelLeftOpen, MessageSquare, Sparkles } from 'lucide-react';
+import { Edit, Plus, PanelLeftClose, PanelLeftOpen, MessageSquare, Sparkles, Trash2, Check, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 
 export interface ChatSession {
   id: string;
@@ -19,7 +20,8 @@ interface ChatHistoryProps {
   onToggle: () => void;
   onSelect: (id: string) => void;
   onNew: () => void;
-  onRename?: (id: string) => void;
+  onRename?: (id: string, title: string) => Promise<void> | void;
+  onDelete?: (id: string) => Promise<void> | void;
 }
 
 export function ChatHistory({
@@ -30,7 +32,21 @@ export function ChatHistory({
   onSelect,
   onNew,
   onRename,
+  onDelete,
 }: ChatHistoryProps) {
+  /** 待删除的会话（null 表示不显示弹窗） */
+  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
+
+  /** 弹窗确认删除 */
+  function handleConfirmDelete() {
+    if (deleteTarget && onDelete) {
+      Promise.resolve(onDelete(deleteTarget.id)).catch((err: unknown) =>
+        console.warn('[chat-history] delete failed:', err)
+      );
+    }
+    setDeleteTarget(null);
+  }
+
   if (collapsed) {
     return (
       <div className="flex w-[60px] flex-col border-r border-bg-line bg-bg-card/60">
@@ -44,7 +60,7 @@ export function ChatHistory({
         <button
           onClick={onNew}
           className="mx-2 mb-2 grid h-9 w-9 place-items-center rounded-lg border border-dashed border-bg-line text-fg-muted hover:border-brand/50 hover:text-brand"
-          title="新对话"
+          title="开启新对话"
         >
           <Edit className="h-4 w-4" />
         </button>
@@ -66,7 +82,7 @@ export function ChatHistory({
         </button>
       </div>
 
-      {/* 新对话 */}
+      {/* 开启新对话 */}
       <div className="p-2">
         <button
           onClick={onNew}
@@ -75,8 +91,8 @@ export function ChatHistory({
             'bg-bg-soft text-fg hover:bg-brand-50 hover:text-brand'
           )}
         >
-          <Edit className="h-3.5 w-3.5" />
-          新对话
+          <Plus className="h-3.5 w-3.5" />
+          开启新对话
         </button>
       </div>
 
@@ -86,30 +102,189 @@ export function ChatHistory({
           <EmptyState />
         ) : (
           <ul className="space-y-1">
-            {sessions.map((s) => {
-              const active = s.id === activeId;
-              return (
-                <li key={s.id}>
-                  <button
-                    onClick={() => onSelect(s.id)}
-                    className={cn(
-                      'group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition',
-                      active
-                        ? 'bg-brand-50 text-brand'
-                        : 'text-fg-muted hover:bg-bg-soft hover:text-fg'
-                    )}
-                  >
-                    <MessageSquare className="h-3.5 w-3.5 flex-none" />
-                    <span className="truncate">{s.title || '新对话'}</span>
-                    {s.pinned && <span className="ml-auto text-[10px] text-fg-subtle">置顶</span>}
-                  </button>
-                </li>
-              );
-            })}
+            {sessions.map((s) => (
+              <SessionItem
+                key={s.id}
+                session={s}
+                active={s.id === activeId}
+                onSelect={onSelect}
+                onRename={onRename}
+                onAskDelete={(sess) => setDeleteTarget(sess)}
+              />
+            ))}
           </ul>
         )}
       </div>
+
+      {/* 删除确认弹窗 */}
+      <ConfirmDialog
+        open={!!deleteTarget}
+        title="确认删除对话"
+        description={
+          deleteTarget
+            ? `确认删除对话"${deleteTarget.title || '新对话'}"？\n删除后无法恢复。`
+            : ''
+        }
+        confirmText="删除"
+        danger
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </div>
+  );
+}
+
+interface SessionItemProps {
+  session: ChatSession;
+  active: boolean;
+  onSelect: (id: string) => void;
+  onRename?: (id: string, title: string) => Promise<void> | void;
+  onAskDelete?: (session: ChatSession) => void;
+}
+
+function SessionItem({ session, active, onSelect, onRename, onAskDelete }: SessionItemProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(session.title || '新对话');
+
+  /** 进入编辑模式 */
+  function startEdit() {
+    setDraft(session.title || '新对话');
+    setEditing(true);
+  }
+
+  /** 提交重命名 */
+  async function commitEdit() {
+    const trimmed = draft.trim() || '新对话';
+    setEditing(false);
+    if (trimmed === (session.title || '新对话')) return;
+    if (onRename) {
+      try {
+        await onRename(session.id, trimmed);
+      } catch (err) {
+        console.warn('[chat-history] rename failed:', err);
+      }
+    }
+  }
+
+  /** 取消编辑 */
+  function cancelEdit() {
+    setEditing(false);
+    setDraft(session.title || '新对话');
+  }
+
+  /** 请求删除（弹窗状态由父组件 ChatHistory 持有） */
+  function handleDelete() {
+    if (onAskDelete) onAskDelete(session);
+  }
+
+  /** 编辑态：用 input + 保存/取消 */
+  if (editing) {
+    return (
+      <li>
+        <div
+          className={cn(
+            'flex items-center gap-1 rounded-lg px-2 py-1.5',
+            'bg-brand-50 text-brand'
+          )}
+        >
+          <MessageSquare className="h-3.5 w-3.5 flex-none" />
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                commitEdit();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelEdit();
+              }
+            }}
+            onBlur={commitEdit}
+            className="flex-1 bg-transparent text-sm outline-none placeholder:text-fg-subtle"
+            placeholder="新对话"
+            maxLength={255}
+          />
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={commitEdit}
+            className="grid h-6 w-6 place-items-center rounded text-brand hover:bg-brand/10"
+            title="保存"
+          >
+            <Check className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={cancelEdit}
+            className="grid h-6 w-6 place-items-center rounded text-fg-muted hover:bg-bg-soft"
+            title="取消"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </li>
+    );
+  }
+
+  /** 默认态：hover 显示修改/删除图标 */
+  return (
+    <li>
+      <div
+        className={cn(
+          'group flex items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition',
+          active
+            ? 'bg-brand-50 text-brand'
+            : 'text-fg-muted hover:bg-bg-soft hover:text-fg'
+        )}
+      >
+        <button
+          onClick={() => onSelect(session.id)}
+          className="flex flex-1 items-center gap-2 truncate text-left"
+        >
+          <MessageSquare className="h-3.5 w-3.5 flex-none" />
+          <span className="truncate">{session.title || '新对话'}</span>
+          {session.pinned && <span className="ml-auto text-[10px] text-fg-subtle">置顶</span>}
+        </button>
+
+        {/* Hover 操作按钮组 */}
+        {(onRename || onAskDelete) && (
+          <div
+            className={cn(
+              'flex items-center gap-0.5',
+              active
+                ? 'opacity-100' // active 状态始终可见
+                : 'opacity-0 group-hover:opacity-100' // 非 active 状态 hover 才出
+            )}
+          >
+            {onRename && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  startEdit();
+                }}
+                className="grid h-6 w-6 place-items-center rounded text-fg-muted hover:bg-brand/10 hover:text-brand"
+                title="重命名"
+              >
+                <Edit className="h-3 w-3" />
+              </button>
+            )}
+            {onAskDelete && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDelete();
+                }}
+                className="grid h-6 w-6 place-items-center rounded text-fg-muted hover:bg-red-50 hover:text-red-500"
+                title="删除"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </li>
   );
 }
 

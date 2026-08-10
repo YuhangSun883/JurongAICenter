@@ -1,0 +1,38 @@
+﻿# 鐢熶骇鐜閰嶇疆锛堟槑鏂囷紝鏁忔劅淇℃伅 鈥?涓嶅叆 git锛屽弬鑰?secrets.txt锛?
+# 鍦?docker-compose 閲岃窇锛岀敤 docker service name 浜掔浉璁块棶
+
+spring:
+  datasource:
+    url: jdbc:mysql://mysql:3306/ai_platform?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&characterEncoding=UTF-8
+    username: ai_app
+    password: JurongAdvnce2044!
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+  data:
+    redis:
+      host: redis
+      port: 6379
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+# ComfyUI锛坉ocker service name锛?
+comfyui:
+  base-url: http://comfyui:8188
+  timeout-seconds: 600
+
+# MinIO锛坉ocker service name锛?
+minio:
+  endpoint: http://minio:9000
+  access-key: aicenter
+  secret-key: sAreQ0qXHA*73wa7=#Kpt+Gfj+*#YVn=HocsifS4
+  bucket: ai-platform
+
+# JWT
+jwt:
+  secret: d9zH+j7Nbw3%wFCMJOEkfKc21-1P_PLCjeO^+sNu_bs*vzuXldK^o#Fr8m2LkR^G
+  access-token-expiry: 2h
+  refresh-token-expiry: 7d
+  issuer: jurong-aicenter

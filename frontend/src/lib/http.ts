@@ -52,6 +52,11 @@ function notifyAuthFailure() {
 /**
  * 核心请求函数：自动注入 access token；401 时 silent refresh + 重试；
  * refresh 失败则清 token + 通知上层（LoginGate redirect 登录页）
+ *
+ * 后端返回格式：
+ *   - 成功：直接返回业务对象（如 JobResponse、GenerateResponse）
+ *   - 业务异常：HTTP 200 + {code, message, data}（由 GlobalExceptionHandler 统一封装）
+ *   - 系统异常：HTTP 4xx/5xx + {code, message, data}
  */
 async function requestInner<T>(path: string, opts: RequestOptions = {}, isRetry = false): Promise<T> {
   const { method = 'GET', body, query, signal } = opts;
@@ -82,27 +87,48 @@ async function requestInner<T>(path: string, opts: RequestOptions = {}, isRetry 
     throw new ApiError(res.status, `HTTP ${res.status}`, payload);
   }
 
+  // 非 OK 状态（4xx/5xx）→ 直接抛错
   if (!res.ok) {
     let payload: unknown = undefined;
     try { payload = await res.json(); } catch { /* ignore */ }
     throw new ApiError(res.status, `HTTP ${res.status}`, payload);
   }
 
-  if (res.status === 204) return undefined as T;
+  // 解析响应体（200/204 等 OK 状态）
+  let json: any;
+  try {
+    const text = await res.text();
+    if (!text || text.trim() === '') return undefined as T;
+    json = JSON.parse(text);
+  } catch {
+    return undefined as T;
+  }
 
-  const json = (await res.json()) as any;
-
-  if (json && typeof json === 'object' && 'code' in json && 'data' in json) {
+  // 检查后端统一响应包装：{code, message, data}
+  // GlobalExceptionHandler 会把业务异常包装成 HTTP 200 + {code, message, data}
+  if (json && typeof json === 'object' && 'code' in json) {
+    // 如果同时有 data 字段，说明是统一包装格式
+    if ('data' in json) {
+      if (json.code !== 0) {
+        // 业务码 9401 (UNAUTHORIZED) → 通知上层
+        if (json.code === 9401) {
+          notifyAuthFailure();
+        }
+        throw new ApiError(json.code ?? res.status, json.message ?? `HTTP ${res.status}`, json);
+      }
+      // code=0 表示成功，返回 data 字段
+      return (json.data ?? null) as T;
+    }
+    // 只有 code 没有 data，且 code != 0 → 业务异常
     if (json.code !== 0) {
-      // 业务码 9401 (UNAUTHORIZED) → 通知上层
       if (json.code === 9401) {
         notifyAuthFailure();
       }
       throw new ApiError(json.code ?? res.status, json.message ?? `HTTP ${res.status}`, json);
     }
-    return json.data as T;
   }
 
+  // 非包装格式，直接返回
   return json as T;
 }
 

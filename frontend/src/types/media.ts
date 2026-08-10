@@ -1,50 +1,89 @@
-// 媒体（素材库 / 角色库 / 上传）
-
 export type MediaType = 'image' | 'video' | 'audio';
 export type MediaSource = 'uploaded' | 'ai-generated';
-export type MediaCategory = 'image' | 'video' | 'audio';
+export type LibraryType = 'system-uploaded' | 'system-ai' | 'custom';
+
+export interface MediaLibrary {
+  id: number;
+  name: string;
+  type: LibraryType;
+  iconKey?: string;
+  description?: string;
+  sortOrder?: number;
+  assetCount?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
 
 export interface MediaItem {
-  id: string;
+  id: number;
+  libraryId?: number;
+  libraryName?: string;
   type: MediaType;
   source: MediaSource;
   url: string;
   name: string;
+  mimeType?: string;
   size?: number;
   width?: number;
   height?: number;
-  createdAt: number;
+  duration?: number;
+  sourceTool?: string;
+  sourceTaskId?: string;
+  createdAt: string;
+  updatedAt?: string;
 }
 
-/** 列表查询 */
+export type MediaAsset = MediaItem;
+
 export interface MediaListQuery {
-  category?: MediaCategory;
-  source?: MediaSource | 'all';
+  libraryId?: number | null;
+  type?: MediaType | string;
+  source?: MediaSource | 'all' | string;
   keyword?: string;
   page?: number;
   pageSize?: number;
 }
 
-/** 上传请求 */
-export interface MediaUploadRequest {
-  file: File;
-  type: MediaType;
-  /** 角色库分类（仅当 category=role 时使用） */
-  roleCategory?: string;
-}
-
-/** 上传响应 */
 export interface MediaUploadResponse {
-  item: MediaItem;
+  id: number;
+  url: string;
+  name: string;
+  type: MediaType;
+  size: number;
+  sizeBytes?: number;
 }
 
-/** 角色分类 */
+export interface BatchDeleteRequest {
+  ids: number[];
+}
+
+export interface PatchAssetRequest {
+  name: string;
+}
+
+export interface CreateLibraryRequest {
+  name: string;
+  iconKey?: string;
+  description?: string;
+}
+
 export interface RoleCategory {
   key: string;
   label: string;
 }
 
-/** 角色库列表查询 */
+export type MediaRoleCategory = RoleCategory;
+
+export interface MediaRole {
+  id: number;
+  name: string;
+  category: string;
+  imageUrl: string;
+  description?: string;
+  tags?: string[];
+  createdAt: number;
+}
+
 export interface RoleListQuery {
   category?: string;
   keyword?: string;

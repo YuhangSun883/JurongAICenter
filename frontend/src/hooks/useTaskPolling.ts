@@ -3,7 +3,7 @@
 
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { videoApi } from '@/api/video';
 import { useWorkbenchStore } from '@/store/workbench';
 import type { TaskStatus } from '@/types/video';
@@ -18,20 +18,39 @@ export function useTaskPolling() {
   const upsertTask = useWorkbenchStore((s) => s.upsertTask);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // 用 useCallback 避免每次渲染创建新函数导致 useEffect 重跑
+  const tick = useCallback(async () => {
+    const currentTasks = useWorkbenchStore.getState().tasks;
+    // 跳过无效 id（空字符串、"undefined"、"null"），避免轮询 /api/jobs/undefined
+    const active = currentTasks.filter(
+      (t) => ACTIVE.includes(t.status) && t.id && t.id !== 'undefined' && t.id !== 'null'
+    );
+    if (active.length === 0) return;
+
+    // 并发请求所有活跃任务，单个失败不影响其他
+    const results = await Promise.allSettled(
+      active.map((t) => videoApi.getTask(t.id))
+    );
+
+    results.forEach((result, index) => {
+      const taskId = active[index].id;
+      if (result.status === 'fulfilled') {
+        upsertTask(result.value);
+      } else {
+        const error = result.reason;
+        // 只在首次失败时打印，避免刷屏
+        console.warn('[useTaskPolling] poll failed for task', taskId,
+          error instanceof Error ? error.message : error);
+      }
+    });
+  }, [upsertTask]);
+
   useEffect(() => {
-    const tick = async () => {
-      const active = tasks.filter((t) => ACTIVE.includes(t.status));
-      if (active.length === 0) return;
-      await Promise.all(
-        active.map((t) =>
-          videoApi.getTask(t.id).then(upsertTask).catch(() => undefined)
-        )
-      );
-    };
+    // 立即执行一次
     tick();
     timer.current = setInterval(tick, POLLING_INTERVAL);
     return () => {
       if (timer.current) clearInterval(timer.current);
     };
-  }, [tasks, upsertTask]);
+  }, [tick]);
 }

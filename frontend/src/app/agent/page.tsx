@@ -33,20 +33,36 @@ export default function AgentPage() {
 
   /** 拉会话列表 */
   const refreshSessions = useCallback(async () => {
-    const res = await agentApi.listSessions({ pageSize: 50 });
-    setSessions(res.items.map(toChatSession));
+    try {
+      const res = await agentApi.listSessions({ pageSize: 50 });
+      setSessions(res.items.map(toChatSession));
+    } catch (err) {
+      // 后端接口可能未实装（如 /agent/sessions），静默兑底
+      console.warn('[agent] listSessions failed:', err);
+      setSessions([]);
+    }
   }, []);
 
   /** 拉某会话的消息 */
   const refreshMessages = useCallback(async (sessionId: string) => {
-    const res = await agentApi.listMessages({ sessionId, pageSize: 50 });
-    setMessages(res.items);
+    try {
+      const res = await agentApi.listMessages({ sessionId, pageSize: 50 });
+      setMessages(res.items);
+    } catch (err) {
+      console.warn('[agent] listMessages failed:', err);
+      setMessages([]);
+    }
   }, []);
 
   /** 拉积分 */
   const refreshCredits = useCallback(async () => {
-    const c = await agentApi.getCredits();
-    setCredits(c.used);
+    try {
+      const c = await agentApi.getCredits();
+      setCredits(c.used);
+    } catch (err) {
+      console.warn('[agent] getCredits failed:', err);
+      setCredits(0);
+    }
   }, []);
 
   useEffect(() => {
@@ -66,7 +82,34 @@ export default function AgentPage() {
     setActiveId(session.id);
   }
 
-  /** 发送消息 —— 先 checkCredits，再 send */
+  /** 重命名对话 */
+  async function handleRename(id: string, title: string) {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    try {
+      await agentApi.renameSession({ sessionId: id, title: trimmed });
+      await refreshSessions();
+    } catch (err) {
+      console.warn('[agent] rename failed:', err);
+    }
+  }
+
+  /** 删除对话 */
+  async function handleDelete(id: string) {
+    try {
+      await agentApi.deleteSession(id);
+      // 如果删的是当前选中 → 清空消息区
+      if (activeId === id) {
+        setActiveId(null);
+        setMessages([]);
+      }
+      await refreshSessions();
+    } catch (err) {
+      console.warn('[agent] delete failed:', err);
+    }
+  }
+
+  /** 发送消息 —— 先 checkCredits，再乐观更新请求 send */
   async function handleSend(content: string, attachmentIds: string[]) {
     if (!content.trim() || sending) return;
 
@@ -89,7 +132,31 @@ export default function AgentPage() {
       // 校验接口挂了就先放过，让 send 兜底
     }
 
-    // 3) 真正发送
+    // 3) 乐观更新：先显示用户消息（temp id，等真实返回后被替换）
+    const optimisticUserId = 'temp-user-' + Date.now();
+    const optimisticUserMsg: AgentMessage = {
+      id: optimisticUserId,
+      sessionId: activeId ?? '',
+      role: 'user',
+      content,
+      createdAt: Date.now(),
+    };
+    setMessages((prev) => [...prev, optimisticUserMsg]);
+
+    // 4) 助手“思考中”占位气泡（加重试点提示）
+    const thinkingMsgId = 'temp-thinking-' + Date.now();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: thinkingMsgId,
+        sessionId: activeId ?? '',
+        role: 'assistant',
+        content: '正在思考...',
+        createdAt: Date.now(),
+      },
+    ]);
+
+    // 5) 真正发送
     setSending(true);
     try {
       const res = await agentApi.send({
@@ -99,8 +166,12 @@ export default function AgentPage() {
       });
       setActiveId(res.sessionId);
       await refreshSessions();
-      await refreshMessages(res.sessionId);
+      await refreshMessages(res.sessionId); // 用真实消息替换乐观消息
       await refreshCredits();
+    } catch (err) {
+      // 发送失败：移除乐观消息 + 提示
+      setMessages((prev) => prev.filter((m) => m.id !== optimisticUserId && m.id !== thinkingMsgId));
+      console.error('[agent] send failed:', err);
     } finally {
       setSending(false);
     }
@@ -145,6 +216,8 @@ export default function AgentPage() {
           onToggle={() => setCollapsed((v) => !v)}
           onSelect={setActiveId}
           onNew={handleNew}
+          onRename={handleRename}
+          onDelete={handleDelete}
         />
 
         <main className="relative flex flex-1 flex-col">
