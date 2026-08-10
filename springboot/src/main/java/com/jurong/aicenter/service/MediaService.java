@@ -66,4 +66,32 @@ public interface MediaService {
     String lookupAiMediaObjectKey(Long userId, String sourceTaskId, String filename);
 
     void deleteAssetsByLibrary(Long userId, Long libraryId);
+
+    /**
+     * Agent 模块用：根据素材 ID 列表取图片 URL（多模态 LLM 用）。
+     *
+     * <p>过滤规则：
+     * <ul>
+     *   <li>只返回当前用户拥有的素材（userId 校验）</li>
+     *   <li>只返回 type=image 的素材（视频/音频不传 LLM）</li>
+     * </ul>
+     *
+     * @param userId 当前用户 ID
+     * @param ids    素材 ID 列表（可为 null/empty）
+     * @return 图片 URL 列表（顺序与输入无关，按 id 去重）
+     */
+    List<String> getImageUrlsByIds(Long userId, List<String> ids);
+
+    /**
+     * Agent 模块用：根据素材 ID 列表取完整素材详情（含 url/name/type）。
+     * 用于 agent 消息气泡里显示用户上传的图片。
+     *
+     * <p>注意：返回的 url 是临时签名 URL（24h 有效）。
+     */
+    List<com.jurong.aicenter.entity.MediaAsset> getAssetsByIds(Long userId, List<String> ids);
+
+    /**
+     * 取 MinIO 预签名 URL（24h 有效）。给前端显示用。
+     */
+    String getPresignedUrl(String objectKey, int hours);
 }

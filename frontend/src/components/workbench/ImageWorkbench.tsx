@@ -205,6 +205,88 @@ export function ImageWorkbench() {
   const [model, setModel] = useState<ImageModel>('高级版 VIP');
   const [ratio, setRatio] = useState<ImageRatio>('自适应');
   const [resolution, setResolution] = useState<ImageResolution>('1K');
+
+  /**
+   * Agent 模块跳转过来的预填：
+   *   URL 参数：
+   *     prefill=true
+   *     prompt=xxx
+   *     attachmentIds=assetId1,assetId2
+   *
+   * 行为：
+   *   1. 自动填入 prompt
+   *   2. 自动把 attachmentIds 转成 PickedMedia 加到 references 列表
+   */
+  const [prefillApplied, setPrefillApplied] = useState(false);
+  useEffect(() => {
+    if (prefillApplied) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('prefill') !== 'true') {
+      setPrefillApplied(true); // 标记已处理，下次直接跳过
+      return;
+    }
+
+    // 1) 填 prompt
+    const p = params.get('prompt');
+    if (p) {
+      setPrompt(p);
+      // 同步到 contenteditable 的 DOM（不然编辑器显示空白）
+      // 等 React 把组件挂载完再设
+      requestAnimationFrame(() => {
+        if (editorRef.current) {
+          editorRef.current.innerText = p;
+        }
+      });
+    }
+
+    // 2) 加素材到 references
+    const idsStr = params.get('attachmentIds');
+    if (idsStr) {
+      const ids = idsStr.split(',').filter(Boolean);
+      if (ids.length > 0) {
+        // 异步加载素材详情
+        (async () => {
+          const picked: PickedMedia[] = [];
+          for (const id of ids) {
+            try {
+              // getAsset 期望 number，但 URL 里来的是 string，强转一下
+              const numericId = Number(id);
+              if (!Number.isFinite(numericId)) continue;
+              const asset = await mediaApi.getAsset(numericId);
+              if (asset) {
+                picked.push({
+                  id: String(asset.id),
+                  url: asset.url,
+                  type: asset.type as 'image' | 'video' | 'audio',
+                  name: asset.name,
+                });
+              }
+            } catch (e) {
+              console.warn('[ImageWorkbench] failed to load prefill asset', id, e);
+            }
+          }
+          if (picked.length > 0) {
+            setReferences((prev) => [...prev, ...picked]);
+            // 顺手加到 materials 上下文
+            addMaterials(picked.map((p) => ({
+              id: p.id,
+              url: p.url,
+              type: p.type,
+              name: p.name,
+            })));
+          }
+        })();
+      }
+    }
+
+    // 清掉 URL 参数（避免刷新页面再次触发）
+    if (typeof window.history?.replaceState === 'function') {
+      const cleanUrl = window.location.pathname;
+      window.history.replaceState({}, '', cleanUrl);
+    }
+    setPrefillApplied(true);
+  }, [prefillApplied, addMaterials]);
   const [format, setFormat] = useState<ImageFormat>('JPEG');
   const [tasks, setTasks] = useState<ImageTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);

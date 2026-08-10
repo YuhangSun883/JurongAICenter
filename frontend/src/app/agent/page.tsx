@@ -1,13 +1,25 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/home/Sidebar';
 import { ChatHistory, type ChatSession } from '@/components/agent/ChatHistory';
 import { ChatComposer } from '@/components/agent/ChatComposer';
 import { InsufficientCreditsDialog } from '@/components/common/InsufficientCreditsDialog';
+import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { agentApi } from '@/api/agent';
-import type { AgentMessage } from '@/types/agent';
+import type { AgentMessage, AgentToolCall } from '@/types/agent';
 import { Coins, Menu, Settings } from 'lucide-react';
+
+/** toolCall.action 到目标路由的映射 */
+const TOOL_ROUTES: Record<string, { route: string; label: string }> = {
+  'jump-to-image':           { route: '/ai-image',          label: '图片生成' },
+  'jump-to-image-edit':       { route: '/ai-image',          label: '图生图（编辑）' },
+  'jump-to-video':            { route: '/ai-video',          label: '视频生成' },
+  'jump-to-image-to-video':   { route: '/ai-video',          label: '图生视频' },
+  'jump-to-product-image':    { route: '/tools/product-image', label: '商品套图' },
+  'jump-to-image-enhancer':   { route: '/tools/image-enhancer', label: '图像增强' },
+};
 
 /** 把后端的 AgentSession 适配成 ChatHistory 需要的 ChatSession */
 function toChatSession(s: { id: string; title: string; updatedAt: number; pinned?: boolean }): ChatSession {
@@ -20,6 +32,7 @@ function toChatSession(s: { id: string; title: string; updatedAt: number; pinned
 }
 
 export default function AgentPage() {
+  const router = useRouter();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
@@ -30,6 +43,8 @@ export default function AgentPage() {
   const [insufficient, setInsufficient] = useState<{ remaining?: number; required?: number }>({
     remaining: undefined, required: undefined,
   });
+  // AI 跳转建议弹窗（toolCall）
+  const [pendingToolCall, setPendingToolCall] = useState<AgentToolCall | null>(null);
 
   /** 拉会话列表 */
   const refreshSessions = useCallback(async () => {
@@ -109,6 +124,25 @@ export default function AgentPage() {
     }
   }
 
+  /** 用户确认 toolCall 跳转 → 携带 prompt + attachmentIds 跳到对应模块 */
+  function handleConfirmToolCall() {
+    const tc = pendingToolCall;
+    if (!tc) return;
+    const route = TOOL_ROUTES[tc.action];
+    if (!route) {
+      setPendingToolCall(null);
+      return;
+    }
+    const params = new URLSearchParams();
+    params.set('prefill', 'true');
+    params.set('prompt', tc.prompt || '');
+    if (tc.attachmentIds && tc.attachmentIds.length > 0) {
+      params.set('attachmentIds', tc.attachmentIds.join(','));
+    }
+    setPendingToolCall(null);
+    router.push(`${route.route}?${params.toString()}`);
+  }
+
   /** 发送消息 —— 先 checkCredits，再乐观更新请求 send */
   async function handleSend(content: string, attachmentIds: string[]) {
     if (!content.trim() || sending) return;
@@ -168,6 +202,11 @@ export default function AgentPage() {
       await refreshSessions();
       await refreshMessages(res.sessionId); // 用真实消息替换乐观消息
       await refreshCredits();
+
+      // 6) 如果 LLM 返回了 toolCall，弹确认框（不是直接跳，让用户决定）
+      if (res.toolCall && TOOL_ROUTES[res.toolCall.action]) {
+        setPendingToolCall(res.toolCall);
+      }
     } catch (err) {
       // 发送失败：移除乐观消息 + 提示
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUserId && m.id !== thinkingMsgId));
@@ -242,6 +281,20 @@ export default function AgentPage() {
                         : 'mr-auto max-w-[80%] rounded-2xl bg-bg-soft px-4 py-2.5 text-sm text-fg'
                     }
                   >
+                    {/* 用户消息：先显示附件图片，再显示文字 */}
+                    {m.role === 'user' && m.attachments && m.attachments.length > 0 && (
+                      <div className="mb-2 flex flex-wrap gap-2">
+                        {m.attachments.map((att, idx) => (
+                          <img
+                            key={idx}
+                            src={att.url || ''}
+                            alt={att.name || 'attachment'}
+                            className="max-h-40 max-w-[200px] rounded-lg object-cover"
+                            loading="lazy"
+                          />
+                        ))}
+                      </div>
+                    )}
                     {m.content}
                   </div>
                 ))}
@@ -269,6 +322,21 @@ export default function AgentPage() {
         onPaid={() => { refreshCredits(); setInsufficient({ remaining: undefined, required: undefined }); }}
         remaining={insufficient.remaining}
         required={insufficient.required}
+      />
+
+      {/* AI 跳转建议弹窗（toolCall） */}
+      <ConfirmDialog
+        open={!!pendingToolCall}
+        title="AI 建议跳转"
+        description={
+          pendingToolCall
+            ? `AI 认为你想前往【${TOOL_ROUTES[pendingToolCall.action]?.label || pendingToolCall.action}】模块。\n\n意图：${pendingToolCall.prompt}${pendingToolCall.reason ? `\n\n理由：${pendingToolCall.reason}` : ''}${pendingToolCall.attachmentIds?.length ? `\n\n携带素材：${pendingToolCall.attachmentIds.length} 张图片（跳转后会自动填入）` : ''}`
+            : ''
+        }
+        confirmText="前往生成"
+        cancelText="取消"
+        onConfirm={handleConfirmToolCall}
+        onCancel={() => setPendingToolCall(null)}
       />
     </div>
   );

@@ -87,7 +87,6 @@ public class VideoFrameCaptionService {
     private final CanvasNodeRepository nodeRepository;
     @Qualifier("captionExecutor")
     private final Executor captionExecutor;
-    private final com.jurong.aicenter.service.VideoFrameExtractor videoFrameExtractor;
 
     // 限流:同时最多 3 个 caption 请求打 NewAPI(避免打爆中转模型)
     private final Semaphore captionSemaphore = new Semaphore(3);
@@ -102,7 +101,6 @@ public class VideoFrameCaptionService {
                                     CanvasTaskRepository taskRepository,
                                     CanvasNodeRepository nodeRepository,
                                     @Qualifier("captionExecutor") Executor captionExecutor,
-                                    VideoFrameExtractor videoFrameExtractor,
                                     ObjectMapper objectMapper) {
         this.extractor = extractor;
         this.newApiClient = newApiClient;
@@ -110,7 +108,6 @@ public class VideoFrameCaptionService {
         this.taskRepository = taskRepository;
         this.nodeRepository = nodeRepository;
         this.captionExecutor = captionExecutor;
-        this.videoFrameExtractor = videoFrameExtractor;
         this.objectMapper = objectMapper;
     }
 
@@ -165,7 +162,7 @@ public class VideoFrameCaptionService {
             try {
                 Path tempVideoDir = frames.get(0).path().getParent();
                 Path audioFile = tempVideoDir.resolve("audio.wav");
-                Path extracted = videoFrameExtractor.extractAudio(node.getResultUrl(), audioFile);
+                Path extracted = extractor.extractAudio(node.getResultUrl(), audioFile);
                 if (extracted != null) {
                     byte[] audioBytes = java.nio.file.Files.readAllBytes(extracted);
                     List<Map<String, Object>> segments = newApiClient.audioTranscribe(audioBytes, "audio/wav");
@@ -279,7 +276,7 @@ public class VideoFrameCaptionService {
                 }
 
                 // 拼口播文案模板
-                content = assembleScript(frames, captions, null);
+                content = assembleScript(frames, captions, dubMap);
                 node.setContent(content);
                 task.setTextResult(content);
             } else {
@@ -394,7 +391,7 @@ public class VideoFrameCaptionService {
      * 帧内容、文字标注、网格布局都在那张大图里里。画布上只看到 1 个 image 节点。
      */
     private CanvasNode createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
-                                          java.util.List<String> createdIds) {
+                                              java.util.List<String> createdIds) {
         if (combinedUrl == null || combinedUrl.isBlank()) {
             log.warn("[video-sidecar-frames] combinedUrl 为空，跳过帧拼图节点创建");
             return null;
