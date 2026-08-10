@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.dto.canvas.NodeConnection;
-import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.entity.CanvasNode;
 import com.jurong.aicenter.entity.CanvasTask;
 import com.jurong.aicenter.exception.BusinessException;
@@ -13,8 +12,6 @@ import com.jurong.aicenter.repository.CanvasTaskRepository;
 import com.jurong.aicenter.service.StorageService;
 import com.jurong.aicenter.service.VideoFrameExtractor;
 import com.jurong.aicenter.service.VideoFrameExtractor.FrameMeta;
-import lombok.RequiredArgsConstructor;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Async;
@@ -57,7 +54,6 @@ import java.util.stream.IntStream;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class VideoFrameCaptionService {
 
     /** 发给 VL 模型的 prompt —— 单帧版,聚焦动作而不是静态画面,严格 30 字内 */
@@ -283,7 +279,7 @@ public class VideoFrameCaptionService {
                 }
 
                 // 拼口播文案模板
-                content = assembleScript(frames, captions);
+                content = assembleScript(frames, captions, null);
                 node.setContent(content);
                 task.setTextResult(content);
             } else {
@@ -397,11 +393,11 @@ public class VideoFrameCaptionService {
      * combinedUrl 是 combineAndUploadFrames 拼图后上传到 MinIO 的公网 URL。
      * 帧内容、文字标注、网格布局都在那张大图里里。画布上只看到 1 个 image 节点。
      */
-    private void createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
+    private CanvasNode createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
                                           java.util.List<String> createdIds) {
         if (combinedUrl == null || combinedUrl.isBlank()) {
             log.warn("[video-sidecar-frames] combinedUrl 为空，跳过帧拼图节点创建");
-            return;
+            return null;
         }
         final int SIDE_OFFSET = 360;
         int baseX = (videoNode.getPositionX() == null ? 0 : videoNode.getPositionX()) + SIDE_OFFSET;

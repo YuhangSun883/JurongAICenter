@@ -8,6 +8,8 @@ export const videoApi = {
     USE_MOCK ? mock.generateScript(req) : real.generateScript(req),
   create: (req: Parameters<typeof real.create>[0]) =>
     USE_MOCK ? mock.create(req) : real.create(req),
+  createImageToVideo: (imageUrl: string, prompt: string, duration: number, resolution: string) =>
+    real.createImageToVideo(imageUrl, prompt, duration, resolution),
   getTask: (id: string) =>
     USE_MOCK ? mock.getTask(id) : real.getTask(id),
   listTasks: (q?: Parameters<typeof real.listTasks>[0]) =>
