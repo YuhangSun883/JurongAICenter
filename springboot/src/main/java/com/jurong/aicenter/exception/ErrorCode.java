@@ -56,9 +56,9 @@ public enum ErrorCode {
     MEDIA_FILE_TOO_LARGE(7021, "文件超过大小限制"),
     MEDIA_FILE_EMPTY(7022, "文件为空"),
     // Aicoming 外部资产服务
-    ASSET_UPLOAD_FAILED(7030, "外部资产上传失败"),
-    ASSET_NOT_ACTIVE(7031, "外部资产未就绪"),
-    ASSET_DELETE_FAILED(7032, "外部资产删除失败");
+    EXTERNAL_ASSET_UPLOAD_FAILED(7030, "外部资产上传失败"),
+    EXTERNAL_ASSET_NOT_ACTIVE(7031, "外部资产未就绪"),
+    EXTERNAL_ASSET_DELETE_FAILED(7032, "外部资产删除失败");
 
     private final int code;
     private final String message;

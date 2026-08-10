@@ -1,5 +1,7 @@
 package com.jurong.aicenter.controller;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.dto.generation.GenerateRequest;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.dto.job.JobResponse;
@@ -26,6 +28,7 @@ import java.util.Map;
 public class GenerationController {
 
     private final GenerationService generationService;
+    private final ObjectMapper objectMapper;
 
     @PostMapping("/generate")
     public GenerateResponse generate(
@@ -51,6 +54,12 @@ public class GenerationController {
             @PathVariable Long id) {
         if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
         Job job = generationService.getJob(id, principal.id());
+        List<String> resultUrls = null;
+        if (job.getResultUrls() != null && !job.getResultUrls().isBlank()) {
+            try {
+                resultUrls = objectMapper.readValue(job.getResultUrls(), new TypeReference<>() {});
+            } catch (Exception ignored) {}
+        }
         return new JobResponse(
             job.getId(),
             job.getWorkflowId(),
@@ -58,7 +67,7 @@ public class GenerationController {
             job.getStatus(),
             job.getCreditsCost(),
             job.getDurationMs(),
-            null,  // TODO(C2): 解析 result_urls JSON 字符串
+            resultUrls,
             job.getErrorMessage(),
             job.getCreatedAt(),
             job.getCompletedAt()

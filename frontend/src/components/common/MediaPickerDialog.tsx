@@ -164,11 +164,9 @@ export function MediaPickerDialog({
 
   // ============ 派生 ============
   const showUploadedHere = activeTopTab === 'assets' && (source === '全部' || source === '我上传的');
-  // 已入库素材的 URL 集合，用于和本地上传素材去重
-  const assetUrls = new Set(assets.map((a) => a.url));
   const visiblePickedCount =
     (showUploadedHere
-      ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id) && !assetUrls.has(u.url)).length
+      ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id)).length
       : 0) +
     (activeTopTab === 'assets'
       ? assets.filter((a) => pickedIds.has(String(a.id))).length
@@ -561,7 +559,7 @@ function AssetsView({
             })}
 
             {/* 空状态 */}
-            {assets.length === 0 && uploadedFiles.filter((u) => u.type === tabToType[tab] && !assetUrls.has(u.url)).length === 0 && (
+            {assets.length === 0 && uploadedFiles.filter((u) => u.type === tabToType[tab]).length === 0 && (
               <div className="col-span-full grid place-items-center py-10 text-center text-xs text-fg-subtle">
                 没有匹配的素材
               </div>

@@ -53,6 +53,13 @@ springdoc:
     path: /swagger-ui.html
     enabled: true
 
+# ============================================================
+# NewAPI 中转站配置（所有 AI 接口统一走这里）
+# ============================================================
+newapi:
+  base-url: ${NEWAPI_BASE_URL:http://localhost:3000}
+  token: ${NEWAPI_TOKEN:}
+
 management:
   endpoints:
     web:
@@ -81,7 +88,7 @@ llm:
 
 # 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
 canvas:
-  workflows-dir: D:/ymWork/JurongAICenter/workflows/
+  workflows-dir: E:/8-10/JurongAICenter/workflows/
   # 画布节点的默认模型参数（最便宜档位，节省测试费用）
   defaults:
     image-model: gpt-image-2-1k
