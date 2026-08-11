@@ -27,6 +27,8 @@ import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 视频生成服务实现（图生视频）— 走 NewAPI 中转站，图片直传 multipart。
@@ -58,6 +60,15 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
 
     /** 视频任务最大存活时间（30 分钟余量） */
     private static final Duration MAX_RUNNING_DURATION = Duration.ofMinutes(30);
+
+    /**
+     * 轮询 NewAPI 连续 400 计数（key = jobId）。
+     * NewAPI 在任务处理中可能临时返回 400（任务对象尚未完全建好、限流等），
+     * 之前一遇 400 就 markFailed 会把本来能成的任务当失败。
+     * 这里累计连续 400 次数：达到阈值（默认 5 次 ≈ 10s）才认定任务真的不存在。
+     */
+    private static final int NOT_FOUND_GRACE_COUNT = 5;
+    private final Map<Long, AtomicInteger> notFoundCountMap = new ConcurrentHashMap<>();
 
     @Override
     public GenerateResponse submitImageToVideo(Long userId,
@@ -184,20 +195,30 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         try {
             result = newApiClient.pollVideo(taskId);
         } catch (BusinessException e) {
-            // 2026-08-09 fix: 400 (任务不存在)时标 FAILED,避免僵尸 job 每 2 秒打一次 NewAPI
+            // 2026-08-09 fix: 400 (任务不存在)时**不要**立即标 FAILED,NewAPI 在处理中可能临时 400;
+            // 累计连续 400 次数,达到 NOT_FOUND_GRACE_COUNT 才认定真的不存在
             String errMsg = e.getMessage() == null ? "" : e.getMessage();
             boolean taskGone = errMsg.contains("400") || errMsg.toLowerCase().contains("not found") || errMsg.toLowerCase().contains("task does not exist");
             if (taskGone) {
-                log.error("[I2V-POLL] job {} NewAPI 任务不存在 (taskId={}),标 FAILED: {}",
-                    job.getId(), taskId, errMsg);
-                markFailed(job, "NewAPI task not found: " + errMsg);
-                    return;
+                int n = notFoundCountMap.computeIfAbsent(job.getId(), k -> new AtomicInteger(0)).incrementAndGet();
+                if (n >= NOT_FOUND_GRACE_COUNT) {
+                    log.error("[I2V-POLL] job {} NewAPI 任务连续 {} 次 400 (taskId={}), 标 FAILED: {}",
+                        job.getId(), n, taskId, errMsg);
+                    notFoundCountMap.remove(job.getId());
+                    markFailed(job, "NewAPI task not found (after " + n + " retries): " + errMsg);
+                } else {
+                    log.warn("[I2V-POLL] job {} NewAPI 任务 400 ({}/{}), 继续重试: taskId={}, err={}",
+                        job.getId(), n, NOT_FOUND_GRACE_COUNT, taskId, errMsg);
+                }
+                return;
             }
             // 其他错误(503/网络问题等)继续重试
             log.warn("[I2V-POLL] job {} 查询 NewAPI 失败 (下次重试): taskId={}, err={}",
                 job.getId(), taskId, errMsg);
             return;
         }
+        // 成功响应 → 清掉 400 计数
+        notFoundCountMap.remove(job.getId());
         if (result == null) {
             log.warn("[I2V-POLL] job {} 查询 NewAPI 返回 null: taskId={}", job.getId(), taskId);
             return;
@@ -247,17 +268,27 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         log.info("[I2V-DONE] job {} ← 视频已下载: {}B", job.getId(), bytes.length);
 
         try (InputStream is = new ByteArrayInputStream(bytes)) {
-            String minioUrl = storageService.uploadFile(
-                job.getUserId(), job.getId(), filename, is, "video/mp4");
-            log.info("[I2V-DONE] job {} ← 已上传到 MinIO: {}", job.getId(), minioUrl);
+            // 直接调 uploadAiMedia 拿到 UploadResult(含 objectKey)，
+            // 确保 media_assets.object_key 与 MinIO 实际路径一致
+            String ext = "mp4";
+            String contentType = "video/mp4";
+            StorageService.UploadResult up = storageService.uploadAiMedia(
+                job.getUserId(), ext, is, contentType);
+            String objectKey = up.objectKey();
+            String minioUrl = up.url();
+            log.info("[I2V-DONE] job {} ← 已上传到 MinIO: objectKey={}, url={}",
+                job.getId(), objectKey, minioUrl);
 
-            // 记录到 media_assets（"AI 生成结果"库）
-            String objectKey = String.format("ai-platform/%d/%d/%s",
-                job.getUserId(), job.getId(), filename);
-            mediaService.recordAiGenerated(
-                job.getUserId(), "video", filename, "video/mp4",
-                (long) bytes.length, objectKey, "video",
-                String.valueOf(job.getId()));
+            // 写入 media_assets 表（AI 生成结果库），objectKey 与 MinIO 实际路径一致
+            try {
+                mediaService.recordAiGenerated(
+                    job.getUserId(), "video", filename, contentType,
+                    (long) bytes.length, objectKey, "video", String.valueOf(job.getId()));
+                log.info("[I2V-DONE] job {} ← 已写入 media_assets 表: objectKey={}", job.getId(), objectKey);
+            } catch (Exception e) {
+                // 入库失败不阻塞任务完成，只记日志
+                log.warn("[I2V-DONE] job {} ← recordAiGenerated 失败: {}", job.getId(), e.getMessage());
+            }
 
             markCompleted(job, List.of(minioUrl));
             log.info("[I2V-DONE] job {} ← 任务完成", job.getId());

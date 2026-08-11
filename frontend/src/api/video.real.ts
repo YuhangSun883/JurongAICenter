@@ -72,13 +72,20 @@ function mapJobToTask(job: any): VideoTask {
   const mappedStatus = statusMap[rawStatus] || 'queued';
 
   // 解析 resultUrls（后端可能返回 JSON 字符串或数组）
+  // 跳过裸 objectKey（如 "media/10/...mp4" 没有 presigned），只取完整 http(s) URL
   let resultUrl: string | undefined;
+  const pickFirstHttpUrl = (arr: unknown[]): string | undefined => {
+    for (const item of arr) {
+      if (typeof item === 'string' && /^https?:\/\//.test(item)) return item;
+    }
+    return undefined;
+  };
   if (Array.isArray(job.resultUrls) && job.resultUrls.length > 0) {
-    resultUrl = job.resultUrls[0];
+    resultUrl = pickFirstHttpUrl(job.resultUrls);
   } else if (typeof job.resultUrls === 'string' && job.resultUrls) {
     try {
       const arr = JSON.parse(job.resultUrls);
-      if (Array.isArray(arr) && arr.length > 0) resultUrl = arr[0];
+      if (Array.isArray(arr) && arr.length > 0) resultUrl = pickFirstHttpUrl(arr);
     } catch { /* ignore */ }
   }
 
