@@ -1,6 +1,12 @@
 """
 JurongTextToVideo — 文本生成视频
 
+⚠️ DEPRECATED 2026-08-11 — 不再被 Java 端 AI 视频模块调用。
+Java 端已重构为直接调 NewAPI 中转站（见 springboot/.../NewApiClient.submitTextToVideo），
+本节点保留只是为了兼容仍在 ComfyUI 画布里手工拖节点的场景。
+新代码请走 NewApiClient，请勿再用此节点。
+被 v2（text_to_video_v2.py）替代，但 v2 也仅供 Canvas 画布模块使用。
+
 调用 NewAPI /v1/videos (multipart)，只有 prompt
 
 注意：
@@ -32,8 +38,8 @@ class JurongTextToVideo:
                 "duration": (["4", "8"], {
                     "default": "4"
                 }),
-                "resolution": (["480P", "720P"], {
-                    "default": "480P"
+                "resolution": (["480p", "720p", "1080p", "4k"], {
+                    "default": "480p"
                 }),
                 "audio": ("AUDIO", {
                     "tooltip": "可选：参考音频（拖入音频文件）"

@@ -108,10 +108,12 @@ public class VideoSyncServiceImpl implements VideoSyncService {
         }
         log.info("Downloaded video: {} bytes", bytes.length);
 
-        // 4. 上传 MinIO
+        // 4. 上传 MinIO（统一走 ai-platform/ 路径，跟 VideoGenerationServiceImpl 保持一致）
         try (InputStream is = new ByteArrayInputStream(bytes)) {
-            String url = storageService.uploadFile(userId, jobId, filename, is, "video/mp4");
-            log.info("Uploaded to MinIO: {}", url);
+            String objectKey = String.format("ai-platform/%d/%d/%s",
+                userId, jobId, filename);
+            String url = storageService.uploadObject(objectKey, is, "video/mp4");
+            log.info("Uploaded to MinIO: key={}, url={}", objectKey, url);
             return url;
         } catch (Exception e) {
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, "上传 MinIO 失败: " + e.getMessage());

@@ -19,4 +19,6 @@ public class JobResponse {
     private String errorMessage;
     private LocalDateTime createdAt;
     private LocalDateTime completedAt;
+    /** 对应的 media_asset.id（视频完成后已入库时有值）。前端用这个调 /api/media/assets/{mediaAssetId}/stream */
+    private Long mediaAssetId;
 }
