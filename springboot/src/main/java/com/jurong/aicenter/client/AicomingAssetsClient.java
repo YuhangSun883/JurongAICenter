@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import lombok.extern.slf4j.Slf4j;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
@@ -46,10 +44,6 @@ import java.time.Duration;
 @Slf4j
 @Component
 public class AicomingAssetsClient {
-
-    // 2026-08-09: Lombok @Slf4j 在本文件未生成 log 字段，临时显式声明。
-    // （其他文件 @Slf4j 正常，可能与 IDEA 索引或 Lombok 缓存有关）
-    private static final Logger log = LoggerFactory.getLogger(AicomingAssetsClient.class);
 
     private final WebClient.Builder webClientBuilder;
     private final RestTemplate restTemplate;

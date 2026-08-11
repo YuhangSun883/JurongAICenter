@@ -48,6 +48,31 @@ public interface MediaService {
                            String sourceTool, String sourceTaskId);
 
     /**
+     * AI 图片工作台同步生成的图片入库（保存到 media_assets + MinIO）。
+     * 与 saveFavoriteAsAsset 的区别：sourceTool=image（用于"预览"Tab），不依赖 ComfyUI 异步 job。
+     *
+     * @param userId      用户 ID
+     * @param imageBytes  图片字节
+     * @param mimeType    MIME 类型
+     * @return 资产响应（含 assetId、URL、名称）
+     */
+    MediaAssetResponse recordGeneratedImage(Long userId, byte[] imageBytes, String mimeType);
+
+    /**
+     * 把已有 AI 生成图片标记为"已收藏"：UPDATE media_assets.source_tool = 'favorite' WHERE user_id=? AND object_key=?
+     * 不上传、不复制图片（MinIO 中文件保持原样）。
+     *
+     * @return 更新后的资产记录（包含新 source_tool）
+     * @throws BusinessException ASSET_NOT_FOUND 如果用户没有该 objectKey 的图片
+     */
+    MediaAssetResponse markAsFavorite(Long userId, String objectKey);
+
+    /**
+     * 撤销收藏：把 source_tool 改回 'image'（从收藏 Tab 移到预览 Tab）
+     */
+    MediaAssetResponse unmarkAsFavorite(Long userId, String objectKey);
+
+    /**
      * 收藏图片 → 存入"我的资产"库（media_assets + MinIO）。
      * 不单独用 favorites/ 目录，直接按 media/{userId}/{yyyy-MM}/{uuid}.{ext} 存。
      *

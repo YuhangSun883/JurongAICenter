@@ -21,7 +21,7 @@ export interface ImageGenerateResult {
 
 /** 收藏图片响应 */
 export interface FavoriteImageResult {
-  id: string;          // MinIO objectKey
+  objectKey: string;   // MinIO objectKey（用于取消收藏时传给后端）
   url: string;         // MinIO 可访问 URL
   createdAt: number;   // 收藏时间戳
 }
@@ -43,15 +43,15 @@ export async function generateImage(
 }
 
 /**
- * 收藏图片（上传到 MinIO 收藏目录）
- * @param imageData base64 data URI 格式的图片数据
+ * 收藏图片（修改 source_tool 字段，不复制图片）
+ * @param objectKey 已生成图片在 MinIO 中的 objectKey
  */
 export async function favoriteImage(
-  imageData: string
+  objectKey: string
 ): Promise<FavoriteImageResult> {
   return request<FavoriteImageResult>(`${API}/favorite`, {
     method: 'POST',
-    body: { imageData },
+    body: { objectKey },
   });
 }
 

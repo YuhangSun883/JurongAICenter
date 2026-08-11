@@ -14,9 +14,11 @@ import {
   Image as ImageIcon,
   Layers3,
   List,
+  ListChecks,
   Loader2,
   Menu,
   MessageCircleQuestion,
+  PanelRightClose,
   Play,
   Plus,
   Save,
@@ -291,18 +293,160 @@ export function ImageWorkbench() {
   const [tasks, setTasks] = useState<ImageTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // 侧栏折叠状态（仿 AI 视频侧栏，折叠后只显示展开按钮）
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   // AI 图片生成相关状态
   const [generatedUrl, setGeneratedUrl] = useState<string | null>(null);
+  const [generatedAt, setGeneratedAt] = useState<number | null>(null); // 当前预览图片的生成时间（毫秒）
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  // 当前正在生成任务的元信息（用于切走后再回来仍显示"生成中"占位卡）
+  const ACTIVE_GEN_KEY = 'image-workbench:active-generation';
+  const [activeGeneration, setActiveGeneration] = useState<{
+    prompt: string;
+    referencePreviewUrl?: string;
+    startedAt: number;
+  } | null>(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      const raw = window.sessionStorage.getItem(ACTIVE_GEN_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      // 超过 10 分钟的任务视为过期（避免永久卡死显示）
+      if (parsed && typeof parsed.startedAt === 'number'
+          && Date.now() - parsed.startedAt < 10 * 60 * 1000) {
+        return parsed;
+      }
+      window.sessionStorage.removeItem(ACTIVE_GEN_KEY);
+      return null;
+    } catch {
+      return null;
+    }
+  });
+
+  // 同步 activeGeneration 到 sessionStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (activeGeneration) {
+        window.sessionStorage.setItem(ACTIVE_GEN_KEY, JSON.stringify(activeGeneration));
+      } else {
+        window.sessionStorage.removeItem(ACTIVE_GEN_KEY);
+      }
+    } catch {
+      // 静默忽略
+    }
+  }, [activeGeneration]);
+  // 历史生成图片记录（侧栏状态栏下方缩略图卡片使用）
+  // 用 sessionStorage 缓存：组件卸载/页面刷新/切换功能后回来都能立即恢复，不需等待接口
+  const HISTORY_CACHE_KEY = 'image-workbench:generation-history:v2';
+  const HISTORY_CACHE_KEY_LEGACY = 'image-workbench:generation-history'; // 旧版（脏数据），启动时清理
+  // 清理旧版本缓存（key 升级时一次性迁移）
+  if (typeof window !== 'undefined') {
+    try {
+      window.sessionStorage.removeItem(HISTORY_CACHE_KEY_LEGACY);
+    } catch {
+      // 静默忽略
+    }
+  }
+  // 按 url 严格去重（保留首次出现的）
+  // 双键去重：同一 item 的 objectKey 和 url 都加入"已见集合"，任何一方命中都视为重复。
+  // 这样：
+  //   - 后端拉取（带 objectKey）会与本地新生成（无 objectKey 但同 url）正确合并
+  //   - 同一 objectKey 多次返回（url 因预签名不同）也能正确去重
+  const dedupeHistory = (
+    list: { id: string; url: string; objectKey?: string; prompt: string; createdAt: number }[]
+  ) => {
+    const seenKeys = new Set<string>();
+    const seenUrls = new Set<string>();
+    const out: typeof list = [];
+    for (const item of list) {
+      const ok = item.objectKey;
+      const url = item.url;
+      const dupByKey = ok && seenKeys.has(ok);
+      const dupByUrl = url && seenUrls.has(url);
+      if (!ok && !url) continue; // 没有任何可识别键，跳过
+      if (dupByKey || dupByUrl) continue;
+      if (ok) seenKeys.add(ok);
+      if (url) seenUrls.add(url);
+      out.push(item);
+    }
+    return out;
+  };
+  const [generationHistory, setGenerationHistory] = useState<{ id: string; url: string; objectKey?: string; prompt: string; createdAt: number }[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = window.sessionStorage.getItem(HISTORY_CACHE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return dedupeHistory(parsed).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+    } catch {
+      return [];
+    }
+  });
+
+  // 同步 history 到 sessionStorage（切换功能/刷新后回来能立即看到）
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      // 写入前再做一次去重兜底，防止历史 sessionStorage 脏数据持续污染
+      const cleaned = dedupeHistory(generationHistory)
+        .sort((a, b) => b.createdAt - a.createdAt)
+        .slice(0, 50);
+      window.sessionStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify(cleaned));
+    } catch {
+      // 配额超限等异常静默忽略
+    }
+  }, [generationHistory]);
+
+  // 组件挂载时加载后端历史：从 media_assets 表中取 type=image, source=ai-generated 的图片
+  // 与本地缓存按 url 合并去重，再按 createdAt 倒序
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const page = await mediaApi.listAssets({ type: 'image', source: 'ai-generated', page: 1, pageSize: 50 });
+        if (cancelled) return;
+        const remote = (page?.items ?? []).map((it) => {
+          const createdAt = it.createdAt ? new Date(it.createdAt).getTime() || Date.now() : Date.now();
+          return {
+            id: `server-${it.id}`,
+            url: it.url,
+            objectKey: it.objectKey,
+            prompt: it.name || '',
+            createdAt,
+          };
+        });
+        // 合并：远端为权威数据 + 保留本地"更新"的条目（用户会话期间新生成但远端尚未返回的）
+        // 关键：避免远端已有数据时本地重复出现。
+        setGenerationHistory((prev) => {
+          if (remote.length === 0) {
+            // 远端没拉取到（如失败），保留本地
+            return dedupeHistory(prev).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+          }
+          // 远端有数据 → 完全以远端为准，本地"比远端还新"的（createdAt > 远端最大）追加在前
+          const maxRemoteCreated = remote.reduce((m, r) => Math.max(m, r.createdAt), 0);
+          const localNewer = prev.filter((p) => p.createdAt > maxRemoteCreated);
+          const merged = [...localNewer, ...remote];
+          return dedupeHistory(merged).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+        });
+      } catch (e) {
+        console.warn('[ImageWorkbench] 加载生成历史失败:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [isFavorited, setIsFavorited] = useState(false); // 当前生成图片是否已收藏
   const [currentFavoriteId, setCurrentFavoriteId] = useState<string | null>(null); // 当前生成图片对应的收藏 ID（MinIO objectKey）
   const [showNewConfirm, setShowNewConfirm] = useState(false); // 新建确认弹窗
   const [activeTab, setActiveTab] = useState<'preview' | 'favorites'>('preview'); // 预览/收藏 Tab
   // 收藏图片列表：从后端加载，包含 MinIO objectKey、URL、收藏时间
-  const [favorites, setFavorites] = useState<{ id: string; url: string; createdAt: number }[]>([]);
+  const [favorites, setFavorites] = useState<{ objectKey: string; url: string; createdAt: number }[]>([]);
   const [favoriting, setFavoriting] = useState(false); // 收藏操作进行中
   const [loadingFavorites, setLoadingFavorites] = useState(false); // 加载收藏列表中
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set()); // 正在删除的图片ID集合
@@ -576,18 +720,18 @@ export function ImageWorkbench() {
       return;
     }
 
-    // 查找已有的引用数量，确定新引用的索引
-    const existingChips = editor.querySelectorAll('[data-ref-id]');
-    const newIndex = existingChips.length + 1;
+    // 用上方 references 中该 ref 的索引作为编号（1-based），保证芯片顺序与上方缩略图一致
+    const refIdx = references.findIndex((r) => r.id === ref.id);
+    const newIndex = refIdx >= 0
+      ? refIdx + 1
+      : editor.querySelectorAll('[data-ref-id]').length + 1; // 兜底
 
-    // 构建芯片 HTML（匹配截图样式：缩略图 + 名称 + 索引徽章）
+    // 构建芯片 HTML：缩略图 + "图片N"（不再显示文件名与蓝色索引徽章，简洁整齐）
     const chipHtml = `
       <span contenteditable="false" data-ref-id="${ref.id}" data-ref-name="${ref.name}"
         class="inline-flex items-center gap-1 rounded border border-[#d0d7e8] bg-[#eef3ff] px-1.5 py-0.5 align-middle mx-0.5 text-xs leading-5">
-        <img src="${ref.url}" class="h-4 w-4 rounded object-cover" alt="${ref.name}" />
-        <span class="text-[#1a1d26] font-medium">@${ref.name}</span>
-        <span class="text-[10px] text-[#8a8f99]">图片</span>
-        <span class="rounded bg-[#3677ff] px-1 text-[10px] font-semibold text-white">@${newIndex}</span>
+        <img src="${ref.url}" class="h-4 w-4 rounded object-cover" alt="图片${newIndex}" />
+        <span class="text-[#1a1d26] font-medium">图片${newIndex}</span>
       </span>&nbsp;`;
 
     // 查找编辑器中最后一个 "@" 位置，替换 "@xxx" 文本为芯片
@@ -620,7 +764,7 @@ export function ImageWorkbench() {
       const inputEvent = new Event('input', { bubbles: true });
       editor.dispatchEvent(inputEvent);
     });
-  }, []);
+  }, [references]);
 
   // 点击新建按钮：有内容时弹窗确认，无内容时直接新建
   const handleNewClick = useCallback(() => {
@@ -801,16 +945,13 @@ export function ImageWorkbench() {
   // 生成中 = tasks.running + (generating 超过 3 秒时算作生成中)
   // 已完成 = 有 generatedUrl 且 非 generating 时算 1
   const displayQueueCount = useMemo(() => {
-    let count = queued;
-    if (generating && elapsedSeconds < 3) count += 1;
-    return count;
-  }, [queued, generating, elapsedSeconds]);
+    return queued;
+  }, [queued]);
 
   const displayRunningCount = useMemo(() => {
-    let count = running;
-    if (generating && elapsedSeconds >= 3) count += 1;
-    return count;
-  }, [running, generating, elapsedSeconds]);
+    // 当前任务由 activeGeneration 表示，不再叠加"generating"避免重复计数
+    return running;
+  }, [running]);
 
   const displayCompletedCount = useMemo(() => {
     return generatedUrl && !generating ? 1 : 0;
@@ -833,8 +974,9 @@ export function ImageWorkbench() {
     // 最终积分 = 基础 × 清晰度系数 × 提示词系数
     return baseCredits * resolutionFactor * promptFactor;
   }, [prompt, model, resolution]);
-  // 只要有提示词文本或引用图片即可提交
-  const canSubmit = (prompt.trim().length > 0 || referencedImages.length > 0) && !submitting && !generating;
+  // 只要有提示词文本或图片（槽位/引用）即可提交
+  const hasAnyImage = selectedSkill ? references.length > 0 : referencedImages.length > 0;
+  const canSubmit = (prompt.trim().length > 0 || hasAnyImage) && !submitting && !generating;
 
   async function handleUploadFiles(files: FileList | null): Promise<PickedMedia[]> {
     if (!files || files.length === 0) return [];
@@ -915,23 +1057,27 @@ export function ImageWorkbench() {
    */
   async function submit() {
     const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt && referencedImages.length === 0) {
-      console.warn('[ImageWorkbench] submit blocked: empty prompt and no references');
+    const hasSourceImages = selectedSkill ? references.length > 0 : referencedImages.length > 0;
+    if (!trimmedPrompt && !hasSourceImages) {
+      console.warn('[ImageWorkbench] submit blocked: empty prompt and no images');
       return;
     }
 
-    // 将引用图片 URL 转换为 base64 data URI 格式，发送给后端
+    // 合并"图片源"用于提交：
+    //   - 有技能选中：使用槽位图片（references），AI 根据技能/提示词/槽位图生成
+    //   - 无技能选中：使用 @ 引用图片（referencedImages），仅根据提示词+引用图生成
+    const sourceImages = selectedSkill ? references : referencedImages;
     let referenceImagesBase64: string[] = [];
-    if (referencedImages.length > 0) {
+    if (sourceImages.length > 0) {
       try {
-        console.log('[ImageWorkbench] converting reference images to base64...');
+        console.log('[ImageWorkbench] converting source images to base64...');
         referenceImagesBase64 = await Promise.all(
-          referencedImages.map((ref) => urlToBase64(ref.url))
+          sourceImages.map((ref) => urlToBase64(ref.url))
         );
-        console.log('[ImageWorkbench] reference images converted:', referenceImagesBase64.length, 'images');
+        console.log('[ImageWorkbench] source images converted:', referenceImagesBase64.length, 'images');
       } catch (err) {
-        console.error('[ImageWorkbench] failed to convert reference images:', err);
-        setGenerateError('引用图片转换失败，请重试');
+        console.error('[ImageWorkbench] failed to convert source images:', err);
+        setGenerateError('图片转换失败，请重试');
         return;
       }
     }
@@ -946,6 +1092,12 @@ export function ImageWorkbench() {
     setGeneratedUrl(null);
     setSubmitting(true);
     setGenerating(true);
+    // 记录当前正在生成的任务（切走后再回来能恢复"生成中"占位卡）
+    setActiveGeneration({
+      prompt: trimmedPrompt || '(空提示词)',
+      referencePreviewUrl: sourceImages[0]?.url,
+      startedAt: Date.now(),
+    });
 
     // 创建 AbortController 用于超时取消
     const controller = new AbortController();
@@ -981,6 +1133,19 @@ export function ImageWorkbench() {
       if (result && result.imageUrl) {
         // 生成成功，显示图片并自动切到预览 Tab
         setGeneratedUrl(result.imageUrl);
+        setGeneratedAt(Date.now());
+        // 追加到历史缩略图列表（侧栏状态栏下方展示，按 url + objectKey 双键去重）
+        setGenerationHistory((prev) => {
+          return dedupeHistory([
+            {
+              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              url: result.imageUrl,
+              prompt: trimmedPrompt,
+              createdAt: Date.now(),
+            },
+            ...prev,
+          ]).slice(0, 50);
+        });
         setActiveTab('preview');
         console.log('[ImageWorkbench] image URL set:', result.imageUrl);
       } else {
@@ -1005,13 +1170,20 @@ export function ImageWorkbench() {
       abortRef.current = null;
       setGenerating(false);
       setSubmitting(false);
+      // 生成任务结束，清除"生成中"占位卡的持久化状态
+      setActiveGeneration(null);
       console.log('[ImageWorkbench] submit finished');
     }
   }
 
   return (
     <main className="h-screen overflow-hidden bg-[#f7f7f8] px-4 py-5 text-[#16181d] sm:px-6">
-      <div className="grid h-full min-h-0 grid-cols-[minmax(420px,610px)_minmax(0,1fr)_76px] gap-3">
+      <div className={cn(
+        'grid h-full min-h-0 gap-3',
+        sidebarCollapsed
+          ? 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_36px]'
+          : 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_112px]'
+      )}>
         <section className="relative flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-white">
           <div className="flex h-14 items-center justify-between px-4">
             {/* 技能选择下拉栏：点击展开技能面板 */}
@@ -1121,7 +1293,11 @@ export function ImageWorkbench() {
 
           <div className="mx-3 flex min-h-0 flex-1 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc]">
             <div className="flex items-center justify-between px-4 pt-4 text-xs text-[#737985]">
-              {!selectedSkill?.referenceSlots && <span>{references.length} / {currentMaxRefs}</span>}
+              {/* 左：参考图片计数（始终显示在左上角，根据是否选中技能显示不同分母） */}
+              <span className="min-w-[40px]">
+                {references.length} / {currentMaxRefs}
+              </span>
+              {/* 右：保存/我的提示词按钮（始终固定在右侧） */}
               <div className="flex items-center gap-3 text-[#a4aab5]">
                 <button
                   type="button"
@@ -1150,12 +1326,6 @@ export function ImageWorkbench() {
             {/* 技能选中时：显示带标签的上传槽位 + 技能 Banner */}
             {selectedSkill?.referenceSlots && selectedSkill.referenceSlots.length > 0 ? (
               <div className="mt-4 px-4">
-                {/* 参考图片计数 */}
-                <div className="mb-3 flex items-center justify-between">
-                  <span className="text-xs text-[#737985]">
-                    {references.length} / {currentMaxRefs}
-                  </span>
-                </div>
                 {/* 带标签的上传槽位 */}
                 <div className="mb-3 flex flex-wrap gap-2">
                   {selectedSkill.referenceSlots.map((slot, idx) => {
@@ -1297,6 +1467,54 @@ export function ImageWorkbench() {
                 ref={editorRef}
                 contentEditable
                 suppressContentEditableWarning
+                onKeyDown={(e) => {
+                  // Backspace / Delete：允许删除紧邻光标的引用芯片（contenteditable=false 元素）
+                  if (e.key === 'Backspace' || e.key === 'Delete') {
+                    const sel = window.getSelection();
+                    if (!sel || sel.rangeCount === 0) return;
+                    const range = sel.getRangeAt(0);
+                    if (!range.collapsed) return; // 有选区时不处理
+                    const editor = editorRef.current;
+                    if (!editor) return;
+
+                    // 找到光标所在文本节点
+                    let node: Node | null = range.startContainer;
+                    const offset = range.startOffset;
+                    // 上跳到元素层
+                    while (node && node.nodeType === Node.TEXT_NODE && node.parentNode) {
+                      node = node.parentNode;
+                    }
+                    if (!node) return;
+
+                    // 检查 Backspace：当前光标前一个兄弟节点是否是 chip
+                    if (e.key === 'Backspace') {
+                      // 情况 1：文本节点开头，光标前一个字符是 chip 的一部分（不常见）
+                      // 情况 2：编辑器根节点的直接子节点是 chip，且光标在其后
+                      const prev = node.previousSibling as HTMLElement | null;
+                      const prevPrev = (node as HTMLElement).previousElementSibling;
+                      // 最常见：当前文本节点紧跟在 chip 之后，且 offset=0
+                      if (
+                        range.startContainer.nodeType === Node.TEXT_NODE &&
+                        offset === 0 &&
+                        (prev?.nodeType === Node.ELEMENT_NODE || prevPrev)
+                      ) {
+                        const chip = (prev as HTMLElement | null)?.querySelector?.('[data-ref-id]')
+                          || (prevPrev as HTMLElement | null);
+                        if (chip && chip.matches?.('[data-ref-id]')) {
+                          e.preventDefault();
+                          chip.remove();
+                          // 触发 input 事件同步 prompt 和 referencedImages
+                          const inputEvent = new Event('input', { bubbles: true });
+                          editor.dispatchEvent(inputEvent);
+                          return;
+                        }
+                      }
+                      // 情况 3：chip 内最后位置的文本（contenteditable=false 内的文本节点不可编辑，
+                      //         浏览器允许 backspace 删除该 chip）
+                      //         浏览器原生行为已能处理，这里不用管
+                    }
+                  }
+                }}
                 onKeyUp={() => {
                   // 键松开后更新菜单位置（跟随光标）
                   updateMenuPosition();
@@ -1510,7 +1728,7 @@ export function ImageWorkbench() {
                   : 'text-[#575e69] hover:text-[#1d222b]'
               )}
             >
-              收藏{favorites.length > 0 && <span className="ml-1 text-[10px] text-[#747b86]">({favorites.length})</span>}
+              收藏
             </button>
           </div>
 
@@ -1575,16 +1793,25 @@ export function ImageWorkbench() {
                       setFavoriting(true);
                       try {
                         if (!isFavorited) {
-                          // 收藏：上传 base64 图片到 MinIO
-                          const result = await imageApi.favoriteImage(generatedUrl);
-                          setFavorites((prev) => [{ id: result.id, url: result.url, createdAt: result.createdAt }, ...prev]);
-                          setCurrentFavoriteId(result.id); // 记录当前图片对应的收藏 ID
+                          // 收藏：从 history 中找到当前图片的 objectKey，调后端标记 source_tool='favorite'
+                          const matched = dedupeHistory(generationHistory).find((h) => h.url === generatedUrl);
+                          const objectKey = matched?.objectKey;
+                          if (!objectKey) {
+                            // 没有 objectKey（用户切走后再回来老 sessionStorage 中的旧条目）—— 兜底：等下次刷新再收藏
+                            console.warn('[ImageWorkbench] 当前图片缺少 objectKey，请刷新后再试');
+                            alert('当前图片尚未同步到服务器，请刷新页面后再收藏');
+                            return;
+                          }
+                          const result = await imageApi.favoriteImage(objectKey);
+                          setFavorites((prev) => [{ objectKey: result.objectKey, url: result.url, createdAt: result.createdAt }, ...prev]);
+                          setCurrentFavoriteId(objectKey); // 记录当前图片对应的 objectKey（取消收藏时用）
                           setIsFavorited(true);
                         } else {
-                          // 取消收藏：用 currentFavoriteId 直接从 MinIO 删除
-                          if (currentFavoriteId) {
-                            await imageApi.unfavoriteImage(currentFavoriteId);
-                            setFavorites((prev) => prev.filter((f) => f.id !== currentFavoriteId));
+                          // 取消收藏：把 source_tool 改回 'image'（不删除图片）
+                          const objectKey = currentFavoriteId;
+                          if (objectKey) {
+                            await imageApi.unfavoriteImage(objectKey);
+                            setFavorites((prev) => prev.filter((f) => f.objectKey !== objectKey));
                             setCurrentFavoriteId(null);
                           }
                           setIsFavorited(false);
@@ -1610,9 +1837,16 @@ export function ImageWorkbench() {
                     <Star className={cn('h-[18px] w-[18px] transition-transform', isFavorited ? 'fill-current' : '', 'active:scale-90')} />
                   </button>
                 </div>
-                {/* 图片下方操作栏：查看原图 | 下载 | 重新生成 */}
+                {/* 图片下方操作栏：日期 | 查看原图 | 下载 */}
                 <div className="mt-3 flex items-center justify-between text-xs text-[#6f7682]">
-                  <span>模型：gpt-image-2-2k</span>
+                  <span>
+                    {generatedAt
+                      ? new Date(generatedAt).toLocaleString('zh-CN', {
+                          year: 'numeric', month: '2-digit', day: '2-digit',
+                          hour: '2-digit', minute: '2-digit', hour12: false,
+                        }).replace(/\//g, '-')
+                      : '——'}
+                  </span>
                   <div className="flex items-center gap-2">
                     <a
                       href={generatedUrl}
@@ -1660,18 +1894,6 @@ export function ImageWorkbench() {
                       <Download className="h-3.5 w-3.5" />
                       下载
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setGeneratedUrl(null);
-                        setPrompt('');
-                        setIsFavorited(false);
-                        setCurrentFavoriteId(null); // 重置收藏 ID
-                      }}
-                      className="rounded border border-[#e4e5e9] px-2 py-1 hover:bg-[#f3f4f6]"
-                    >
-                      重新生成
-                    </button>
                   </div>
                 </div>
               </div>
@@ -1712,7 +1934,7 @@ export function ImageWorkbench() {
             ) : (
               <div className="grid grid-cols-2 gap-3">
                 {favorites.map((fav) => (
-                  <div key={fav.id} className="group relative overflow-hidden rounded-lg bg-white shadow-sm">
+                  <div key={fav.objectKey} className="group relative overflow-hidden rounded-lg bg-white shadow-sm">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={fav.url}
@@ -1743,13 +1965,13 @@ export function ImageWorkbench() {
                         下载
                       </button>
                       <button
-                        disabled={deletingIds.has(fav.id)}
+                        disabled={deletingIds.has(fav.objectKey)}
                         onClick={async () => {
                           // 标记为删除中（乐观更新）
-                          setDeletingIds((prev) => new Set(prev).add(fav.id));
-                          setFavorites((prev) => prev.filter((f) => f.id !== fav.id));
+                          setDeletingIds((prev) => new Set(prev).add(fav.objectKey));
+                          setFavorites((prev) => prev.filter((f) => f.objectKey !== fav.objectKey));
                           try {
-                            await imageApi.unfavoriteImage(fav.id);
+                            await imageApi.unfavoriteImage(fav.objectKey);
                           } catch (err) {
                             console.error('取消收藏失败:', err);
                             // 失败时回退
@@ -1757,15 +1979,15 @@ export function ImageWorkbench() {
                           } finally {
                             setDeletingIds((prev) => {
                               const next = new Set(prev);
-                              next.delete(fav.id);
+                              next.delete(fav.objectKey);
                               return next;
                             });
                           }
                         }}
                         className="rounded bg-white/90 px-2 py-1 text-xs text-[#e5484d] hover:bg-white disabled:opacity-50 disabled:cursor-not-allowed"
-                        title={deletingIds.has(fav.id) ? '删除中...' : '取消收藏'}
+                        title={deletingIds.has(fav.objectKey) ? '删除中...' : '取消收藏'}
                       >
-                        {deletingIds.has(fav.id) ? '删除中' : '移除'}
+                        {deletingIds.has(fav.objectKey) ? '删除中' : '移除'}
                       </button>
                     </div>
                   </div>
@@ -1776,129 +1998,105 @@ export function ImageWorkbench() {
           )}
         </section>
 
-        <aside className="flex min-h-0 flex-col items-center rounded-xl border border-[#e4e5e9] bg-[#fbfbfc] py-5">
-          {/* AI图片生成状态栏：排队中 / 生成中 / 已完成 */}
-          <div className="w-16 rounded-lg border border-[#eceef2] bg-white py-3 text-center shadow-sm">
-            <div className={cn(
-              'text-xs transition-colors',
-              displayQueueCount > 0 ? 'text-[#3677ff] font-medium' : 'text-[#9ca2ad]'
-            )}>
-              排队中
-            </div>
-            <div className={cn(
-              'text-2xl font-semibold leading-7 transition-colors',
-              displayQueueCount > 0 ? 'text-[#3677ff]' : 'text-[#444a55]'
-            )}>
-              {displayQueueCount}
-            </div>
-            <div className={cn(
-              'mt-2 text-xs transition-colors',
-              displayRunningCount > 0 ? 'text-[#11a96e] font-medium' : 'text-[#9ca2ad]'
-            )}>
-              生成中
-            </div>
-            <div className={cn(
-              'text-2xl font-semibold leading-7 transition-colors',
-              displayRunningCount > 0 ? 'text-[#11a96e]' : 'text-[#444a55]'
-            )}>
-              {displayRunningCount}
-            </div>
-            <div className={cn(
-              'mt-2 text-xs transition-colors',
-              displayCompletedCount > 0 ? 'text-[#f5a524] font-medium' : 'text-[#9ca2ad]'
-            )}>
-              已完成
-            </div>
-            <div className={cn(
-              'text-2xl font-semibold leading-7 transition-colors',
-              displayCompletedCount > 0 ? 'text-[#f5a524]' : 'text-[#444a55]'
-            )}>
-              {displayCompletedCount}
-            </div>
-          </div>
-          {/* 生成中/已完成图片缩略图卡片（替换原来的 Layers3 图标按钮） */}
-          <div className="mt-6 w-16">
-            <div
-              className="relative aspect-square w-full overflow-hidden rounded-lg border shadow-sm"
-              style={{
-                // 根据状态决定边框颜色和背景
-                backgroundImage: generatedUrl
-                  ? `url(${generatedUrl})`
-                  : referencedImages.length > 0
-                    ? `url(${referencedImages[0].url})`
-                    : 'linear-gradient(180deg, #e8eaf0 0%, #c8ccd6 100%)',
-                backgroundSize: 'cover',
-                backgroundPosition: 'center',
-                borderColor:
-                  displayRunningCount > 0
-                    ? '#9ad5b6'
-                    : displayCompletedCount > 0
-                      ? '#f5d58e'
-                      : '#cfd3dc',
-              }}
+        <aside className="flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc] py-4">
+          {sidebarCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed(false)}
+              className="mx-auto grid h-7 w-7 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
+              title="展开侧栏"
             >
-              {/* 无图时显示编辑图标占位 */}
-              {!generatedUrl && referencedImages.length === 0 && (
-                <div className="grid h-full w-full place-items-center bg-[rgba(255,255,255,0.45)]">
-                  <ImageIcon className="h-6 w-6 text-[#7a808c]" />
-                </div>
-              )}
-              {/* 生成中显示 Loader 覆盖层 */}
-              {displayRunningCount > 0 && (
-                <div className="grid h-full w-full place-items-center bg-[rgba(0,0,0,0.12)] backdrop-blur-[1px]">
-                  <Loader2 className="h-5 w-5 animate-spin text-white drop-shadow" />
-                </div>
-              )}
-              {/* 右上角状态标签（截图中的"编辑中"样式） */}
-              <div
-                className={cn(
-                  'absolute left-1.5 top-1.5 inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-semibold shadow-sm',
-                  displayRunningCount > 0
-                    ? 'bg-[#11a96e] text-white'
-                    : displayQueueCount > 0
-                      ? 'bg-[#3677ff] text-white'
-                      : displayCompletedCount > 0
-                        ? 'bg-[#f5a524] text-white'
-                        : 'bg-white/90 text-[#545a66] ring-1 ring-[#d8dbe2]'
-                )}
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          ) : (
+            <div className="flex items-center justify-between px-3">
+              <span className="text-xs font-semibold text-[#3f4652]">任务队列</span>
+              <button
+                type="button"
+                onClick={() => setSidebarCollapsed(true)}
+                className="grid h-6 w-6 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
+                title="收起侧栏"
               >
-                {displayRunningCount > 0
-                  ? '生成中'
-                  : displayQueueCount > 0
-                    ? '排队中'
-                    : displayCompletedCount > 0
-                      ? '已完成'
-                      : '编辑中'}
-              </div>
-              {/* 底部日期时间（截图中的 08/08 12:47 样式） */}
-              <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-end justify-between gap-1">
-                <div className="text-[10px] font-medium leading-tight text-white drop-shadow">
-                  <div>{new Date().toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' }).replace(/\//g, '/')}</div>
-                  <div>{new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })}</div>
+                <PanelRightClose className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {!sidebarCollapsed && (
+            <>
+              <div className="mt-5 flex gap-2 rounded-lg border border-[#eceef2] bg-white px-2.5 py-2.5 text-center shadow-sm">
+                <div className="flex-1">
+                  <div className="text-[10px] text-[#9ca2ad]">排队中</div>
+                  <div className="text-base font-semibold leading-5">{displayQueueCount}</div>
                 </div>
-                {/* 右下角删除按钮（截图中的垃圾桶样式） */}
-                {(generatedUrl || referencedImages.length > 0) && (
+                <div className="w-px bg-[#eceef2]" />
+                <div className="flex-1">
+                  <div className="text-[10px] text-[#9ca2ad]">生成中</div>
+                  <div className="text-base font-semibold leading-5">
+                    {/* 优先显示当前活动生成任务，再叠加 store 中其他任务数 */}
+                    {(activeGeneration ? 1 : 0) + displayRunningCount}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-3 flex min-h-0 flex-1 flex-col items-center gap-2 overflow-auto px-1.5">
+                {/* 当前正在生成的任务（仿视频侧栏卡片样式：aspect-square） */}
+                {activeGeneration && !generationHistory.some((h) => h.url === generatedUrl) && (
+                  <div
+                    className={cn(
+                      'relative w-full flex-none overflow-hidden rounded-lg border shadow-sm transition',
+                      'border-[#e7e9ed]'
+                    )}
+                  >
+                    <div
+                      className="flex aspect-square w-full items-center justify-center bg-[#f4f5f7] text-[#9ca2ad]"
+                      style={{
+                        backgroundImage: generatedUrl
+                          ? `url(${generatedUrl})`
+                          : activeGeneration.referencePreviewUrl
+                            ? `url(${activeGeneration.referencePreviewUrl})`
+                            : undefined,
+                        backgroundSize: 'cover',
+                        backgroundPosition: 'center',
+                      }}
+                    >
+                      {!generatedUrl && !activeGeneration.referencePreviewUrl && (
+                        <ImageIcon className="h-4 w-4 text-[#a4aab5]" />
+                      )}
+                      {/* 切走再回来后 React state generating 已为 false，但仍要显示旋转 Loader */}
+                      <Loader2 className="h-4 w-4 animate-spin text-[#4f7cff]" />
+                    </div>
+                    {/* 蓝色进度条：始终显示 */}
+                    <div className="absolute bottom-0 left-0 h-0.5 bg-[#4f7cff] w-full" />
+                  </div>
+                )}
+
+                {/* 历史生成图列表 */}
+                {generationHistory.length === 0 && !activeGeneration && (
+                  <p className="pt-8 text-[10px] text-[#c2c6cf]">暂无任务</p>
+                )}
+                {dedupeHistory(generationHistory).map((item) => (
                   <button
+                    key={item.id}
                     type="button"
                     onClick={() => {
-                      if (generatedUrl) {
-                        setGeneratedUrl(null);
-                        setIsFavorited(false);
-                        setCurrentFavoriteId(null); // 重置收藏 ID
-                      }
+                      setGeneratedUrl(item.url);
+                      setGeneratedAt(item.createdAt);
+                      setActiveTab('preview');
                     }}
-                    className="grid h-3.5 w-3.5 place-items-center rounded bg-black/40 text-white backdrop-blur-sm transition-colors hover:bg-black/60"
-                    aria-label="清除"
+                    title={item.prompt || '(空提示词)'}
+                    className={cn(
+                      'relative w-full flex-none overflow-hidden rounded-lg border shadow-sm transition',
+                      generatedUrl === item.url
+                        ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
+                        : 'border-[#e7e9ed] hover:border-[#cbd3e6]'
+                    )}
                   >
-                    <Trash2 className="h-2.5 w-2.5" />
+                    <img src={item.url} alt="" className="aspect-square w-full object-cover" />
                   </button>
-                )}
-              </div>
-            </div>
-          </div>
-          <div className="mt-auto pb-2">
-            <ChevronRight className="h-4 w-4 text-[#a6abb4]" />
-          </div>
+                ))}
+                </div>
+              <div className="mt-auto pb-2" />
+            </>
+          )}
         </aside>
       </div>
 

@@ -5,12 +5,13 @@ import lombok.Data;
 
 /**
  * 图片收藏请求 DTO
- * 用户点击收藏按钮时，将 base64 图片数据上传到 MinIO 持久化存储
+ * 用户点击收藏按钮时，把"AI 生成"记录（source_tool='image'）标记为"已收藏"（source_tool='favorite'），
+ * 不再额外上传/复制图片（避免 MinIO 重复存储）。
  */
 @Data
 public class FavoriteImageRequest {
 
-    /** 图片数据（base64 data URI 格式，如 data:image/png;base64,...） */
-    @NotBlank(message = "图片数据不能为空")
-    private String imageData;
+    /** 已生成的 AI 图片在 MinIO 中的 objectKey（如 media/123/2026-08/abc.png） */
+    @NotBlank(message = "objectKey 不能为空")
+    private String objectKey;
 }
