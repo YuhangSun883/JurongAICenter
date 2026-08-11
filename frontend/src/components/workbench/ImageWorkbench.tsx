@@ -720,18 +720,18 @@ export function ImageWorkbench() {
       return;
     }
 
-    // 查找已有的引用数量，确定新引用的索引
-    const existingChips = editor.querySelectorAll('[data-ref-id]');
-    const newIndex = existingChips.length + 1;
+    // 用上方 references 中该 ref 的索引作为编号（1-based），保证芯片顺序与上方缩略图一致
+    const refIdx = references.findIndex((r) => r.id === ref.id);
+    const newIndex = refIdx >= 0
+      ? refIdx + 1
+      : editor.querySelectorAll('[data-ref-id]').length + 1; // 兜底
 
-    // 构建芯片 HTML（匹配截图样式：缩略图 + 名称 + 索引徽章）
+    // 构建芯片 HTML：缩略图 + "图片N"（不再显示文件名与蓝色索引徽章，简洁整齐）
     const chipHtml = `
       <span contenteditable="false" data-ref-id="${ref.id}" data-ref-name="${ref.name}"
         class="inline-flex items-center gap-1 rounded border border-[#d0d7e8] bg-[#eef3ff] px-1.5 py-0.5 align-middle mx-0.5 text-xs leading-5">
-        <img src="${ref.url}" class="h-4 w-4 rounded object-cover" alt="${ref.name}" />
-        <span class="text-[#1a1d26] font-medium">@${ref.name}</span>
-        <span class="text-[10px] text-[#8a8f99]">图片</span>
-        <span class="rounded bg-[#3677ff] px-1 text-[10px] font-semibold text-white">@${newIndex}</span>
+        <img src="${ref.url}" class="h-4 w-4 rounded object-cover" alt="图片${newIndex}" />
+        <span class="text-[#1a1d26] font-medium">图片${newIndex}</span>
       </span>&nbsp;`;
 
     // 查找编辑器中最后一个 "@" 位置，替换 "@xxx" 文本为芯片
@@ -764,7 +764,7 @@ export function ImageWorkbench() {
       const inputEvent = new Event('input', { bubbles: true });
       editor.dispatchEvent(inputEvent);
     });
-  }, []);
+  }, [references]);
 
   // 点击新建按钮：有内容时弹窗确认，无内容时直接新建
   const handleNewClick = useCallback(() => {
@@ -974,8 +974,9 @@ export function ImageWorkbench() {
     // 最终积分 = 基础 × 清晰度系数 × 提示词系数
     return baseCredits * resolutionFactor * promptFactor;
   }, [prompt, model, resolution]);
-  // 只要有提示词文本或引用图片即可提交
-  const canSubmit = (prompt.trim().length > 0 || referencedImages.length > 0) && !submitting && !generating;
+  // 只要有提示词文本或图片（槽位/引用）即可提交
+  const hasAnyImage = selectedSkill ? references.length > 0 : referencedImages.length > 0;
+  const canSubmit = (prompt.trim().length > 0 || hasAnyImage) && !submitting && !generating;
 
   async function handleUploadFiles(files: FileList | null): Promise<PickedMedia[]> {
     if (!files || files.length === 0) return [];
@@ -1056,23 +1057,27 @@ export function ImageWorkbench() {
    */
   async function submit() {
     const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt && referencedImages.length === 0) {
-      console.warn('[ImageWorkbench] submit blocked: empty prompt and no references');
+    const hasSourceImages = selectedSkill ? references.length > 0 : referencedImages.length > 0;
+    if (!trimmedPrompt && !hasSourceImages) {
+      console.warn('[ImageWorkbench] submit blocked: empty prompt and no images');
       return;
     }
 
-    // 将引用图片 URL 转换为 base64 data URI 格式，发送给后端
+    // 合并"图片源"用于提交：
+    //   - 有技能选中：使用槽位图片（references），AI 根据技能/提示词/槽位图生成
+    //   - 无技能选中：使用 @ 引用图片（referencedImages），仅根据提示词+引用图生成
+    const sourceImages = selectedSkill ? references : referencedImages;
     let referenceImagesBase64: string[] = [];
-    if (referencedImages.length > 0) {
+    if (sourceImages.length > 0) {
       try {
-        console.log('[ImageWorkbench] converting reference images to base64...');
+        console.log('[ImageWorkbench] converting source images to base64...');
         referenceImagesBase64 = await Promise.all(
-          referencedImages.map((ref) => urlToBase64(ref.url))
+          sourceImages.map((ref) => urlToBase64(ref.url))
         );
-        console.log('[ImageWorkbench] reference images converted:', referenceImagesBase64.length, 'images');
+        console.log('[ImageWorkbench] source images converted:', referenceImagesBase64.length, 'images');
       } catch (err) {
-        console.error('[ImageWorkbench] failed to convert reference images:', err);
-        setGenerateError('引用图片转换失败，请重试');
+        console.error('[ImageWorkbench] failed to convert source images:', err);
+        setGenerateError('图片转换失败，请重试');
         return;
       }
     }
@@ -1090,7 +1095,7 @@ export function ImageWorkbench() {
     // 记录当前正在生成的任务（切走后再回来能恢复"生成中"占位卡）
     setActiveGeneration({
       prompt: trimmedPrompt || '(空提示词)',
-      referencePreviewUrl: referencedImages[0]?.url,
+      referencePreviewUrl: sourceImages[0]?.url,
       startedAt: Date.now(),
     });
 
@@ -1462,6 +1467,54 @@ export function ImageWorkbench() {
                 ref={editorRef}
                 contentEditable
                 suppressContentEditableWarning
+                onKeyDown={(e) => {
+                  // Backspace / Delete：允许删除紧邻光标的引用芯片（contenteditable=false 元素）
+                  if (e.key === 'Backspace' || e.key === 'Delete') {
+                    const sel = window.getSelection();
+                    if (!sel || sel.rangeCount === 0) return;
+                    const range = sel.getRangeAt(0);
+                    if (!range.collapsed) return; // 有选区时不处理
+                    const editor = editorRef.current;
+                    if (!editor) return;
+
+                    // 找到光标所在文本节点
+                    let node: Node | null = range.startContainer;
+                    const offset = range.startOffset;
+                    // 上跳到元素层
+                    while (node && node.nodeType === Node.TEXT_NODE && node.parentNode) {
+                      node = node.parentNode;
+                    }
+                    if (!node) return;
+
+                    // 检查 Backspace：当前光标前一个兄弟节点是否是 chip
+                    if (e.key === 'Backspace') {
+                      // 情况 1：文本节点开头，光标前一个字符是 chip 的一部分（不常见）
+                      // 情况 2：编辑器根节点的直接子节点是 chip，且光标在其后
+                      const prev = node.previousSibling as HTMLElement | null;
+                      const prevPrev = (node as HTMLElement).previousElementSibling;
+                      // 最常见：当前文本节点紧跟在 chip 之后，且 offset=0
+                      if (
+                        range.startContainer.nodeType === Node.TEXT_NODE &&
+                        offset === 0 &&
+                        (prev?.nodeType === Node.ELEMENT_NODE || prevPrev)
+                      ) {
+                        const chip = (prev as HTMLElement | null)?.querySelector?.('[data-ref-id]')
+                          || (prevPrev as HTMLElement | null);
+                        if (chip && chip.matches?.('[data-ref-id]')) {
+                          e.preventDefault();
+                          chip.remove();
+                          // 触发 input 事件同步 prompt 和 referencedImages
+                          const inputEvent = new Event('input', { bubbles: true });
+                          editor.dispatchEvent(inputEvent);
+                          return;
+                        }
+                      }
+                      // 情况 3：chip 内最后位置的文本（contenteditable=false 内的文本节点不可编辑，
+                      //         浏览器允许 backspace 删除该 chip）
+                      //         浏览器原生行为已能处理，这里不用管
+                    }
+                  }
+                }}
                 onKeyUp={() => {
                   // 键松开后更新菜单位置（跟随光标）
                   updateMenuPosition();
