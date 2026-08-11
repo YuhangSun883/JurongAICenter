@@ -18,4 +18,7 @@ public class ImageGenerateResponse {
 
     /** 原始 NewAPI 返回的 URL（用于调试） */
     private String originalUrl;
+
+    /** 入库后的 MinIO objectKey（用于前端收藏时调用 markAsFavorite） */
+    private String objectKey;
 }

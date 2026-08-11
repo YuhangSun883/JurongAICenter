@@ -17,6 +17,7 @@ export interface ImageGenerateResult {
   imageUrl: string;    // 图片地址（base64 data URI 或 MinIO URL）
   model: string;       // 使用的模型名称
   originalUrl: string; // NewAPI 原始返回的 URL
+  objectKey?: string;  // 入库后的 MinIO objectKey（用于收藏时传给后端）
 }
 
 /** 收藏图片响应 */

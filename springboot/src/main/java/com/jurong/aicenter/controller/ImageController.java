@@ -113,13 +113,15 @@ public class ImageController {
 
         // 3. 入库到 media_assets（type=image, source=ai-generated, sourceTool=image）
         //    这样预览窗口的图片会进入任务队列（用户切走再回来也能看到历史）
+        String savedObjectKey = null;
         try {
             int commaIdx = base64DataUri.indexOf(',');
             String mimeType = base64DataUri.startsWith("data:image/png") ? "image/png" : "image/jpeg";
             if (commaIdx != -1) {
                 byte[] imageBytes = Base64.getDecoder().decode(base64DataUri.substring(commaIdx + 1));
                 MediaAssetResponse saved = mediaService.recordGeneratedImage(userId, imageBytes, mimeType);
-                log.info("AI 生成图片已入库: assetId={}, url={}", saved.getId(), saved.getUrl());
+                savedObjectKey = saved.getObjectKey();
+                log.info("AI 生成图片已入库: assetId={}, objectKey={}", saved.getId(), savedObjectKey);
             }
         } catch (Exception e) {
             // 入库失败不影响主流程（生成已成功），仅记录告警
@@ -130,7 +132,8 @@ public class ImageController {
         ImageGenerateResponse response = new ImageGenerateResponse(
             base64DataUri,
             "gpt-image-2-2k",
-            base64DataUri
+            base64DataUri,
+            savedObjectKey
         );
 
         // 计算图片详细属性

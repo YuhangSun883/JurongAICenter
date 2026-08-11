@@ -299,6 +299,7 @@ export function ImageWorkbench() {
   // AI 图片生成相关状态
   const [generatedUrl, setGeneratedUrl] = useState<string | null>(null);
   const [generatedAt, setGeneratedAt] = useState<number | null>(null); // 当前预览图片的生成时间（毫秒）
+  const [generatedObjectKey, setGeneratedObjectKey] = useState<string | null>(null); // 当前预览图片入库后的 MinIO objectKey（用于收藏时传给后端）
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -352,30 +353,48 @@ export function ImageWorkbench() {
     }
   }
   // 按 url 严格去重（保留首次出现的）
-  // 双键去重：同一 item 的 objectKey 和 url 都加入"已见集合"，任何一方命中都视为重复。
-  // 这样：
-  //   - 后端拉取（带 objectKey）会与本地新生成（无 objectKey 但同 url）正确合并
-  //   - 同一 objectKey 多次返回（url 因预签名不同）也能正确去重
+  // 四重去重：
+  //   1) 同一 objectKey 视为同一条（主要）
+  //   2) 同一 url 视为同一条
+  //   3) createdAt 相差 ≤ 60 秒 且 prompt 相同 也视为同一条（兜底处理"前端 base64 条目与远端 MinIO 条目并存"的场景）
+  //   4) 当远端条目（带 objectKey）与本地条目（无 objectKey 但同 url）冲突时，保留远端条目（带 sourceTool 等完整字段）
   const dedupeHistory = (
-    list: { id: string; url: string; objectKey?: string; prompt: string; createdAt: number }[]
+    list: { id: string; url: string; objectKey?: string; sourceTool?: string; prompt: string; createdAt: number }[]
   ) => {
-    const seenKeys = new Set<string>();
-    const seenUrls = new Set<string>();
-    const out: typeof list = [];
+    // 第一遍：先收集所有带 objectKey 的条目作为权威，后续遇到同 url 的无 objectKey 条目跳过
+    const keyedItems: typeof list = [];
+    const unkeyedItems: typeof list = [];
     for (const item of list) {
-      const ok = item.objectKey;
+      if (item.objectKey) keyedItems.push(item);
+      else unkeyedItems.push(item);
+    }
+    const seenKeys = new Set<string>();
+    const out: typeof list = [];
+    for (const item of keyedItems) {
+      const ok = item.objectKey!;
+      if (seenKeys.has(ok)) continue;
+      seenKeys.add(ok);
+      out.push(item);
+    }
+    // 第二遍：处理无 objectKey 的条目（如前端 base64 unshift），只在远端没有匹配时保留
+    const TIME_WINDOW_MS = 60_000;
+    const seenUrls = new Set<string>(out.map((it) => it.url).filter(Boolean) as string[]);
+    for (const item of unkeyedItems) {
       const url = item.url;
-      const dupByKey = ok && seenKeys.has(ok);
       const dupByUrl = url && seenUrls.has(url);
-      if (!ok && !url) continue; // 没有任何可识别键，跳过
-      if (dupByKey || dupByUrl) continue;
-      if (ok) seenKeys.add(ok);
-      if (url) seenUrls.add(url);
+      const dupByTime = !dupByUrl && out.some((existing) =>
+        existing.prompt && item.prompt
+        && existing.prompt === item.prompt
+        && Math.abs(existing.createdAt - item.createdAt) <= TIME_WINDOW_MS
+      );
+      if (!url) continue;
+      if (dupByUrl || dupByTime) continue; // 远端有同条目，跳过本地
+      seenUrls.add(url);
       out.push(item);
     }
     return out;
   };
-  const [generationHistory, setGenerationHistory] = useState<{ id: string; url: string; objectKey?: string; prompt: string; createdAt: number }[]>(() => {
+  const [generationHistory, setGenerationHistory] = useState<{ id: string; url: string; objectKey?: string; sourceTool?: string; prompt: string; createdAt: number }[]>(() => {
     if (typeof window === 'undefined') return [];
     try {
       const raw = window.sessionStorage.getItem(HISTORY_CACHE_KEY);
@@ -404,43 +423,72 @@ export function ImageWorkbench() {
 
   // 组件挂载时加载后端历史：从 media_assets 表中取 type=image, source=ai-generated 的图片
   // 与本地缓存按 url 合并去重，再按 createdAt 倒序
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const page = await mediaApi.listAssets({ type: 'image', source: 'ai-generated', page: 1, pageSize: 50 });
-        if (cancelled) return;
-        const remote = (page?.items ?? []).map((it) => {
-          const createdAt = it.createdAt ? new Date(it.createdAt).getTime() || Date.now() : Date.now();
-          return {
-            id: `server-${it.id}`,
-            url: it.url,
-            objectKey: it.objectKey,
-            prompt: it.name || '',
-            createdAt,
-          };
-        });
-        // 合并：远端为权威数据 + 保留本地"更新"的条目（用户会话期间新生成但远端尚未返回的）
-        // 关键：避免远端已有数据时本地重复出现。
-        setGenerationHistory((prev) => {
-          if (remote.length === 0) {
-            // 远端没拉取到（如失败），保留本地
-            return dedupeHistory(prev).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+
+  // 公共方法：拉取远端并合并到 history
+  const refreshHistory = useCallback(async () => {
+    try {
+      const page = await mediaApi.listAssets({ type: 'image', source: 'ai-generated', page: 1, pageSize: 50 });
+      const remote = (page?.items ?? []).map((it) => {
+        const createdAt = it.createdAt ? new Date(it.createdAt).getTime() || Date.now() : Date.now();
+        return {
+          id: `server-${it.id}`,
+          url: it.url,
+          objectKey: it.objectKey,
+          sourceTool: it.sourceTool,
+          prompt: it.name || '',
+          createdAt,
+        };
+      });
+      // 合并：远端为权威数据 + 保留本地"更新"的条目（用户会话期间新生成但远端尚未返回的）
+      setGenerationHistory((prev) => {
+        if (remote.length === 0) {
+          // 远端没拉取到（如失败），保留本地
+          return dedupeHistory(prev).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+        }
+        // 1) 把"本地最近 60 秒内的无 objectKey 条目"替换为远端 objectKey（去重核心逻辑）
+        //    前端 unshift 的本地条目 url 是 base64 data URI，与远端 MinIO URL 不同但其实是同一张图
+        //    注意：远端条目的 prompt 字段是后端 MediaAsset.name（objectKey 文件名），与用户提示词无关
+        //    所以只能按 createdAt 时间差匹配。设置 60 秒窗口避免误合并。
+        const RECENT_WINDOW_MS = 60_000;
+        const usedRemoteIdx = new Set<number>();
+        const upgraded = prev.map((p) => {
+          if (p.objectKey) return p; // 已经有 objectKey（来自远端）
+          // 在远端找时间差最小的条目
+          let bestIdx = -1;
+          let bestDiff = Infinity;
+          for (let i = 0; i < remote.length; i++) {
+            if (usedRemoteIdx.has(i)) continue;
+            const r = remote[i];
+            const diff = Math.abs(r.createdAt - p.createdAt);
+            if (diff <= RECENT_WINDOW_MS && diff < bestDiff) {
+              bestDiff = diff;
+              bestIdx = i;
+            }
           }
-          // 远端有数据 → 完全以远端为准，本地"比远端还新"的（createdAt > 远端最大）追加在前
-          const maxRemoteCreated = remote.reduce((m, r) => Math.max(m, r.createdAt), 0);
-          const localNewer = prev.filter((p) => p.createdAt > maxRemoteCreated);
-          const merged = [...localNewer, ...remote];
-          return dedupeHistory(merged).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+          if (bestIdx >= 0) {
+            usedRemoteIdx.add(bestIdx);
+            return {
+              ...remote[bestIdx],
+              createdAt: p.createdAt,
+              prompt: p.prompt || remote[bestIdx].prompt,
+            };
+          }
+          return p;
         });
-      } catch (e) {
-        console.warn('[ImageWorkbench] 加载生成历史失败:', e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+        // 2) 加入尚未被匹配的远端条目
+        const remainingRemote = remote.filter((_, i) => !usedRemoteIdx.has(i));
+        const merged = [...upgraded, ...remainingRemote];
+        // 3) 最终去重 + 排序
+        return dedupeHistory(merged).sort((a, b) => b.createdAt - a.createdAt).slice(0, 50);
+      });
+    } catch (e) {
+      console.warn('[ImageWorkbench] 加载生成历史失败:', e);
+    }
   }, []);
+
+  useEffect(() => {
+    refreshHistory();
+  }, [refreshHistory]);
   const [isFavorited, setIsFavorited] = useState(false); // 当前生成图片是否已收藏
   const [currentFavoriteId, setCurrentFavoriteId] = useState<string | null>(null); // 当前生成图片对应的收藏 ID（MinIO objectKey）
   const [showNewConfirm, setShowNewConfirm] = useState(false); // 新建确认弹窗
@@ -1134,19 +1182,11 @@ export function ImageWorkbench() {
         // 生成成功，显示图片并自动切到预览 Tab
         setGeneratedUrl(result.imageUrl);
         setGeneratedAt(Date.now());
-        // 追加到历史缩略图列表（侧栏状态栏下方展示，按 url + objectKey 双键去重）
-        setGenerationHistory((prev) => {
-          return dedupeHistory([
-            {
-              id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              url: result.imageUrl,
-              prompt: trimmedPrompt,
-              createdAt: Date.now(),
-            },
-            ...prev,
-          ]).slice(0, 50);
-        });
+        setGeneratedObjectKey(result.objectKey ?? null); // 收藏时使用
         setActiveTab('preview');
+        // 不在本地 unshift（base64 data URI 与远端 MinIO URL 不同，dedupeHistory 失效）
+        // 而是完全依赖远端刷新：后端已入库，立即拉取一次（带 objectKey 的服务端条目）
+        refreshHistory();
         console.log('[ImageWorkbench] image URL set:', result.imageUrl);
       } else {
         console.warn('[ImageWorkbench] result missing imageUrl:', result);
@@ -1793,12 +1833,15 @@ export function ImageWorkbench() {
                       setFavoriting(true);
                       try {
                         if (!isFavorited) {
-                          // 收藏：从 history 中找到当前图片的 objectKey，调后端标记 source_tool='favorite'
-                          const matched = dedupeHistory(generationHistory).find((h) => h.url === generatedUrl);
-                          const objectKey = matched?.objectKey;
+                          // 收藏：优先用当前图片自身的 objectKey（submit 时已记录），否则从 history 中查找
+                          let objectKey: string | null | undefined = generatedObjectKey;
                           if (!objectKey) {
-                            // 没有 objectKey（用户切走后再回来老 sessionStorage 中的旧条目）—— 兜底：等下次刷新再收藏
-                            console.warn('[ImageWorkbench] 当前图片缺少 objectKey，请刷新后再试');
+                            // 兜底：从 history 中按 url 找
+                            const matched = dedupeHistory(generationHistory).find((h) => h.url === generatedUrl);
+                            objectKey = matched?.objectKey;
+                          }
+                          if (!objectKey) {
+                            console.warn('[ImageWorkbench] 当前图片缺少 objectKey');
                             alert('当前图片尚未同步到服务器，请刷新页面后再收藏');
                             return;
                           }
@@ -2080,6 +2123,11 @@ export function ImageWorkbench() {
                     onClick={() => {
                       setGeneratedUrl(item.url);
                       setGeneratedAt(item.createdAt);
+                      setGeneratedObjectKey(item.objectKey ?? null); // 同步 objectKey（收藏时用）
+                      // 根据远端 sourceTool 字段同步收藏状态
+                      const isFav = item.sourceTool === 'favorite';
+                      setIsFavorited(isFav);
+                      setCurrentFavoriteId(isFav ? item.objectKey ?? null : null);
                       setActiveTab('preview');
                     }}
                     title={item.prompt || '(空提示词)'}
