@@ -772,7 +772,17 @@ function AssetEditDialog({
                   className="h-full w-full object-cover"
                 />
               ) : asset.type === 'video' ? (
-                <Film className="h-6 w-6 text-[#cbd5e1]" />
+                <video
+                  src={asset.url}
+                  className="h-full w-full object-cover"
+                  muted
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    if (v.currentTime < 0.1) v.currentTime = 0.1;
+                  }}
+                />
               ) : (
                 <Music2 className="h-6 w-6 text-[#cbd5e1]" />
               )}
@@ -984,9 +994,20 @@ function AssetCard({
             }}
           />
         ) : asset.type === 'video' ? (
-          <div className="grid h-full w-full place-items-center">
-            <Film className="h-9 w-9 text-[#cbd5e1]" strokeWidth={1.5} />
-          </div>
+          <video
+            src={asset.url}
+            className="h-full w-full object-cover transition group-hover:scale-105"
+            muted
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={(e) => {
+              const v = e.currentTarget;
+              if (v.currentTime < 0.1) v.currentTime = 0.1;
+            }}
+            onError={(e) => {
+              (e.target as HTMLVideoElement).style.display = 'none';
+            }}
+          />
         ) : (
           <div className="grid h-full w-full place-items-center">
             <Music2 className="h-9 w-9 text-[#cbd5e1]" strokeWidth={1.5} />
