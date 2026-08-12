@@ -12,7 +12,6 @@ import type {
 } from '@/types/video';
 
 const API = '/api/videos';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 
 /** 根据创建时间模拟任务的进度（PENDING 0%→10%，RUNNING 10%→90%） */
 function simulateProgress(job: any, status: string): number {
@@ -185,9 +184,9 @@ export async function createImageToVideo(
   formData.append('duration', String(duration));
   formData.append('resolution', resolution);
 
-  // 发送到后端
+  // 发送到后端（走相对路径，由 Next.js rewrites 代理到 :8080）
   const token = getAccessToken();
-  const resp = await fetch(`${API_BASE}/api/videos/image-to-video`, {
+  const resp = await fetch(`${API}/image-to-video`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: formData,

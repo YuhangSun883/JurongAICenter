@@ -66,6 +66,9 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
     /** 视频任务最大存活时间（30 分钟余量） */
     private static final Duration MAX_RUNNING_DURATION = Duration.ofMinutes(30);
 
+    /** 记录 job 连续返回 "任务不存在" 的次数，超过阈值后清理（防御 NewAPI 偶发 400） */
+    private final ConcurrentHashMap<Long, AtomicInteger> notFoundCountMap = new ConcurrentHashMap<>();
+
     /** 支持的 video templateId 集合（轮询时用 in 条件） */
     private static final List<String> VIDEO_TEMPLATE_IDS = List.of(
         TEMPLATE_TEXT_TO_VIDEO, TEMPLATE_IMAGE_TO_VIDEO, TEMPLATE_MULTI_IMAGE_TO_VIDEO
