@@ -92,7 +92,7 @@ export async function uploadToCanvas(
   if (opts.positionX != null) fd.append('positionX', String(opts.positionX));
   if (opts.positionY != null) fd.append('positionY', String(opts.positionY));
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
   const token = getAccessToken();
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
