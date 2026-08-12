@@ -794,7 +794,17 @@ function AssetEditDialog({
                   className="h-full w-full object-cover"
                 />
               ) : asset.type === 'video' ? (
-                <Film className="h-6 w-6 text-[#cbd5e1]" />
+                <video
+                  src={asset.url}
+                  className="h-full w-full object-cover"
+                  muted
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    if (v.currentTime < 0.1) v.currentTime = 0.1;
+                  }}
+                />
               ) : (
                 <Music2 className="h-6 w-6 text-[#cbd5e1]" />
               )}

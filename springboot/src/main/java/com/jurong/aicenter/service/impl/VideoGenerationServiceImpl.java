@@ -29,6 +29,8 @@ import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * 视频生成服务实现（文生视频 / 图生视频 / 多图生视频）— 全部走 NewAPI 中转站，绕过 ComfyUI。
@@ -315,6 +317,8 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
                 job.getId(), taskId, errMsg);
             return;
         }
+        // 成功响应 → 清掉 400 计数
+        notFoundCountMap.remove(job.getId());
         if (result == null) {
             log.warn("[VIDEO-POLL] job {} 查询 NewAPI 返回 null: taskId={}", job.getId(), taskId);
             return;

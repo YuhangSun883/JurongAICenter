@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Upload, X, ChevronDown, Search,
-  Check, ShieldCheck, Trash2, Loader2,
+  Check, ShieldCheck, Trash2, Loader2, Music,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddMaterialCard } from './AddMaterialCard';
@@ -511,7 +511,25 @@ function AssetsView({
                     onClick={() => onToggle(a.id)}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
+                  {a.type === 'video' ? (
+                    <video
+                      src={a.url}
+                      className="h-full w-full object-cover"
+                      muted
+                      playsInline
+                      preload="metadata"
+                      onLoadedMetadata={(e) => {
+                        const v = e.currentTarget;
+                        if (v.currentTime < 0.1) v.currentTime = 0.1;
+                      }}
+                    />
+                  ) : a.type === 'audio' ? (
+                    <div className="grid h-full w-full place-items-center bg-bg-soft text-fg-muted">
+                      <Music className="h-6 w-6" />
+                    </div>
+                  ) : (
                     <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
+                  )}
                     {selected && (
                       <span className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-brand text-white shadow-glow">
                         <Check className="h-3 w-3" />
@@ -545,7 +563,26 @@ function AssetsView({
                   onClick={() => onToggle(String(a.id))}
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
+                  {a.type === 'video' ? (
+                    <video
+                      src={a.url}
+                      className="h-full w-full object-cover"
+                      muted
+                      playsInline
+                      preload="metadata"
+                      // 推进到 0.1s 强制渲染第一帧（默认 metadata 模式下不主动显示）
+                      onLoadedMetadata={(e) => {
+                        const v = e.currentTarget;
+                        if (v.currentTime < 0.1) v.currentTime = 0.1;
+                      }}
+                    />
+                  ) : a.type === 'audio' ? (
+                    <div className="grid h-full w-full place-items-center bg-bg-soft text-fg-muted">
+                      <Music className="h-6 w-6" />
+                    </div>
+                  ) : (
+                    <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
+                  )}
                   {selected && (
                     <span className="absolute right-1.5 top-1.5 grid h-5 w-5 place-items-center rounded-full bg-brand text-white shadow-glow">
                       <Check className="h-3 w-3" />
