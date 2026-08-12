@@ -45,6 +45,22 @@ function simulateProgress(job: any, status: string): number {
 }
 
 /** 后端 JobResponse → 前端 VideoTask 格式转换 */
+
+/**
+ * 把后端返回的 MinIO 签名 URL（或 asset:// 等内部 scheme）转换成同域后端代理 URL。
+ * 原因：浏览器对跨域 MinIO URL 会触发 ORB / CORS 拒绝，导致视频无法播放。
+ * 解决方案：改用 /api/media/assets/{id}/stream（同域，无 ORB 问题）。
+ *
+ * @param jobId  后端 job/asset id
+ * @param rawUrl 后端 resultUrls 里的原始 URL（可能是 MinIO 签名 URL）
+ */
+function toBackendStreamUrl(jobId: string | number, rawUrl?: string): string | undefined {
+  if (!jobId) return rawUrl;
+  const token = getAccessToken();
+  const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+  return `/api/media/assets/${jobId}/stream${qs}`;
+}
+
 function mapJobToTask(job: any): VideoTask {
   if (!job) {
     console.warn('[mapJobToTask] job is null/undefined');
@@ -72,22 +88,22 @@ function mapJobToTask(job: any): VideoTask {
   const mappedStatus = statusMap[rawStatus] || 'queued';
 
   // 解析 resultUrls（后端可能返回 JSON 字符串或数组）
-  // 跳过裸 objectKey（如 "media/10/...mp4" 没有 presigned），只取完整 http(s) URL
-  let resultUrl: string | undefined;
-  const pickFirstHttpUrl = (arr: unknown[]): string | undefined => {
-    for (const item of arr) {
-      if (typeof item === 'string' && /^https?:\/\//.test(item)) return item;
-    }
-    return undefined;
-  };
+  let rawResultUrl: string | undefined;
   if (Array.isArray(job.resultUrls) && job.resultUrls.length > 0) {
-    resultUrl = pickFirstHttpUrl(job.resultUrls);
+    rawResultUrl = job.resultUrls[0];
   } else if (typeof job.resultUrls === 'string' && job.resultUrls) {
     try {
       const arr = JSON.parse(job.resultUrls);
-      if (Array.isArray(arr) && arr.length > 0) resultUrl = pickFirstHttpUrl(arr);
+      if (Array.isArray(arr) && arr.length > 0) rawResultUrl = arr[0];
     } catch { /* ignore */ }
   }
+
+  // 把 MinIO 签名 URL 转换成后端代理 URL，避免浏览器跨域 ORB/CORS 拦截
+  // MinIO URL 形如 http://host:port/bucket-name/object-key?X-Amz-...
+  // 后端代理 URL 形如 /api/media/assets/{mediaAssetId}/stream?token=xxx
+  // 注意：job.id 是任务 id，跟 media_asset.id 不一样；必须用 mediaAssetId 才能 stream
+  const streamId = job.mediaAssetId ?? job.id;
+  const resultUrl = streamId != null ? toBackendStreamUrl(streamId, rawResultUrl) : rawResultUrl;
 
   // 进度：COMPLETED → 100, FAILED → 0, RUNNING → 10-90%, PENDING → 0-10%
   let progress: number;
@@ -129,8 +145,18 @@ export async function generateScript(
 }
 
 export async function create(req: CreateVideoRequest): Promise<CreateVideoResponse> {
-  const resp = await request<any>(API, { method: 'POST', body: req });
-  // request 函数已解包 {code, data}，resp 是业务对象 {jobId, status, ...}
+  // 后端：POST /api/videos/text-to-video（VideoGenerationController#textToVideo）
+  // 前端将 CreateVideoRequest 映射到该接口的请求体字段
+  const backendBody = {
+    script: req.script,
+    model: req.model,
+    aspectRatio: req.aspectRatio,
+    resolution: req.resolution,
+    duration: req.duration,
+    audioMode: req.audioMode ?? 'mute',
+  };
+  const resp = await request<any>(`${API}/text-to-video`, { method: 'POST', body: backendBody });
+  // 后端返回 GenerateResponse { jobId, status, ... } 或被包装 {code, data}
   const taskId = String(resp?.jobId ?? resp?.id ?? '');
   if (!taskId || taskId === 'undefined') {
     throw new Error('后端未返回有效的 jobId，响应: ' + JSON.stringify(resp));

@@ -45,6 +45,11 @@ public interface StorageService {
     String getPresignedUrl(String objectKey, int expiryHours);
 
     /**
+     * 从 MinIO 读取文件流（用于后端代理/流式转发给前端，避免跨域）
+     */
+    InputStream getFileStream(String objectKey);
+
+    /**
      * uploadAiMedia 的返回体
      */
     record UploadResult(String objectKey, String url) {}

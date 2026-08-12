@@ -120,23 +120,12 @@ public class VideoSyncServiceImpl implements VideoSyncService {
         }
         log.info("Downloaded video: {} bytes", bytes.length);
 
-        // 4. 上传 MinIO（用 uploadAiMedia 拿真实 objectKey，与 media_assets 对齐）
+        // 4. 上传 MinIO（统一走 ai-platform/ 路径，跟 VideoGenerationServiceImpl 保持一致）
         try (InputStream is = new ByteArrayInputStream(bytes)) {
-            StorageService.UploadResult up = storageService.uploadAiMedia(
-                userId, "mp4", is, "video/mp4");
-            String objectKey = up.objectKey();
-            String url = up.url();
-            log.info("Uploaded to MinIO: objectKey={}, url={}", objectKey, url);
-
-            // 5. 写入 media_assets（AI 生成结果库），独立模式下用伪 jobId 作 sourceTaskId
-            try {
-                mediaService.recordAiGenerated(
-                    userId, "video", filename, "video/mp4",
-                    (long) bytes.length, objectKey, "video", String.valueOf(jobId));
-                log.info("Recorded AI media: objectKey={}", objectKey);
-            } catch (Exception e) {
-                log.warn("recordAiGenerated failed: {}", e.getMessage());
-            }
+            String objectKey = String.format("ai-platform/%d/%d/%s",
+                userId, jobId, filename);
+            String url = storageService.uploadObject(objectKey, is, "video/mp4");
+            log.info("Uploaded to MinIO: key={}, url={}", objectKey, url);
             return url;
         } catch (Exception e) {
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, "上传 MinIO 失败: " + e.getMessage());

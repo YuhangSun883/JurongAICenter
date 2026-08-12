@@ -46,9 +46,9 @@ class JurongTextToVideoV2:
                     "default": "4",
                     "tooltip": "视频时长（秒）"
                 }),
-                "resolution": (["480P", "720P", "1080P"], {
-                    "default": "480P",
-                    "tooltip": "视频分辨率"
+                "resolution": (["480p", "720p", "1080p", "4k"], {
+                    "default": "480p",
+                    "tooltip": "视频分辨率（aicoming 只接受小写 p 格式，节点已自动规范化）"
                 }),
                 "seed": ("INT", {
                     "default": 0,

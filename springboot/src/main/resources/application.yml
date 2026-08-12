@@ -54,11 +54,21 @@ springdoc:
     enabled: true
 
 # ============================================================
-# NewAPI 中转站配置（所有 AI 接口统一走这里）
+# NewAPI 中转站配置（视频生成 / 聊天统一走这里 :3000）
 # ============================================================
 newapi:
   base-url: ${NEWAPI_BASE_URL:http://localhost:3000}
   token: ${NEWAPI_TOKEN:}
+
+# ============================================================
+# aicoming-video-proxy 配置（素材库 CRUD 走这里 :8080）
+# 文档 §3 明说：素材上传不走 new-api（:3000 会 404），必须直连 proxy
+# 默认指向雨云 192.140.163.161:8080，部署时通过环境变量覆盖
+# ============================================================
+aicoming:
+  proxy:
+    base-url: ${AICOMING_PROXY_BASE_URL:http://192.140.163.161:8080}
+    token: ${AICOMING_PROXY_TOKEN:${NEWAPI_TOKEN:}}   # 默认复用 newapi token
 
 management:
   endpoints:

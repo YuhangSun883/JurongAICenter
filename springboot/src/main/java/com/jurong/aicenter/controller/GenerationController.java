@@ -6,10 +6,13 @@ import com.jurong.aicenter.dto.generation.GenerateRequest;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.dto.job.JobResponse;
 import com.jurong.aicenter.entity.Job;
+import com.jurong.aicenter.entity.MediaAsset;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.MediaAssetRepository;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.GenerationService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpHeaders;
@@ -29,6 +32,7 @@ public class GenerationController {
 
     private final GenerationService generationService;
     private final ObjectMapper objectMapper;
+    private final MediaAssetRepository mediaAssetRepository;
 
     @PostMapping("/generate")
     public GenerateResponse generate(
@@ -60,6 +64,21 @@ public class GenerationController {
                 resultUrls = objectMapper.readValue(job.getResultUrls(), new TypeReference<>() {});
             } catch (Exception ignored) {}
         }
+        // 查 video job 对应的 media_asset.id（用于前端调 /api/media/assets/{id}/stream）
+        Long mediaAssetId = null;
+        if (job.getStatus() != null && "COMPLETED".equalsIgnoreCase(job.getStatus())) {
+            try {
+                MediaAsset asset = mediaAssetRepository.selectOne(
+                    new LambdaQueryWrapper<MediaAsset>()
+                        .eq(MediaAsset::getUserId, principal.id())
+                        .eq(MediaAsset::getSourceTaskId, String.valueOf(job.getId()))
+                        .last("LIMIT 1")
+                );
+                if (asset != null) mediaAssetId = asset.getId();
+            } catch (Exception ignored) {
+                // 不阻塞主流程
+            }
+        }
         return new JobResponse(
             job.getId(),
             job.getWorkflowId(),
@@ -70,7 +89,8 @@ public class GenerationController {
             resultUrls,
             job.getErrorMessage(),
             job.getCreatedAt(),
-            job.getCompletedAt()
+            job.getCompletedAt(),
+            mediaAssetId
         );
     }
 

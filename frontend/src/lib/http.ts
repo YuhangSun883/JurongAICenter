@@ -85,6 +85,7 @@ async function requestInner<T>(path: string, opts: RequestOptions = {}, isRetry 
   if (!res.ok) {
     let payload: unknown = undefined;
     try { payload = await res.json(); } catch { /* ignore */ }
+    console.error('[http] non-OK response', { url: buildUrl(path, query), status: res.status, payload });
     throw new ApiError(res.status, `HTTP ${res.status}`, payload);
   }
 
