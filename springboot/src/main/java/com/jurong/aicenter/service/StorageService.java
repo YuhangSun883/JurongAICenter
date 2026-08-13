@@ -1,6 +1,7 @@
 package com.jurong.aicenter.service;
 
 import java.io.InputStream;
+import java.util.List;
 
 /**
  * 对象存储服务（MinIO / OSS）
@@ -45,9 +46,13 @@ public interface StorageService {
     String getPresignedUrl(String objectKey, int expiryHours);
 
     /**
-     * 从 MinIO 读取文件流（用于后端代理/流式转发给前端，避免跨域）
+     * 2026-08-13 新增:MinIO 兜底轮询 - 按前缀列对象
+     *
+     * @param prefix 路径前缀
+     * @param recursive 是否递归子目录
+     * @return 该前缀下的所有对象 key 列表(按 lastModified 倒序,最新在前)
      */
-    InputStream getFileStream(String objectKey);
+    List<String> listObjectsByPrefix(String prefix, boolean recursive);
 
     /**
      * uploadAiMedia 的返回体

@@ -8,6 +8,7 @@ import type {
   CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
+  GenerateVideoRequest,
   UpdateCanvasRequest,
   UpdateCanvasNodeRequest,
   UploadToCanvasOptions,
@@ -145,6 +146,18 @@ export async function deleteCanvas(canvasId: string): Promise<void> {
   }
 }
 
+/**
+ * 删除单个节点 + 清掉所有引用该节点的 edge。
+ * 用于前端"删除节点"按钮,保证 mock 模式下行为跟后端对齐。
+ */
+export async function deleteNode(nodeId: string): Promise<void> {
+  nodes.delete(nodeId);
+  for (let index = mockEdges.length - 1; index >= 0; index -= 1) {
+    const edge = mockEdges[index];
+    if (edge.from === nodeId || edge.to === nodeId) mockEdges.splice(index, 1);
+  }
+}
+
 export async function listCanvases(page = 1, pageSize = 50): Promise<CanvasListItem[]> {
   ensureDefaultCanvas();
   return Array.from(mockCanvases.values())
@@ -209,6 +222,16 @@ export async function generateNode(req: GenerateCanvasNodeRequest): Promise<Gene
     text: req.type === 'text' ? req.prompt || req.content || '\u8fd9\u662f mock \u751f\u6210\u7684\u811a\u672c\u6587\u6848\u3002' : undefined,
     resultUrl: req.type === 'image' ? 'https://example.com/mock-canvas-image.png' : undefined,
     creditsEstimated: req.type === 'image' ? 1.18 : 0.2,
+  };
+}
+
+export async function generateVideo(req: GenerateVideoRequest): Promise<GenerateCanvasNodeResponse> {
+  return {
+    taskId: `canvas_task_video_${Date.now()}`,
+    nodeId: req.nodeId,
+    status: 'success',
+    resultUrl: 'https://example.com/mock-canvas-video.mp4',
+    creditsEstimated: 20,
   };
 }
 

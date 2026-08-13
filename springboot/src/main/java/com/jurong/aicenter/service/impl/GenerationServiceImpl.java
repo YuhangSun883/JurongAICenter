@@ -313,24 +313,27 @@ public class GenerationServiceImpl implements GenerationService {
     @Override
     @Scheduled(fixedDelay = 2000)
     public void pollRunningJobs() {
+        // 2026-08-11:tick 和 "无任务" 日志降到 debug,避免每 2 秒刷屏(原来 95% 的日志都是这种噪声)
+        log.debug("[GEN-POLL] tick, thread={}", Thread.currentThread().getName());
         List<Job> runningJobs;
         try {
+            // 2026-08-10 修复:过滤掉 templateId="image-to-video" 的 job,避免 GenerationService
+            // 误把 NewAPI 提交的图生视频 job 当成 ComfyUI job 处理,错误地标 FAILED。
+            // image-to-video job 由 VideoGenerationServiceImpl.pollRunningVideoJobs 专门处理。
             runningJobs = jobRepository.selectList(
-                new LambdaQueryWrapper<Job>().eq(Job::getStatus, "RUNNING")
+                new LambdaQueryWrapper<Job>()
+                    .eq(Job::getStatus, "RUNNING")
+                    .ne(Job::getTemplateId, "image-to-video")
             );
         } catch (Exception e) {
             log.error("pollRunningJobs: query failed", e);
             return;
         }
-        if (runningJobs.isEmpty()) return;
-
-        // 任务数较少时不记日志，避免每 2 秒刷屏（空闲时常见）
-        if (runningJobs.size() >= 5) {
-            log.info("pollRunningJobs: {} RUNNING", runningJobs.size());
-        } else {
-            // 2026-08-09:降到 trace,默认不显示,避免轮询刷屏
-            log.trace("pollRunningJobs: {} RUNNING", runningJobs.size());
+        if (runningJobs.isEmpty()) {
+            log.debug("[GEN-POLL] 当前没有 RUNNING 非图生视频 job");
+            return;
         }
+        log.info("[GEN-POLL] 发现 {} 个 RUNNING 非图生视频 job", runningJobs.size());
         for (Job job : runningJobs) {
             try {
                 processOneJob(job);
@@ -343,6 +346,13 @@ public class GenerationServiceImpl implements GenerationService {
 
     /** 处理单个 RUNNING job：超时 → FAILED；查 history → COMPLETED / FAILED / 跳过 */
     private void processOneJob(Job job) {
+        // 2026-08-10 二次保险:虽然 pollRunningJobs 已经过滤了 templateId="image-to-video",
+        // 但为了防止某些 MyBatis-Plus 边界情况(比如 null),在 processOneJob 里再判断一次。
+        // image-to-video job 应该由 VideoGenerationServiceImpl.pollRunningVideoJobs 专门处理。
+        if ("image-to-video".equals(job.getTemplateId())) {
+            log.info("[GEN-POLL] 跳过 image-to-video job {} (由 VideoGenerationService 处理)", job.getId());
+            return;
+        }
         if (job.getComfyuiPromptId() == null || job.getComfyuiPromptId().isEmpty()) {
             log.warn("job {} has no comfyuiPromptId, marking FAILED", job.getId());
             markFailed(job, "missing comfyuiPromptId");

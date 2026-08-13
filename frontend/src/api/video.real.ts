@@ -11,7 +11,11 @@ import type {
   VideoTask,
 } from '@/types/video';
 
+// 注意:本文件服务于 ai-video 工作台(/ai-video 页面),与画布(/canvas)视频生成无关。
+// 画布视频生成走 canvas.real.ts → /api/canvas/nodes/{id}/generate-video。
+// ai-video 独立工具项目前不在本次修复范围,保留原样。
 const API = '/api/videos';
+const JOBS_API = '/api/jobs';
 
 /** 根据创建时间模拟任务的进度（PENDING 0%→10%，RUNNING 10%→90%） */
 function simulateProgress(job: any, status: string): number {
@@ -223,24 +227,35 @@ export async function createImageToVideo(
 }
 
 export async function getTask(id: string): Promise<VideoTask> {
-  try {
-    const job = await request<any>(`/api/jobs/${id}`);
-    console.debug('[getTask] job received:', job);
-    return mapJobToTask(job);
-  } catch (error) {
-    console.warn('[getTask] failed for id=' + id, error);
-    // 返回一个占位任务，保留原有的进度显示，不强制标 FAILED
-    return {
-      id,
-      status: 'queued',
-      progress: 0,
-      request: {} as CreateVideoRequest,
-      error: error instanceof Error ? error.message : String(error),
-      estimatedCredits: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    };
-  }
+  // 2026-08-13 修复:走 /api/jobs/{id}(后端实现),不是 /api/videos/{id}(不存在)
+  const job = await request<{
+    id: number;
+    status: string;
+    resultUrls: string[] | null;
+    errorMessage: string | null;
+    completedAt: string | null;
+  }>(`${JOBS_API}/${id}`);
+  // 适配为前端 VideoTask 格式
+  return {
+    id: String(job.id),
+    status: normalizeStatus(job.status),
+    progress: job.status === 'COMPLETED' ? 100 : job.status === 'FAILED' ? 0 : 50,
+    request: {} as CreateVideoRequest,
+    resultUrl: job.resultUrls?.[0],
+    error: job.errorMessage ?? undefined,
+    estimatedCredits: 0,
+    createdAt: 0,
+    updatedAt: job.completedAt ? new Date(job.completedAt).getTime() : Date.now(),
+  };
+}
+
+function normalizeStatus(s: string): TaskStatus {
+  // 后端大写 (RUNNING/COMPLETED/FAILED) → 前端小写 (queued/running/succeeded/failed)
+  const u = s.toUpperCase();
+  if (u === 'COMPLETED' || u === 'SUCCESS' || u === 'SUCCEEDED') return 'succeeded';
+  if (u === 'FAILED' || u === 'ERROR' || u === 'CANCELLED') return 'failed';
+  if (u === 'QUEUED' || u === 'PENDING') return 'queued';
+  return 'running';
 }
 
 export async function listTasks(q: ListTasksQuery = {}): Promise<ListTasksResponse> {

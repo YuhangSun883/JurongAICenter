@@ -15,6 +15,7 @@ import com.jurong.aicenter.service.GenerationService;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -25,6 +26,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+@Slf4j
 @RestController
 @RequestMapping("/api")
 @RequiredArgsConstructor
@@ -58,25 +60,22 @@ public class GenerationController {
             @PathVariable Long id) {
         if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
         Job job = generationService.getJob(id, principal.id());
-        List<String> resultUrls = null;
-        if (job.getResultUrls() != null && !job.getResultUrls().isBlank()) {
+        // 2026-08-13 16:40 修复:解析 result_urls JSON 字符串为 List<String>
+        //   之前 L61 写死 null,导致前端 GET /api/jobs/{id} 永远拿不到视频 URL
+        //   这是 useTaskPolling 看不到视频的核心 bug。
+        java.util.List<String> resultUrls = null;
+        String raw = job.getResultUrls();
+        if (raw != null && !raw.isBlank()) {
             try {
-                resultUrls = objectMapper.readValue(job.getResultUrls(), new TypeReference<>() {});
-            } catch (Exception ignored) {}
-        }
-        // 查 video job 对应的 media_asset.id（用于前端调 /api/media/assets/{id}/stream）
-        Long mediaAssetId = null;
-        if (job.getStatus() != null && "COMPLETED".equalsIgnoreCase(job.getStatus())) {
-            try {
-                MediaAsset asset = mediaAssetRepository.selectOne(
-                    new LambdaQueryWrapper<MediaAsset>()
-                        .eq(MediaAsset::getUserId, principal.id())
-                        .eq(MediaAsset::getSourceTaskId, String.valueOf(job.getId()))
-                        .last("LIMIT 1")
-                );
-                if (asset != null) mediaAssetId = asset.getId();
-            } catch (Exception ignored) {
-                // 不阻塞主流程
+                com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+                resultUrls = mapper.readValue(raw,
+                    mapper.getTypeFactory().constructCollectionType(
+                        java.util.List.class, String.class));
+            } catch (Exception e) {
+                log.warn("[jobs.getJob] 解析 resultUrls 失败,降级为 null: id={}, raw={}, err={}",
+                    id, raw.length() > 200 ? raw.substring(0, 200) + "..." : raw,
+                    e.getMessage());
             }
         }
         return new JobResponse(

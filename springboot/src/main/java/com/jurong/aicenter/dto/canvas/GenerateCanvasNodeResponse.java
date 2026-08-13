@@ -44,6 +44,13 @@ public class GenerateCanvasNodeResponse {
      */
     private List<String> createdNodeIds;
 
+    /**
+     * 2026-08-10 新增:任务失败时的友好错误消息。
+     * 之前 getTaskStatus 不返回错误原因,前端只能看到 status="failed" 却不知为何失败。
+     * 现在 CanvasServiceImpl.getTaskStatus 把 CanvasTask.errorMessage 透传过来。
+     */
+    private String failMessage;
+
     public List<String> getCreatedNodeIds() {
         return createdNodeIds == null ? Collections.emptyList() : createdNodeIds;
     }

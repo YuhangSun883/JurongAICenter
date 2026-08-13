@@ -19,6 +19,7 @@ import com.jurong.aicenter.service.canvas.CanvasAiService;
 import com.jurong.aicenter.service.canvas.CanvasAsyncExecutor;
 import com.jurong.aicenter.service.canvas.VideoFrameCaptionService;
 import com.jurong.aicenter.service.canvas.ClothingTransferService;
+import com.jurong.aicenter.service.canvas.CanvasVideoGenService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -61,6 +62,7 @@ public class CanvasServiceImpl implements CanvasService {
     private final ObjectMapper objectMapper;
     private final VideoFrameCaptionService videoFrameCaptionService;
     private final ClothingTransferService clothingTransferService;
+    private final CanvasVideoGenService canvasVideoGenService;
 
     private static final String DEFAULT_CANVAS_NAME = "默认画布";
 
@@ -123,7 +125,7 @@ public class CanvasServiceImpl implements CanvasService {
         c.setCreatedAt(now);
         c.setUpdatedAt(now);
         canvasRepository.insert(c);
-        log.info("Canvas created: id={}, userId={}, name={}", c.getId(), userId, c.getName());
+        log.debug("Canvas created: id={}, userId={}, name={}", c.getId(), userId, c.getName());
         return c;
     }
 
@@ -148,18 +150,68 @@ public class CanvasServiceImpl implements CanvasService {
             .map(CanvasNodeResponse::from)
             .toList();
 
+        // 2026-08-12 修复:视频节点兜底 —— 如果 node.resultUrl 为空,但有最近的 success canvas_task
+        //   且 task.resultUrl 有值,把 task.resultUrl 写回 node(并持久化),避免"刷新后视频消失"
+        //   触发场景:executeVideoGenAsync 主流程异常中断 / @Scheduled 兜底轮询只更新了 job 表没更新 node 表
+        for (CanvasNode n : nodes) {
+            if (!"video".equalsIgnoreCase(n.getType())) continue;
+            if (n.getResultUrl() != null && !n.getResultUrl().isBlank()) continue;
+            try {
+                com.jurong.aicenter.entity.CanvasTask lastSuccessTask = taskRepository.selectOne(
+                    new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.jurong.aicenter.entity.CanvasTask>()
+                        .eq(com.jurong.aicenter.entity.CanvasTask::getNodeId, n.getId())
+                        .eq(com.jurong.aicenter.entity.CanvasTask::getStatus, "success")
+                        .orderByDesc(com.jurong.aicenter.entity.CanvasTask::getCompletedAt)
+                        .last("LIMIT 1")
+                );
+                if (lastSuccessTask != null
+                    && lastSuccessTask.getResultUrl() != null
+                    && !lastSuccessTask.getResultUrl().isBlank()) {
+                    String url = lastSuccessTask.getResultUrl();
+                    n.setResultUrl(url);
+                    n.setStatus("success");
+                    n.setUpdatedAt(java.time.LocalDateTime.now());
+                    nodeRepository.updateById(n);
+                    log.info("[getCanvasDetail] 视频节点 result_url 兜底回填: nodeId={}, url={}", n.getId(), url);
+                }
+            } catch (Exception recoverErr) {
+                log.warn("[getCanvasDetail] 视频节点 result_url 兜底失败(非致命): nodeId={}, err={}",
+                    n.getId(), recoverErr.getMessage());
+            }
+        }
+
         // 解析所有连线（多端口格式）→ EdgeDto 列表
+        // 2026-08-10 修复:前端 addNode 只传了上游节点 (upstreamIds),
+        // 没同步更新源节点的 downstreamIds,所以原来只从 downstreamIds 拍平的话刷新会丢边。
+        // 现在双向拍平:downstreamIds (n -> c.nodeId) + upstreamIds (c.nodeId -> n),合并去重。
         List<CanvasDetail.EdgeDto> edges = new ArrayList<>();
+        Set<String> edgeKeys = new HashSet<>();   // 去重 key: from|to
         Set<String> nodeIds = nodes.stream().map(CanvasNode::getId).collect(Collectors.toSet());
         for (CanvasNode n : nodes) {
-            // 下游连接：把节点的 downstreamIds 拍平成 edges
+            // 1) 下游连接:把 downstreamIds 拍平成 edges
             List<NodeConnection> downs = parseConnections(n.getDownstreamIds());
             for (NodeConnection c : downs) {
-                if (nodeIds.contains(c.getNodeId())) {
-                    edges.add(new CanvasDetail.EdgeDto(n.getId(), c.getNodeId(), c.getPort()));
-                } else {
+                if (!nodeIds.contains(c.getNodeId())) {
                     log.warn("Canvas edge dropped: from node {} to missing node {} (port={})",
                         n.getId(), c.getNodeId(), c.getPort());
+                    continue;
+                }
+                String key = n.getId() + "|" + c.getNodeId();
+                if (edgeKeys.add(key)) {
+                    edges.add(new CanvasDetail.EdgeDto(n.getId(), c.getNodeId(), c.getPort()));
+                }
+            }
+            // 2) 上游连接:把 upstreamIds 反向拍平成 edges (c.nodeId -> n)
+            List<NodeConnection> ups = parseConnections(n.getUpstreamIds());
+            for (NodeConnection c : ups) {
+                if (!nodeIds.contains(c.getNodeId())) {
+                    log.warn("Canvas edge dropped: from missing upstream {} to {} (port={})",
+                        c.getNodeId(), n.getId(), c.getPort());
+                    continue;
+                }
+                String key = c.getNodeId() + "|" + n.getId();
+                if (edgeKeys.add(key)) {
+                    edges.add(new CanvasDetail.EdgeDto(c.getNodeId(), n.getId(), c.getPort()));
                 }
             }
         }
@@ -200,7 +252,7 @@ public class CanvasServiceImpl implements CanvasService {
         // 4. 删画布本身
         canvasRepository.deleteById(canvasId);
 
-        log.info("Canvas deleted: id={}, userId={}, cascaded nodes={}",
+        log.debug("Canvas deleted: id={}, userId={}, cascaded nodes={}",
             canvasId, userId, nodeIds.size());
     }
 
@@ -232,7 +284,7 @@ public class CanvasServiceImpl implements CanvasService {
         // 触绘画布 updated_at（让"我的创作"列表把刚加节点的画布顶上去）
         touchCanvas(resolvedCanvasId);
 
-        log.info("Canvas node created: id={}, userId={}, type={}, canvasId={}",
+        log.debug("Canvas node created: id={}, userId={}, type={}, canvasId={}",
             node.getId(), userId, node.getType(), resolvedCanvasId);
         return node;
     }
@@ -248,6 +300,7 @@ public class CanvasServiceImpl implements CanvasService {
         if (req.getPositionY() != null) node.setPositionY(req.getPositionY());
         if (req.getUpstreamIds() != null) node.setUpstreamIds(serializeConnections(req.getUpstreamIds()));
         if (req.getDownstreamIds() != null) node.setDownstreamIds(serializeConnections(req.getDownstreamIds()));
+        if (req.getSettings() != null) node.setSettings(req.getSettings());
         node.setUpdatedAt(LocalDateTime.now());
         nodeRepository.updateById(node);
         return node;
@@ -267,7 +320,7 @@ public class CanvasServiceImpl implements CanvasService {
         // 级联删任务
         taskRepository.delete(new LambdaQueryWrapper<CanvasTask>().eq(CanvasTask::getNodeId, nodeId));
         touchCanvas(canvasId);
-        log.info("Canvas node deleted: id={}, userId={}", nodeId, userId);
+        log.debug("Canvas node deleted: id={}, userId={}", nodeId, userId);
     }
 
     @Override
@@ -312,7 +365,7 @@ public class CanvasServiceImpl implements CanvasService {
         // 6. 触绘画布（让"我的创作"列表把刚加节点的画布顶上去）
         touchCanvas(resolvedCanvasId);
 
-        log.info("Canvas node created via upload: id={}, type={}, userId={}, filename={}, assetId={}",
+        log.debug("Canvas node created via upload: id={}, type={}, userId={}, filename={}, assetId={}",
             node.getId(), nodeType, userId, fileName, uploadRes.getId());
         return node;
     }
@@ -377,9 +430,12 @@ public class CanvasServiceImpl implements CanvasService {
                     materialIds.addAll(imageUpstreamIds.subList(1, imageUpstreamIds.size()));
                 }
                 if (!materialIds.isEmpty()) {
-                    log.info("[generate] 检测到换装场景: nodeId={}, source={}, materials={}",
-                        nodeId, sourceNodeId, materialIds);
-                    return transferClothing(userId, sourceNodeId, materialIds);
+                    log.debug("[generate] 检测到换装场景: nodeId={}, source={}, materials={}, userInstruction={}",
+                        nodeId, sourceNodeId, materialIds, req.getUserInstruction());
+                    // 2026-08-10 v5:传 nodeId(用户点击的目标节点)作为结果落点,
+                    // sourceNodeId(抽帧图节点)只读,不写回,避免刷新后覆盖原图
+                    // 2026-08-11:透传 userInstruction(用户自然语言描述)
+                    return transferClothing(userId, nodeId, sourceNodeId, materialIds, req.getUserInstruction());
                 }
             }
         }
@@ -420,7 +476,8 @@ public class CanvasServiceImpl implements CanvasService {
         return new GenerateCanvasNodeResponse(
             task.getId(), nodeId, "pending",
             null, null, task.getCreditsEstimated(),
-            java.util.Collections.emptyList()
+            java.util.Collections.emptyList(),
+            null  // failMessage: pending 状态无失败原因
         );
     }
 
@@ -475,80 +532,196 @@ public class CanvasServiceImpl implements CanvasService {
         videoFrameCaptionService.executeCaptionAsync(
             task, node, node.getResultUrl(), fps, userId, safeMode);
 
-        log.info("Canvas video-caption task created: taskId={}, nodeId={}, userId={}, fps={}, mode={}",
+        log.debug("Canvas video-caption task created: taskId={}, nodeId={}, userId={}, fps={}, mode={}",
             task.getId(), nodeId, userId, fps, safeMode);
 
         // 8. 立刻返回 pending，前端轮询 /tasks/{taskId}
         return new GenerateCanvasNodeResponse(
             task.getId(), nodeId, "pending", null, null, null,
-            java.util.Collections.emptyList()
+            java.util.Collections.emptyList(),
+            null  // failMessage: pending 状态无失败原因
         );
     }
 
     /**
-     * 2026-08-09 新增:换装(Clothing Transfer)
-     * 接收 1 个视频节点 + 3 个衣服 image 节点的 id(顺序:正面/背面/模特上身)
-     * 逐帧调 NewAPI /v1/images/edits,生成 N 张换装图 + 1 张拼图
+     * 2026-08-09 新增:换装(Clothing Transfer) — 3 参数重载
+     * 直接在源节点上点换装:target = source,结果覆盖源节点 resultUrl
      */
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public GenerateCanvasNodeResponse transferClothing(Long userId, String videoNodeId,
+    public GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
                                                         java.util.List<String> clothingNodeIds) {
+        // Controller 直接调用时 targetNodeId 既是 source 也是 target
+        return transferClothing(userId, targetNodeId, targetNodeId, clothingNodeIds, null);
+    }
+
+    /**
+     * 2026-08-10 v5:换装(Clothing Transfer) — 4 参数重载
+     * 从 generateNode 自动路由过来:target(右侧激活节点,用户点击的)是结果落点,
+     * source(上游抽帧图节点)只读不写,避免刷新后覆盖原图。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
+                                                        String sourceNodeId,
+                                                        java.util.List<String> clothingNodeIds) {
+        return transferClothing(userId, targetNodeId, sourceNodeId, clothingNodeIds, null);
+    }
+
+    /**
+     * 2026-08-11 新增:5 参数重载,支持 userInstruction(用户自然语言描述,如"换人脸+换沐浴露")
+     * 替换上面的 4 参数重载,把 userInstruction 也传到 service。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
+                                                        String sourceNodeId,
+                                                        java.util.List<String> clothingNodeIds,
+                                                        String userInstruction) {
         // 1. 鉴权 + 拿节点
-        CanvasNode videoNode = mustGetOwnedNode(userId, videoNodeId);
+        CanvasNode sourceNode = mustGetOwnedNode(userId, sourceNodeId);
+        CanvasNode targetNode = mustGetOwnedNode(userId, targetNodeId);
         // 2026-08-09:源节点可以是 video(抽帧)或 image(本身是拼好的帧网格)
-        if (!"video".equalsIgnoreCase(videoNode.getType())
-                && !"image".equalsIgnoreCase(videoNode.getType())) {
+        if (!"video".equalsIgnoreCase(sourceNode.getType())
+                && !"image".equalsIgnoreCase(sourceNode.getType())) {
             throw new BusinessException(ErrorCode.INVALID_PARAM,
-                "源节点必须是 video 或 image,当前 type=" + videoNode.getType());
+                "源节点必须是 video 或 image,当前 type=" + sourceNode.getType());
         }
-        if (videoNode.getResultUrl() == null || videoNode.getResultUrl().isBlank()) {
+        if (sourceNode.getResultUrl() == null || sourceNode.getResultUrl().isBlank()) {
             throw new BusinessException(ErrorCode.INVALID_PARAM,
                 "源节点还没有 resultUrl,请先上传或生成");
         }
-        // 2. 校验衣服图(现在只要 >=1 张)
+        // 2. 校验衣服图(>=1 张)
         if (clothingNodeIds == null || clothingNodeIds.isEmpty()) {
             throw new BusinessException(ErrorCode.INVALID_PARAM,
                 "至少需要 1 张衣服参考图,实际=" + (clothingNodeIds == null ? 0 : clothingNodeIds.size()));
         }
         for (String cid : clothingNodeIds) {
-            CanvasNode cn = mustGetOwnedNode(userId, cid);  // 鉴权 + 存在性
+            CanvasNode cn = mustGetOwnedNode(userId, cid);
             if (!"image".equalsIgnoreCase(cn.getType())) {
                 throw new BusinessException(ErrorCode.INVALID_PARAM,
                     "衣服节点 " + cid + " 必须是 image 类型,实际=" + cn.getType());
             }
         }
-        for (String cid : clothingNodeIds) {
-            CanvasNode cn = mustGetOwnedNode(userId, cid);  // 鉴权 + 存在性
-            if (!"image".equalsIgnoreCase(cn.getType())) {
-                throw new BusinessException(ErrorCode.INVALID_PARAM,
-                    "衣服节点 " + cid + " 必须是 image 类型,实际=" + cn.getType());
-            }
-        }
-        // 3. 写任务
+        // 3. 写任务 — task.nodeId 绑定 target(激活节点),不是 source!
+        // 把 userInstruction 也存进 prompt 字段,供后续可能的查询/恢复
         CanvasTask task = new CanvasTask();
-        task.setNodeId(videoNodeId);
+        task.setNodeId(targetNodeId);
         task.setUserId(userId);
         task.setType("clothing-transfer");
         task.setStatus("pending");
-        task.setPrompt("clothingNodeIds=" + String.join(",", clothingNodeIds));
+        task.setPrompt("clothingNodeIds=" + String.join(",", clothingNodeIds)
+            + ";userInstruction=" + (userInstruction == null ? "" : userInstruction));
         taskRepository.insert(task);
 
-        // 4. 视频节点标 running
-        videoNode.setStatus("running");
-        videoNode.setUpdatedAt(LocalDateTime.now());
-        nodeRepository.updateById(videoNode);
+        // 4. target(激活节点)标 running;如果 target != source,source 不动保持原图
+        targetNode.setStatus("running");
+        targetNode.setUpdatedAt(LocalDateTime.now());
+        nodeRepository.updateById(targetNode);
 
-        // 5. 异步执行
-        clothingTransferService.executeTransferAsync(task, videoNode, clothingNodeIds, userId);
+        // 5. 异步执行 — 传 sourceNode(只读) + userInstruction
+        clothingTransferService.executeTransferAsync(task, sourceNode, clothingNodeIds, userId, userInstruction);
 
-        log.info("Canvas clothing-transfer task created: taskId={}, videoNodeId={}, userId={}, clothingNodeIds={}",
-            task.getId(), videoNodeId, userId, clothingNodeIds);
+        log.debug("Canvas clothing-transfer task created: taskId={}, targetNodeId={}, sourceNodeId={}, userId={}, clothingNodeIds={}, userInstruction={}",
+            task.getId(), targetNodeId, sourceNodeId, userId, clothingNodeIds, userInstruction);
 
         // 6. 立刻返回 pending
         return new GenerateCanvasNodeResponse(
-            task.getId(), videoNodeId, "pending", null, null, null,
-            java.util.Collections.emptyList()
+            task.getId(), targetNodeId, "pending", null, null, null,
+            java.util.Collections.emptyList(),
+            null  // failMessage: pending 状态无失败原因
+        );
+    }
+
+    /**
+     * 2026-08-10 新增:画布视频生成(从多源输入生成新视频)
+     * 模式同 transferClothing: 1.鉴权+拿节点 2.写任务 3.标节点 running 4.异步执行 5.返回 pending
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public GenerateCanvasNodeResponse generateVideoFromCanvas(Long userId, String videoGenNodeId,
+                                                                int duration, String resolution) {
+        // 2026-08-13:在方法开头加 INFO 日志,确保所有触发都能看到(避免后续 idempotent 命中静默 return)
+        log.info("┌─ [video-gen] generateVideoFromCanvas ENTRY: userId={}, videoGenNodeId={}, duration={}s, resolution={}",
+            userId, videoGenNodeId, duration, resolution);
+
+        // 1. 鉴权 + 拿节点(可接受 video 节点 —— 合并后 video 节点同时作为上传节点和生成节点)
+        CanvasNode videoGenNode = mustGetOwnedNode(userId, videoGenNodeId);
+        log.info("│  [video-gen] 节点已获取: id={}, upstreamIds={}, status={}",
+            videoGenNode.getId(), videoGenNode.getUpstreamIds(), videoGenNode.getStatus());
+
+        // 2026-08-11 新增:幂等性检查 — 防止前端双击/网络重试/race condition 触发 2 次 NewAPI 提交
+        // 同一 user + 同一 videoGenNodeId,如果有 PENDING/RUNNING 任务,直接返回现有 taskId,不创建新任务、不调 NewAPI。
+        java.util.List<com.jurong.aicenter.entity.CanvasTask> existing = taskRepository.selectList(
+            new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<com.jurong.aicenter.entity.CanvasTask>()
+                .eq(com.jurong.aicenter.entity.CanvasTask::getUserId, userId)
+                .eq(com.jurong.aicenter.entity.CanvasTask::getNodeId, videoGenNodeId)
+                .eq(com.jurong.aicenter.entity.CanvasTask::getType, "video-generation")
+                .in(com.jurong.aicenter.entity.CanvasTask::getStatus, "pending", "running")
+                .orderByDesc(com.jurong.aicenter.entity.CanvasTask::getCreatedAt)
+                .last("LIMIT 1"));
+        if (!existing.isEmpty()) {
+            com.jurong.aicenter.entity.CanvasTask existingTask = existing.get(0);
+            // 2026-08-13:debug 改 info,确保静默 return 也能在控制台看到
+            log.info("│  [video-gen] ⚠️ 幂等性检查命中: 已有 {}-中任务(taskId={}),返回现有,不再创建新任务/调 NewAPI",
+                existingTask.getStatus(), existingTask.getId());
+            log.info("└─ [video-gen] generateVideoFromCanvas EARLY RETURN (idempotent hit)");
+            return new GenerateCanvasNodeResponse(
+                existingTask.getId(), videoGenNodeId, existingTask.getStatus(),
+                existingTask.getTextResult(), existingTask.getResultUrl(),
+                existingTask.getCreditsEstimated(), java.util.Collections.emptyList(),
+                null);
+        }
+        log.info("│  [video-gen] 幂等性检查通过(无 pending/running 任务),继续创建新任务");
+
+        // 上游连接必须存在(脚本拆解文本 + 换装总图)
+        if (videoGenNode.getUpstreamIds() == null || videoGenNode.getUpstreamIds().isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "视频节点没有上游输入,请先连接脚本拆解文本节点和换装总图节点");
+        }
+
+        // 默认参数(优先用节点 settings 中的配置,其次用请求参数,最后用默认值)
+        if (videoGenNode.getSettings() != null && !videoGenNode.getSettings().isBlank()) {
+            try {
+                com.fasterxml.jackson.databind.JsonNode settings = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readTree(videoGenNode.getSettings());
+                if (duration <= 0 && settings.has("duration")) duration = settings.get("duration").asInt();
+                if ((resolution == null || resolution.isBlank()) && settings.has("resolution")) {
+                    resolution = settings.get("resolution").asText();
+                }
+                log.debug("[video-gen] 从节点 settings 读取参数: duration={}, resolution={}", duration, resolution);
+            } catch (Exception e) {
+                log.warn("[video-gen] 解析节点 settings 失败(非致命): {}", e.getMessage());
+            }
+        }
+        if (duration <= 0) duration = 9;
+        if (resolution == null || resolution.isBlank()) resolution = "720P";
+
+        // 2. 写任务
+        CanvasTask task = new CanvasTask();
+        task.setNodeId(videoGenNodeId);
+        task.setUserId(userId);
+        task.setType("video-generation");
+        task.setStatus("pending");
+        task.setPrompt("videoGenNodeId=" + videoGenNodeId);
+        taskRepository.insert(task);
+
+        // 3. 视频生成节点标 running
+        videoGenNode.setStatus("running");
+        videoGenNode.setUpdatedAt(LocalDateTime.now());
+        nodeRepository.updateById(videoGenNode);
+
+        // 4. 异步执行
+        canvasVideoGenService.executeVideoGenAsync(task, videoGenNode, duration, resolution, userId);
+
+        log.debug("Canvas video-generation task created: taskId={}, videoGenNodeId={}, userId={}, duration={}s, resolution={}",
+            task.getId(), videoGenNodeId, userId, duration, resolution);
+
+        // 5. 立刻返回 pending
+        return new GenerateCanvasNodeResponse(
+            task.getId(), videoGenNodeId, "pending", null, null, null,
+            java.util.Collections.emptyList(),
+            null  // failMessage: pending 状态无失败原因
         );
     }
 
@@ -576,9 +749,19 @@ public class CanvasServiceImpl implements CanvasService {
             task.getTextResult(),
             task.getResultUrl(),
             task.getCreditsEstimated(),
-            java.util.Collections.emptyList()
+            java.util.Collections.emptyList(),
+            null  // failMessage 占位,下面再根据 status 设置
         );
         resp.setCreatedNodeIds(createdIds);
+        // 2026-08-10 修复:把失败原因透传给前端,前端轮询拿到 status="failed" 时能显示具体原因
+        if ("failed".equalsIgnoreCase(task.getStatus())) {
+            String err = task.getErrorMessage();
+            // 截断到合理长度,防止超长 Java 堆栈撑爆前端 toast / 数据库 fail_reason VARCHAR(500)
+            if (err != null && err.length() > 450) {
+                err = err.substring(0, 450) + "...";
+            }
+            resp.setFailMessage(err);
+        }
         return resp;
     }
 
@@ -620,7 +803,7 @@ public class CanvasServiceImpl implements CanvasService {
         c.setCreatedAt(now);
         c.setUpdatedAt(now);
         canvasRepository.insert(c);
-        log.info("Default canvas auto-created: userId={}, id={}", userId, c.getId());
+        log.debug("Default canvas auto-created: userId={}, id={}", userId, c.getId());
         return c;
     }
 

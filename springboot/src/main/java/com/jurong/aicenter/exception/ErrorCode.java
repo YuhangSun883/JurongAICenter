@@ -26,6 +26,11 @@ public enum ErrorCode {
     NEWAPI_TASK_FAILED(3008, "newapi task failed"),
     NEWAPI_TASK_TIMEOUT(3009, "newapi task timeout"),
     NEWAPI_VIDEO_URL_MISSING(3010, "newapi video url missing"),
+    NEWAPI_REQUEST_INVALID(3011, "newapi request invalid (4xx, business rejected)"),
+    // 2026-08-12 added: 区分 task not found (400) 与其他 4xx 错误
+    // 400 task not found 不一定是任务失败 —— 可能是 NewAPI 元数据被清理但视频文件还在 CDN 上
+    // 调用方应根据 syncUrl / assetUrl 等兜底,而不是立即 FAILED
+    NEWAPI_TASK_NOT_FOUND(3012, "newapi task not found (TTL expired or cleaned, but video may still exist on CDN)"),
 
     WORKFLOW_NOT_FOUND(4001, "workflow not found"),
     WORKFLOW_ACCESS_DENIED(4002, "workflow access denied"),
