@@ -9,9 +9,12 @@ import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
-import org.springframework.http.MediaType;
+import org.springframework.http.*;
 import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.RestTemplate;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
@@ -34,6 +37,48 @@ import java.util.Map;
  */
 @Component
 public class NewApiClient {
+
+    /**
+     * 2026-08-11 新增:submit 视频任务的完整结果。
+     * - taskId:NewAPI 任务 ID(必填)
+     * - url:视频 URL(可能为 null,某些场景 submit 响应里就有,某些需要后续 poll 拿)
+     */
+    public record SubmitResult(String taskId, String url) {
+        public boolean hasUrl() { return url != null && !url.isBlank(); }
+    }
+
+    /**
+     * 2026-08-13 DEBUG:递归收集 JSON 顶层 + 二级字段名,排查"字段名变了"类问题
+     */
+    private static String collectFieldNames(JsonNode node) {
+        if (node == null) return "(null)";
+        StringBuilder sb = new StringBuilder();
+        collectFieldNamesRecursive(node, sb, 0, 3);  // 最多 3 层
+        return sb.toString();
+    }
+
+    private static void collectFieldNamesRecursive(JsonNode node, StringBuilder sb, int depth, int maxDepth) {
+        if (depth >= maxDepth || node == null || !node.isObject()) return;
+        boolean first = true;
+        for (java.util.Iterator<String> it = node.fieldNames(); it.hasNext(); ) {
+            if (!first) sb.append(", ");
+            first = false;
+            String name = it.next();
+            sb.append(name);
+            JsonNode child = node.get(name);
+            if (child != null && child.isObject()) {
+                sb.append("{");
+                StringBuilder childSb = new StringBuilder();
+                collectFieldNamesRecursive(child, childSb, depth + 1, maxDepth);
+                sb.append(childSb);
+                sb.append("}");
+            } else if (child != null && child.isArray() && child.size() > 0) {
+                sb.append("[]");
+            }
+        }
+    }
+
+
     // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
     private static final Logger log = LoggerFactory.getLogger(NewApiClient.class);
 
@@ -44,6 +89,14 @@ public class NewApiClient {
 
     @Value("${newapi.base-url}")
     private String baseUrl;
+
+    // 2026-08-12 added:视频生成/查询专用端点,走 aicoming-proxy 8080(持久化,元数据不清理)
+    //   baseUrl = NewAPI 中转站 3000 (task_xxx 格式, 5 retries 后元数据被清理 -> 拿到不了 video URL)
+    //   videoBaseUrl = aicoming-proxy 8080 (vid_xxx 格式, 元数据持久化 -> 每次都能拿到)
+    //   两者 token 共享。参考文档 §5.5:资产 CRUD 必走 8080,视频生成走 NewAPI 中转站;
+    //   这里反向优化:视频也走 8080 避免元数据 TTL 清理问题。
+    @Value("${newapi.video-base-url:http://192.140.163.161:3000}")
+    private String videoBaseUrl;
 
     @Value("${newapi.token}")
     private String token;
@@ -62,8 +115,40 @@ public class NewApiClient {
      * @return NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬倵楠炲灝鍔氭い锔诲灣缁牏鈧綆鍋佹禍婊堟煙閸濆嫭顥滃ù婊堢畺閺岀喖宕楅崗鑲╃▏闂佹寧娲︽禍婊堬綖韫囨稒鎯為柛锔诲幘閻撴捇姊洪崷顓х劸閻庢稈鏅犻獮蹇旀綇閳哄啰锛濇繛鎾磋壘濞层倝寮稿☉銏♀拺閻㈩垼鍠氱粔顔筋殽閻愬弶顥滈柣锝嗙箞瀹曠喖顢曢妶搴℃櫔缂傚倸鍊搁崐鐑芥倿閿曞倹鏅梻渚€鈧偛鑻晶浼存煛娴ｅ壊鐓肩€殿喛顕ч埥澶愬煑閳规儳浜鹃柨鏇炲€哥粻锝嗙節闂堟稒鍣介柡浣圭墵濮婄粯鎷呮笟顖涙暞濠碘槅鍋勭€氭澘鐣烽鐑嗘晝闁挎洍鍋撻柣?JSON闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿噮鍣ｅ畷濂告偄閸涘鍞堕梻鍌欒兌椤牓顢栭崱娑樼闁告挆鍐ㄧ亰濡炪倖鎸鹃崑鎰ｉ崼鐔剁箚妞ゆ牗绻嶉崵娆愮箾閸涘洤娲﹂埛鎴炵箾閼奸鍤欐鐐搭殜閺岋綁鎮㈤崣澶嬬彋閻庢鍠栭…鐑藉箖閵忋倕宸濆┑鐘插鑲栨繝寰锋澘鈧呭緤娴犲鐤い鏍剱閺佷胶鈧箍鍎遍ˇ浼村煕閹寸姷纾奸悗锝庡亽閸庛儵鏌涙惔锛勭闁靛洤瀚伴獮瀣攽閹邦厸鏋呴柣搴㈩問閸犳盯顢氳閸┿儲寰勯幇顒夋綂闂佺粯锕㈠褎鎱ㄩ崼鏇熲拻濞达絽鎲￠崯鐐烘煕閺冩捇妾紒鍌氱Ч瀵粙鈥栭濠勭М鐎规洖銈告慨鈧柕蹇ｆ緛缁?status / metadata.url 缂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ょ紓宥咃躬瀵鏁愭径濠勵吅闂佹寧绻傞幉娑㈠箻缂佹鍘辨繝鐢靛Т閸婂綊宕戦妷鈺傜厸閻忕偠顕ф慨鍌溾偓娈垮櫘閸撶喎鐣疯ぐ鎺濇晩閻熸瑥瀚惁閬嶆⒒閸屾瑧鍔嶆俊鐐叉健瀹曘垺绂掔€ｎ偄浠梺鍐叉惈閹冲酣鎷戦悢鍏肩厽闁哄倽娉曞▓閬嶆煛鐎ｎ亪鍙勬慨濠佺矙瀹曞爼顢楁径瀣珨闁荤喐绮岀粔鍫曞矗閸涱収娓婚柕鍫濇閹嫭绻涢悡搴㈠仴闁糕斁鍋撳銈嗗灱濞夋洟藝閿曞倹鐓冮柦妯侯樈濡偓婵犳鍠掗崑鎾绘⒑閻愯棄鍔滈柡瀣偢瀹曟垿骞樼紒妯衡偓濠氭煠閹帒鍔ら柛妯烘啞缁绘繈濮€閿濆棛銆愬銈嗗灥閹虫﹢骞冨鈧弫鎰板幢閺囩姷鐣鹃梻浣告啞閻熴儵藝椤栨稒鍙忕€广儱顦伴悡娑氣偓鍏夊亾閻庯綆鍓涜ⅵ闂備浇顕栭崰鎾诲垂閽樺鏆︽い鎰剁畱鍞悷婊冪箻瀹曘垽骞囬鍓э紳闂佺鏈悷褔藝閿斿浜滈柨鏃囶嚙閻忥絿绱掓潏鈺佷沪缂佺粯绻堝畷鎺戭煥閸曨剦鍟庡┑鐘垫暩閸嬫稑螣婵犲啰顩叉繝濠傜墳缂嶆牠鏌涘☉妯兼憼闁绘挸绻橀弻娑㈩敃閿濆洨鐣洪梺闈╃秬婵倝濡甸崟顖氱睄闁逞屽墰閺侇噣鏁撻悩鑼舵憰闂佹寧绻傞ˇ浼村磻閹扮増鐓熼柟瀵稿剳娓氭稑霉閻橆偅娅婃慨濠呮缁瑧鎹勯妸锔筋潊闂備胶顭堥敃銉ф崲閸儳宓侀柛鎰╁壆閺冨牆宸濇い鏃囨閸旀帗淇婇悙顏勨偓鏍礉閹达箑纾规俊銈呮噺閸庡﹪鏌涢鐘插姕闁抽攱鍨垮濠氬醇閻旂儤鍒涢梺缁樼⊕缁海妲愰幒妤€绠甸柟鐑樺灍閹稿啫鈹戦悙鏉戠仴闁诲繑宀告俊鍫曟晲婢跺﹦顦ㄩ梺鍐叉惈閸燁偊鐛Δ浣风箚闁绘劦浜滈埀顒佺墪椤斿繑绻濆顒傦紱闂佺懓澧界划顖炴偂韫囨稒鐓曟い鎰╁€曢弸鏃堟煙閽樺鏆炲ǎ?
      */
     public JsonNode pollVideo(String taskId) {
+        // 2026-08-12 根治:先走 aicoming-proxy 8080 (拿即时状态,如 in_progress),
+        //   如果返回 4xx (元数据被清理) 或 5xx,立即 fallback 到 NewAPI 3000 (真实视频服务,视频持久化)
+        //   修复原因:用户澄清 "aicoming 控制台看到的视频" 都是在 NewAPI 3000 上的,aicoming-proxy 8080
+        //     只持久化元数据,视频生成完成后元数据被清理。真实视频 URL 一直在 NewAPI 3000 + CDN。
+        // 2026-08-13 16:30 修正:实测 3000 中转站 token 全部 401(curl /api/user/self),
+        //   走 8080 task_not_exist 不再 fallback 到 3000(反正 401 也拿不到),
+        //   直接抛 NEWAPI_TASK_NOT_FOUND 让 @Scheduled 走 TNF 保留 RUNNING 路径。
         try {
-            return webClientBuilder.baseUrl(baseUrl).build()
+            return pollVideoFromUrl(videoBaseUrl, taskId);
+        } catch (BusinessException primary) {
+            boolean isFallback = primary.getCode() == ErrorCode.NEWAPI_UNREACHABLE.getCode();
+            if (!isFallback) {
+                throw primary;
+            }
+            log.warn("[NewAPI] pollVideo 8080 网络错误, fallback 到 NewAPI 3000: taskId={}, err={}",
+                taskId, primary.getMessage());
+            try {
+                return pollVideoFromUrl(baseUrl, taskId);
+            } catch (BusinessException fallback) {
+                log.error("[NewAPI] pollVideo 3000 也失败: taskId={}, err={}", taskId, fallback.getMessage());
+                throw primary;
+            }
+        }
+    }
+
+    /**
+     * 内部方法:对指定 base URL 发起 /v1/videos/{taskId} 查询。
+     */
+    private JsonNode pollVideoFromUrl(String base, String taskId) {
+        long pollStart = System.currentTimeMillis();
+        log.info("┌─ [POLL-DEBUG] pollVideoFromUrl START: base={}, taskId={}", base, taskId);
+        JsonNode pollResult = null;
+        try {
+            pollResult = webClientBuilder.baseUrl(base).build()
                 .get()
                 .uri("/v1/videos/{taskId}", taskId)
                 .header("Authorization", "Bearer " + token)
@@ -71,10 +156,15 @@ public class NewApiClient {
                 .bodyToMono(JsonNode.class)
                 .timeout(Duration.ofSeconds(30))
                 .onErrorMap(WebClientResponseException.class, e -> {
-                    log.error("NewAPI /v1/videos/{} failed: {} {}",
-                        taskId, e.getStatusCode(), e.getMessage());
-                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                        "NewAPI query failed: " + e.getMessage());
+                    String respBody = e.getResponseBodyAsString();
+                    log.error("NewAPI /v1/videos/{} failed: {} body={}",
+                        taskId, e.getStatusCode(), respBody);
+                    ErrorCode code = (e.getStatusCode().is4xxClientError())
+                        ? ErrorCode.NEWAPI_TASK_NOT_FOUND
+                        : ErrorCode.NEWAPI_UNREACHABLE;
+                    return new BusinessException(code,
+                        "NewAPI query failed: HTTP " + e.getStatusCode()
+                            + (respBody != null ? " body=" + respBody : ""));
                 })
                 .onErrorMap(e -> {
                     if (e instanceof BusinessException) return e;
@@ -83,10 +173,80 @@ public class NewApiClient {
                 })
                 .block();
         } catch (Exception e) {
+            long pollElapsed = System.currentTimeMillis() - pollStart;
+            log.info("└─ [POLL-DEBUG] pollVideoFromUrl FAILED: taskId={}, 耗时 {}ms, err={}", taskId, pollElapsed, e.getMessage());
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI pollVideo({}) failed: {}", taskId, e.getMessage());
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
         }
+        long pollElapsed = System.currentTimeMillis() - pollStart;
+        if (pollResult == null) {
+            log.info("└─ [POLL-DEBUG] pollVideoFromUrl DONE: taskId={}, 耗时 {}ms, result=null", taskId, pollElapsed);
+        } else {
+            String status = pollResult.path("status").asText("(no status field)");
+            String fullStr = pollResult.toString();
+            String preview = fullStr.length() < 1000 ? fullStr : fullStr.substring(0, 1000) + "...";
+            // 2026-08-13 加日志:列出所有顶层字段名,排查 status/url 在哪
+            String fieldNames = collectFieldNames(pollResult);
+            log.info("└─ [POLL-DEBUG] pollVideoFromUrl DONE: taskId={}, 耗时 {}ms, status={}, fields=[{}], body={}",
+                taskId, pollElapsed, status, fieldNames, preview);
+        }
+        return pollResult;
+    }
+
+    public String audioTranscription(byte[] audioBytes, String filename, String language) {
+        if (audioBytes == null || audioBytes.length == 0) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "audioTranscription: audioBytes 为空");
+        }
+        if (audioBytes.length > 25 * 1024 * 1024) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "audioTranscription: 音频/视频文件超 25MB (size=" + audioBytes.length + ")");
+        }
+        final String useLang = (language == null || language.isBlank()) ? "zh" : language;
+        final String fname = (filename != null && !filename.isBlank()) ? filename : "transcribe.mp4";
+
+        log.info("[NewAPI] audioTranscription: {} 字节, filename={}, language={}",
+            audioBytes.length, fname, useLang);
+
+        MultipartBodyBuilder builder = new MultipartBodyBuilder();
+        final String finalFname = fname;
+        builder.part("file", new org.springframework.core.io.ByteArrayResource(audioBytes) {
+            @Override
+            public String getFilename() { return finalFname; }
+        });
+        builder.part("model", "gpt-4o-transcribe");
+        builder.part("language", useLang);
+
+        JsonNode response = webClientBuilder.baseUrl(videoBaseUrl).build()
+            .post()
+            .uri("/v1/audio/transcriptions")
+            .header("Authorization", "Bearer " + token)
+            .contentType(MediaType.MULTIPART_FORM_DATA)
+            .body(BodyInserters.fromMultipartData(builder.build()))
+            .retrieve()
+            .bodyToMono(JsonNode.class)
+            .timeout(Duration.ofSeconds(120))
+            .onErrorMap(WebClientResponseException.class, e -> {
+                String respBody = e.getResponseBodyAsString();
+                log.error("[NewAPI] audioTranscription failed: {} body={}", e.getStatusCode(), respBody);
+                String friendly = translateNewApiError(respBody);
+                return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI audioTranscription failed: HTTP " + e.getStatusCode() + " " + friendly);
+            })
+            .block();
+
+        if (response == null) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI audioTranscription: 响应为空");
+        }
+        String text = response.path("text").asText("");
+        if (text.isBlank()) {
+            log.error("[NewAPI] audioTranscription: 响应 text 字段为空: {}", response);
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI audioTranscription: 转写结果为空");
+        }
+        log.info("[NewAPI] audioTranscription OK: {} 字符", text.length());
+        return text;
     }
 
     /**
@@ -131,7 +291,7 @@ public class NewApiClient {
             }
         }
         throw new BusinessException(ErrorCode.NEWAPI_TASK_TIMEOUT,
-            "NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞楅梻渚€娼х换鍫ュ春閸曨垱鍊块柛鎾楀懐锛滈梺褰掑亰閸欏骸鈻撳鍫熺厸鐎光偓閳ь剟宕伴弽顓犲祦鐎广儱顦介弫濠勭棯閹峰矂鍝烘慨锝咁樀濮婄粯鎷呮笟顖滃姼濡炪倖鍨堕崹褰掑箲閵忕姭鏀介悗锝庝海閹芥洟姊洪崫鍕窛闁哥姴娴峰▎銏ゆ倷閻戞鍘卞銈嗗姧缁茶法绮婚幘鎰佺唵閻熸瑥瀚悡銉╂煃鐟欏嫬鐏撮柟顔界懇瀵爼骞嬮悩杈敇闂備浇澹堥敓銉╁磹濠靛钃熼柨鐔哄Т閻掑灚銇勯幒宥堝厡妞も晝鍏橀幃妤呮晲鎼粹€茬盎闂侀€炲苯澧伴柡浣割煼瀵濡搁妷銏℃杸闂佺硶鍓濋〃鍡椻枔椤撶喓绡€缁炬澘顦辩壕鍧楁煕韫囨棑鑰跨€殿喛顕ч埥澶婎潩閿濆懍澹曢梺鎸庣箓妤犲憡绂嶅┑鍫氬亾鐟欏嫭绀€闁活剙銈搁崺鈧い鎺戝枤濞兼劖绻涢崣澶樼劷闁轰緡鍣ｉ弫鎾绘偐閼碱剛鏆繝鐢靛仜濡瑩骞愰崫銉ф／鐟滄棃寮婚悢琛″亾閻㈡鐒惧ù鐘欏洦鐓涘璺侯儐閵囨繃鎱ㄦ繝鍌ょ吋鐎规洘甯掗埢搴ㄥ箣濠靛棭鐎撮梻鍌欑劍濡炴寧绂嶅鍛濠电姴鍊婚弳锕傛煟閻旂娅炴繛宸憾閺佸倻鈧箍鍎卞Λ娆忊枍閹剧粯鈷掑ù锝呮啞閹牏绱掔€ｂ晝绐旈柟顔斤耿楠炲洭顢涘Ο瑙勭潖闂備礁婀遍崕銈夊垂瑜版崵鍥级濞嗙偓瀵岄梺闈涚墕濡稒鏅堕鍌滅＜閻庯綆鍋呭畷宀€鈧娲忛崹铏圭矉閹烘柡鍋撻敐搴′簮闁圭柉娅ｇ槐鎾诲磼濞嗘垵濡介梺宕囶儠閸婃繈銆侀弮鍫濈闂傚牊绋掗鍧楁⒒娴ｇ鎮戦柟顔煎€搁…鍥槾婵炲棎鍨介幃娆撴倻濡厧骞堥梻浣告惈濞层垽宕濆畝鍕祦婵°倕鎳忛悡鏇㈡煟濡搫鏆卞┑顔肩Ч閺岋紕浠︾粙鍨拤閻庡灚婢樼€氼厾鎹㈠┑瀣妞ゅ繐娲﹂妤呮⒒閸屾瑧顦﹂柟纰卞亜铻為悗闈涙憸缁€濠傘€掑锝呬壕閻庢鍠栭…閿嬩繆閹间礁唯闁靛繆鍓濋弶鎼佹⒒娴ｇ顥忛柛瀣噽閹广垽鍩€椤掍椒绻嗛柛娆忣槸婵牏绱掔紒妯肩畵妞ゆ洏鍎靛鎼侇敃閳垛晛浜鹃柡鍥ュ灪閸嬪倿鏌熼柇锕€鏋撻柛瀣崌瀹曞綊顢曢敐鍥у殥闂佽瀛╅崙褰掑闯閿濆鏄ラ柍褜鍓氶妵鍕箳閹搭垰濮涚紓浣割樀濞佳囨箒濠电姴锕ょ€氼噣骞婇崘顔肩闂侇剙绉甸悡娆撴煙濞堝灝鏋涙い锝呫偢閺屽秹鏌ㄧ€ｎ亞鐟ㄩ梻鍥ь樀閺屻劌鈹戦崱妯烘闂佸摜鍠撻崑銈夊箖瑜版帒绠涢柛鎾茶兌閻﹀牓姊洪崫鍕拱缂佸甯￠獮鍡涘棘鎼存挻顫嶅┑鈽嗗灠閸㈠弶绂嶉悙顒傜瘈闂傚牊绋掗ˉ鐘绘煛閸☆厼顩柟鍙夋倐閹囧醇濠靛牏鎳嗛梻鍌欑瀹曨剙煤椤撱垹钃熼柨鐔哄Т閻愬﹪鏌嶆潪鐗堫樂婵″弶鍔曢埞鎴﹀煡閸℃ぞ绨介梺绋跨箲閿氭い顐㈢箻閹煎綊宕烽鐙呯床婵犵妲呴崹闈涒枍閿濆棛顩烽柟闂寸劍閻撶喐銇勮箛鎾愁伌婵¤尪娅ｇ槐?(" + timeoutSec + "s): " + taskId);
+            "NewAPI 视频任务超时 (" + timeoutSec + "s, taskId=" + taskId + ")");
     }
 
     /**
@@ -172,7 +332,7 @@ public class NewApiClient {
                     log.error("NewAPI /v1/chat/completions failed: {} {}",
                         e.getStatusCode(), e.getResponseBodyAsString());
                     return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                        "LLM 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞堟俊鐐€ら崢浠嬪垂閸偆顩叉繝闈涱儐閻撴洘绻涢崱妤冪缂佺姴顭烽弻鈥崇暆閳ь剟宕伴幘鑸殿潟闁圭儤顨呴～鍛存煟濡櫣锛嶇憸閭﹀灦濮婄粯鎷呴懞銉ｂ偓鍐磼閳ь剚鎷呯悰鈥充壕婵﹩鍋勫畵鍡欌偓娈垮枦椤曆囧煡婢跺á鐔兼煥鐎ｅ灚缍屽┑鐘垫暩閸嬫稑螞濞嗘挸绀夋俊銈呭暟閻瑩鏌涢妷顔煎闁抽攱鍨堕幈銊╂偡閻楀牊鎮欓梺閫炲苯鍘甸柛濠冪箓閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸鹃崰鎾绘偩閹惰姤鈷掗柛灞剧懆閸忓本銇勯鐐靛ⅱ闁瑰箍鍨介獮鍥级閼愁垍鏇㈡煟鎼搭垳绉甸柛鎾寸〒缁牊绻濋崶銊у幍闁哄鐗撶粻鏍ь瀶椤曗偓閺岋綁骞樼€靛憡鍒涢梺璇″枟椤ㄥ﹪寮幇鏉跨＜婵炴垶鐟цぐ鍥╃磽閸屾瑧鍔嶉柛鏃€鐗曡灋闁告劦鍠栭拑鐔兼煥濞戞ê顏ф繛宀婁邯閺岋綁骞囬棃娑橆潾濡炪倧缂氶崡鎶藉箖濡ゅ啯鍠嗛柛鏇ㄥ墰椤︻參姊洪崨濠庣劶闁搞儜鍛箣闂備胶顢婇幓顏嗙不閹达附鍊峰┑鐘叉处閻撶娀鏌涘☉姗嗙叕闁哥喎绻戞穱濠囶敃鎼粹剝鍣界痪鍙ョ矙閺屾稓浠﹂幑鎰棟闂侀€炲苯澧存い銉︽尵閸掓帡宕奸悢绋款€撻柣鐔哥懃鐎氼參鎮甸悜鑺ョ厵闁稿繗鍋愰弳姗€鏌涢弬璺ㄧ伇濠㈣娲樼换婵嗩潩椤撶姴甯鹃梻浣稿閸嬪懐鎹㈤崘鈺佸灁濠靛倸鎲￠悡鏇㈡煏閸繃顥炵紒鈧€ｎ喗鐓涢悘鐐插⒔濞插瓨銇勯姀鈩冪闁轰焦鍔欏畷鍗炩枎濡亶姘舵⒒閸屾艾鈧绮堟担鍝ユ殾妞ゆ巻鍋撻悡銈夋煥閺囩偛鈧憡顢婇梻浣告啞濞诧箓宕归幍顔句笉婵炴垯鍨洪悡鏇熴亜椤撶喎鐏ュù婊呭仧缁辨帡骞囬鐕佹濠殿喖锕ュ钘夌暦閵婏妇绡€闁稿本绮堥崠鏍磽閸屾瑧璐伴柛鐘愁殜閹兘鍩￠崨顖氱ウ? " + e.getStatusCode());
+                        "LLM 调用失败:" + e.getStatusCode());
                 })
                 .onErrorMap(e -> {
                     if (e instanceof BusinessException) return e;
@@ -187,7 +347,7 @@ public class NewApiClient {
             JsonNode first = response.get("choices").get(0);
             JsonNode msg = first.get("message");
             if (msg == null || !msg.has("content")) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "LLM 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁惧墽鎳撻—鍐偓锝庝簼閹癸綁鏌ｉ鐐搭棞闁靛棙甯掗～婵嬫晲閸涱剙顥氬┑掳鍊楁慨鐑藉磻閻愮儤鍋嬮柣妯荤湽閳ь兛绶氬鏉戭潩鏉堚敩銏ゆ⒒娴ｈ鍋犻柛搴㈡そ瀹曟粓鏁冮崒姘€梺鍛婂姦閸犳鎮￠妷鈺傜厸闁搞儺鐓堝▓鏂棵瑰鍫㈢暫婵﹤鎼晥闁搞儜鈧崑鎾澄旈崨顓狅紱闂佽宕橀崺鏍х暦閸欏绡€闂傚牊绋掑婵堢磼閳锯偓閸嬫捇姊绘担渚劸闁哄牜鍓涢崚鎺戠暆閸曗斁鍋撻崒姣椽顢旈崨顏呭闂備浇濮ら敋妞わ富鍨跺鎶芥偄閸忚偐鍘遍梺缁樏壕顓熸櫠閻㈢鍋撳▓鍨灈妞ゎ厼鍢查锝夊箻椤旇棄浜滈梺鎯х箺椤曟牠宕惔銊︹拻濞达絿顭堥ˉ蹇涙煟閹惧磭澧︾€规洑鍗冲浠嬪Ω瑜忚ぐ楣冩⒑閸涘﹥澶勯柛瀣у亾闂佽　鍋撳ù鐘差儐閻撶喖鏌熼柇锕€澧紒鐙欏洦鐓冪紓浣股戠粈鈧梻鍥ь槹缁绘繃绻濋崒姘间紑闂佹椿鍘界敮鐐哄焵椤掑喚娼愭繛鍙夛耿閺佸啴濮€閵堝懏妲梺閫炲苯澧柕鍥у楠炴帡宕卞鎯ь棜濠碉紕鍋戦崐銈嗙濠婂牆鐤悗娑櫭肩换鍡涙煕椤愶絾绀€妤犵偑鍨烘穱濠囶敍濠婂啫濡哄┑鐐茬墱閸嬪﹤顫忕紒妯诲濞撴凹鍨抽崝绋款渻閵堝棗鐏ユ繛宸幖閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸鹃崑鐔兼偩?content");
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "LLM 响应格式错误:缺少 message.content");
             }
             String content = msg.get("content").asText();
             log.info("LLM chat OK: model={}, inputLen={}, outputLen={}",
@@ -220,7 +380,110 @@ public class NewApiClient {
      */
     public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
                               String imageMime, int duration, String resolution) {
-        return submitVideo(prompt, imageBytes, imageFilename, imageMime, duration, resolution, null);
+        SubmitResult r = submitVideoFull(prompt, imageBytes, imageFilename, imageMime, duration, resolution, null);
+        return r.taskId();
+    }
+
+    /**
+     * 2026-08-11 新增:多图版 submitVideo(主图 multipart + 附加 URL 列表)。
+     * 用于视频节点有多个上游 image 节点的场景(三视图+换装帧图+其他)。
+     */
+    public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
+                              String imageMime, int duration, String resolution,
+                              java.util.List<String> additionalImageUrls) {
+        // 走 submitVideoMultiImage 方法(直接构造 multipart + 附加 URL)
+        return submitVideoMultiImage(prompt, imageBytes, imageFilename, imageMime,
+            duration, resolution, additionalImageUrls).taskId();
+    }
+
+    /**
+     * 2026-08-11 新增:多图版 submitVideo 内部实现。
+     * 主图走 multipart input_reference,附加 URL 通过 image_urls JSON 字段附加。
+     */
+    private SubmitResult submitVideoMultiImage(String prompt, byte[] imageBytes, String imageFilename,
+                              String imageMime, int duration, String resolution,
+                              java.util.List<String> additionalImageUrls) {
+        try {
+            MultipartBodyBuilder builder = new MultipartBodyBuilder();
+            builder.part("model", "doubao-seedance-2.0");
+            builder.part("prompt", prompt);
+            builder.part("duration", String.valueOf(duration));
+            // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
+            //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
+            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
+
+            // 主图(如果有 bytes)走 multipart input_reference
+            if (imageBytes != null && imageBytes.length > 0) {
+                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
+                final String mime = imageMime != null ? imageMime : "image/png";
+                // 2026-08-13 FIX: 同步发 image/input_reference/image_url 3 个字段名(模仿 Python api_client.submit_video)
+                // 原因:aicoming-proxy 8/13 改了期望字段名,只发 input_reference 会被忽略
+                ByteArrayResource imgResource1 = new ByteArrayResource(imageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                ByteArrayResource imgResource2 = new ByteArrayResource(imageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                ByteArrayResource imgResource3 = new ByteArrayResource(imageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                builder.part("image", imgResource1, MediaType.parseMediaType(mime));
+                builder.part("input_reference", imgResource2, MediaType.parseMediaType(mime));
+                builder.part("image_url", imgResource3, MediaType.parseMediaType(mime));
+            }
+
+            // 附加 URL 通过 image_urls JSON 字段附加(2026-08-11 新增多图)
+            if (additionalImageUrls != null && !additionalImageUrls.isEmpty()) {
+                try {
+                    String imageUrlsJson = MAPPER.writeValueAsString(additionalImageUrls);
+                    builder.part("image_urls", imageUrlsJson);
+                } catch (Exception e) {
+                    log.warn("Failed to serialize image_urls: {}", e.getMessage());
+                }
+            }
+
+            JsonNode response = webClientBuilder.baseUrl(videoBaseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .body(BodyInserters.fromMultipartData(builder.build()))
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(Duration.ofSeconds(600))
+                .onErrorMap(WebClientResponseException.class, e -> {
+                    String body = e.getResponseBodyAsString();
+                    log.error("NewAPI /v1/videos (multi) failed: {} body={}", e.getStatusCode(), body);
+                    String friendly = translateNewApiError(body);
+                    ErrorCode code = (e.getStatusCode().is4xxClientError())
+                        ? ErrorCode.NEWAPI_REQUEST_INVALID
+                        : ErrorCode.NEWAPI_UNREACHABLE;
+                    return new BusinessException(code,
+                        "NewAPI /v1/videos " + e.getStatusCode() + ": " + friendly);
+                })
+                .block();
+
+            if (response == null) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI /v1/videos (multi) 返回空响应");
+            }
+
+            String taskId = response.path("task_id").asText(response.path("id").asText(""));
+            if (taskId.isEmpty()) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI /v1/videos (multi) 响应缺 id/task_id: " + response);
+            }
+            log.info("NewAPI /v1/videos (multi) task submitted: {} (primary={}B, additionalUrls={})",
+                taskId,
+                imageBytes != null ? imageBytes.length : 0,
+                additionalImageUrls);
+            return new SubmitResult(taskId, null);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (multi) 调用失败: " + e.getMessage());
+        }
     }
 
     /**
@@ -236,14 +499,16 @@ public class NewApiClient {
      * 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄闁挎繂妫Λ鍕⒑閸濆嫷鍎庣紒鑸靛哺瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁诡垎鍐ｆ寖缂備緡鍣崹鎶藉箲閵忕姭妲堥柕蹇曞Х椤撴椽姊洪崫鍕殜闁稿鎹囬弻娑㈠Χ閸涱垍褔鏌＄仦鍓ф创濠碉紕鍏橀、娆撴偂鎼存ɑ瀚介梻鍌欐祰濡椼劎绮堟担璇ユ椽顢橀姀鐘烘憰闂佸搫娴勭槐鏇㈡偪閳ь剟姊洪崫鍕窛闁稿鍋婃俊鐑芥晜鏉炴壆鐩庨梻浣瑰濡線顢氳閳诲秴顓兼径瀣幍濡炪倖姊婚悺鏂库枔濠婂牊鐓熸繛鎴濆船濞呭秶鈧娲栫紞濠囥€佸▎鎾村亗閹兼惌鍠楃紞鎾寸節绾板纾块柛瀣灴瀹曟劘顦撮柍褜鍓熷褔鎯岄崒姘辨殾闁荤喐澹嗛弳锕傛煕閵夋垵鍟版禍浼存⒒娴ｇ顥忛柛瀣╃窔瀹曟洟鏌嗗鍡欏帒闂佹悶鍎崝搴ｅ姬閳ь剟姊洪棃娑㈢崪缂佽鲸娲滅划濠氬箻閸撲胶锛濋悗骞垮劚閹锋垿鐓渚囨闁绘劖褰冮弳锝夋煕閳轰礁顏€规洘锕㈤崺鈩冩媴缁嬭銈夋⒒閸屾瑧鍔嶉悗绗涘懏宕查柛灞绢嚤濞戞ǚ鏋庨柟鎯х－閻涖儵姊洪崫鍕枆闁告ü绮欓崺?*濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐏忓繘姊洪崨濠庢畷濠电偛锕ら锝囨嫚濞村顫嶅┑鈽嗗灦閺€閬嶅棘閳ь剟姊绘担鍛婂暈婵炶绠撳畷鎴﹀礋椤掍礁寮块梺闈涚箞閸婃牠鍩涢幋鐐电闁煎ジ顤傞崵娆愵殽閻愭惌娈滈柡宀€鍠栭獮鏍ㄦ媴閾忚姣囬梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁煕閻樺疇澹樻い顓炴喘楠炲洭顢橀悩娈垮晭闂備礁鎲￠悷銉┧囨潏銊︽珷妞ゅ繐鐗婇崑鍌炴煏閸繍妲归柣鎾卞劦閺岋繝宕堕埡浣风捕婵炲瓨绮嶆竟鍡欐?ratio 闂?watermark**闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨绘い鎺嬪灪閵囧嫰骞囬姣挎捇鏌熸笟鍨妞ゎ偅绮撳畷鍗炍旈埀顒勫煕閹烘鈷戠紓浣姑粭褔鏌￠崪浣镐喊妤犵偛顦辩划娆忊枎閹勫€梻浣稿閸嬫帒顭块埀顒傜磽閸愨晜绀嬫慨濠傤煼瀹曟帒鈻庨幋顓熜滈梻浣告贡閳峰牓宕戞繝鍌滄殾妞ゆ牜鍎愰弫鍐煥閺冨洦顥夊ù婊堜憾濮婅櫣鍖栭弴鐐测拤闂佽崵鍟欓崟顓涙灃閻庡箍鍎遍ˇ浼存偂閻斿吋鐓忛煫鍥ㄦ礀鏍￠梺鍝ュ枔閸嬨倝寮婚敐澶婄閻犺櫣鍎ら悗鍓х磽娴ｈ櫣甯涢柣鈺婂灦閻涱喚鈧綆鍠楅崐鑸电箾閼奸鍞洪梺顓у灣閳ь剝顫夊ú蹇涘垂娴犲绠氱€广儱顦伴崕鏃€銇?闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬悧鍫㈠幈闂佸綊鍋婇崹鎵閿曞倹鐓熼柕蹇曞閻撳吋鎱ㄦ繝鍕笡缂佹鍠栭崺鈧い鎺嗗亾妞ゎ厼娲╅ˇ褰掓寠濠靛洢浜滈柟鏉垮閻ｉ亶鏌ｉ妶鍥т壕缂佺粯鐩獮瀣倷鐠轰警妫熸俊鐐€戦崕鎻掔暆閹间礁钃熼柨婵嗩槹閸嬪嫮绱掔€ｎ偄顕滈柣婵堟暬閹嘲顭ㄩ崨顓ф毉闁汇埄鍨遍〃濠傜暦閹达箑绠涙い鏃傛嚀娴滈箖鏌ｉ悢鍛婄凡妞ゃ儱绻橀弻娑㈡偐瀹曞洤鈷岄悗瑙勬礃缁秶鈧絻鍋愰埀顒佺⊕鑿ら柟鐤缁辨捇宕掑▎鎴濆闂佹寧姘ㄧ槐鎺懳旀担鍛婅癁闂佸搫鐭夌紞鈧紒鐘崇洴瀵剟宕归鑺ュ殘婵犵數濮烽。顔炬閺囥垹鏋侀悹鍥皺閺嗭箓鏌ｉ弮鍌楁嫛闁轰礁绉甸幈銊ヮ潨閳ь剛娑甸幖浣歌埞婵炲樊浜濋埛鎺懨归敐鍫燁仩闁靛棗锕弻娑㈠箻鐎靛摜鐤勬繝纰夌磿閺佸骞冨▎鎴斿亾闂堟稒鎲哥憸浼寸畺濮婃椽宕崟顒€鍋嶉梺鎼炲妽濡炰粙宕哄☉銏犵闁圭偨鍔岀紞濠囧极閹版澘宸濇い鏂垮悑濞堟﹢姊绘担鐑樺殌鐎殿喖鐖奸獮鍐磼閻愯尪鎽曞┑鐐村灟閸ㄦ椽宕戦幇鐗堢叄闊浄绲芥禍婊堟⒒婢跺﹦效婵﹥妞藉畷顐﹀礋椤掆偓濞堝苯鈹戦悙宸Ч缂佸鐗犻幃姗€宕橀瑙ｆ嫼闂佸憡绋戦敃锝囨闁秵鐓曟慨妞诲亾缂佺姵鐗曢锝夊及韫囷絾鈻岄梻浣告惈閻绱炴笟鈧獮鍐煛閸涱喖鈧粯淇婇婊呫€婇柛瀣崌瀹曟﹢顢旈崱娆欑闯闁诲骸绠嶉崕閬嶅箠閹邦厽娅忛梺璇插椤旀牠宕抽鈧畷鎶芥晲閸涱垱娈鹃梺缁樻尭缁ㄥ爼寮ㄦ禒瀣厱闁斥晛鍟伴幊鍛偓瑙勬礀閹碱偊鍩為幋锔芥櫖闁告洦鍋傞弶顓㈡⒑缁嬪尅鏀婚柣妤冨█閻涱噣骞囬婊冧簼闂佸憡鍔戦崝搴ㄦ晬濞戙垺鈷戠紓浣股戦埛鎰版煟椤忓浂娼愮紒鍌氱Ч閹兘鏌囬敂鎯ф暩闂佽崵濮惧銊ф媰閿曞倸纾块幖杈剧悼绾惧ジ鎮归崶褍绾фい銉ｅ灲閺屸€崇暆鐎ｎ剛袦濡ょ姷鍋涘ú顓炵暦濡ゅ懎浼犻柕澹嫭娅掗梻鍌氬€风欢姘跺焵椤掑倸浠滈柤娲诲灡閺呭爼顢涢悙瀵稿幗濠德板€撻懗鍫曟儗閹烘柡鍋撳▓鍨珮闁稿锕妴浣糕枎閹炬潙浠奸悗鍏夊亾闁逞屽墴閹線宕奸妷锔规嫼闂佺鍋愰崑娑㈠礉濮椻偓閺屾盯寮懗顖氼伃闂佸磭绮幑鍥嵁鐎ｎ喗鏅滈柣锝呰嫰楠炴姊绘担铏瑰笡妞ゎ厼娲畷鏇㈠Χ婢跺á銉╂煕閹伴潧鏋熼柛瀣剁秮閺屽秷顧侀柛鎾跺枛瀵偊宕橀鑲╁姦濡炪倖甯掔€氀囧焵椤掑﹦鐣电€规洖鐖奸、妤呭焵椤掑嫬绀冮柍褜鍓欓—鍐Χ鎼粹€斥拻闂佸憡鎸婚懝鎹愮亱闂佸憡鍔﹂崰鏍几娓氣偓閺岀喖鎮ч崼鐔哄嚒閻庣懓鎲＄换鍐Φ閸曨垰绠婚悹铏瑰劋閻庢儳顪冮妶鍡樼叆閻庢凹鍠氬Σ鎰板箻鐠囪尙锛滃┑鐐叉鐢帡宕㈤敓鐘崇厽閹兼番鍨兼竟妯肩磼缂佹◤顏堟偩閻戣棄閱囬柡鍥╁€ｉ埡鍐╁枑鐎广儱娲﹂弳婊勪繆閵堝懏鍣洪柍閿嬪笒闇夐柨婵嗘噺閸熺偤鏌涢悢鍝勪户缂佽鲸甯為幏鐘诲箵閹哄棗浜惧┑鐘宠壘閻掑灚銇勯幒宥囶槮闁搞値鍓熼弻娑㈠箻鐠虹儤鐏堥悗瑙勬礃濡炰粙宕洪埀顒併亜閹哄秹妾峰ù婊勭矒閺岀喖宕崟顒夋婵炲瓨绮嶉崕鎶解€旈崘顔嘉ч幖绮光偓宕囶啋闂備胶顭堢换鎴︽晝閵忋倕绠栧ù鍏兼儗閺佸﹪鏌ｉ敐鍛伇闁伙箑鐗撳娲川婵犲倸袝婵炲瓨绮庨崑銈夌嵁婵犲倵鏀介悗锝庡亐閹锋椽姊绘笟鍥т簽闁稿鐩幊鐔碱敍濞戞瑦鐝烽柣搴ｆ暩绾爼宕戦幘鏂ユ灁闁割煈鍠楅悘鏇烆渻閵堝棙鑲犻柛銉戝懎寮ㄥ┑鐘灱濞夋盯鈥﹂鈧…鍥Ω閳哄倻鍘遍梺鏂ユ櫅閸熶即骞婇崘顏佸亾濞堝灝鏋熷┑鐐诧工椤繘鎼圭憴鍕幑闂佸憡渚楅崣搴∥涢崼銉︹拺閻熸瑥瀚妵鐔访瑰鍛粶閸楅亶鏌熼悧鍫熺凡闁告濞婇弻锝夊棘閹规劦鍔呭┑鐐存綑鐎氼剟鈥旈崘顔嘉ч柛鈩冪懃閳峰牓姊虹粙娆惧剳闁稿鍊濆畷鍝勨槈閵忕姷顓洪梺鎸庢琚欓柟宄版惈椤啴濡堕崱妤€顫囬梺绋匡攻濞叉绮嬮幒鎴叆闁割偆鍠撻崢鎯р攽閻愯泛钄兼い鏇嗗洦鍊堕柨鐔哄У閻撴盯鏌涘☉鍗炲箻闁糕晪绲鹃妵鍕閿涘嫧妲堝銈庡幑閸旀垵鐣烽妸鈺婃晬闁靛牆娲ょ花銉╂⒒閸屾瑦绁版い鏇嗗洤绀勯柣锝呯灱缁€濠囨煕閳╁啰鈽夌痪鎯ь煼閺屾盯寮撮妸銉㈠亾鐎ｎ厹浜归柟鐑樼箖閺咁亪姊洪柅鐐茶嫰婢у鈧鍠栭…宄邦嚕閹绢喖顫呴柣妯垮蔼閳ь剙鐏濋埞鎴炲箠闁稿﹥鍔欏畷鎴﹀箻缂佹鍘搁梺绯曟閸橀箖骞冩總鍛婄厓鐟滄粓宕滃┑瀣剁稏濠㈣泛鈯曞ú顏勫唨鐟滃繘寮抽敂濮愪簻闁圭儤鍨甸鈺呮煟閹绢垪鍋撻幇浣哄數闁荤姾妗ㄧ拃锕傚磿閹邦喚纾界€广儱鎳忛崰姗€鏌＄仦鐐缂佺粯绻嗙粻娑樷槈濞嗘ǚ鍋撳澶嬧拺缂備焦顭囩粻鎵磼閻樿櫕灏い顐㈢箻閹煎湱鎲撮崟顐ゅ酱闂備礁鎼悮顐﹀磿濞差亜鐒垫い鎺嶇贰濞堟粓鏌＄仦鍓р槈閾伙綁鏌ゆ慨鎰偓妤呮偂婢舵劖鍊甸悷娆忓缁€鍐煕閵娿儲鍋ラ柣娑卞枛铻ｉ柤娴嬫櫇閿涙粌鈹戦埥鍡楃仯闁告鍥╁祦闁割偁鍎查埛鎺懨归敐鍛暈闁诡垰鐗婄换娑氫沪閸屾氨浼堥悗瑙勬礃缁诲倿鎮惧┑瀣妞ゆ劑鍊曟慨?
      * 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌氬€烽懗鑸垫叏闁垮绠鹃柍褜鍓熼弻鈥崇暆閳ь剟宕伴弽褏鏆︽繝濠傛－濡查箖鏌ｉ姀鈺佺仭闁烩晩鍨跺璇测槈濮橈絽浜鹃柨婵嗗暙婵″ジ鏌嶈閸撴氨鎹㈤崼婵愬殨濠电姵鑹鹃崡鎶芥煟閺冨洦顏犳い鏃€娲熷铏圭磼濡搫袝闂佸憡鎸诲畝鎼佸箖閻㈢绫嶉柛顐ゅ暱閹锋椽姊虹涵鍛汗闁稿绋掓穱濠冪附閸涘﹦鍘辨繝鐢靛Т閸婂綊宕戦妷褉鍋撳▓鍨灕妞ゆ泦鍥х叀濠㈣埖鍔曢～鍛存煟濡吋鏆╅柡澶婃啞娣囧﹪鎮欓鍕ㄥ亾閺嶎偅鏆滃┑鐘插婵ジ鏌＄仦璇插姎闁告垹濮电换娑㈠幢濡闉嶉梺鎶芥敱閸ㄥ湱妲愰幘瀛樺闁兼祴鍓濋崹瑙勭閹间緡鏁傞柛顐ゅ枔閸橀亶鏌熼懝鐗堝涧缂佹煡绠栧鎶筋敆閸屾浜炬繛鍫濈仢閺嬫稒銇勯鐘插幋妤犵偛鍟存慨鈧柕蹇娾偓鍏呯钵闂備胶鍋ㄩ崕閬嶅储閺嶃劎鐝堕柡鍥ュ灪閳锋垶鎱ㄩ悷鐗堟悙闁诲浚浜濋妵鍕籍閳ь剟鎮ч悩璇茬畺闁绘劕鎼粻姘亜椤戣В鍋撳畷鍥┬ㄩ梺璇″枓閺呮盯鍩㈡惔銈囩杸闁哄倹顑欏Σ閬嶆⒒娴ｈ櫣甯涢柟鍛婃倐瀹曨垶骞嶉绛嬫綗闂佽鍎抽悺銊﹀垔閹绢喗鐓犳繛鏉戭儏婢ф煡鏌涢妸銉﹁础闁告帗甯″畷濂稿煑閳轰椒澹曢梺鎸庣箓妤犳悂寮搁悢鍏肩厽闁规儳顕幊鍕煏閸パ冾伃鐎殿噮鍣ｅ畷鎺戭煥閸曨剙鏅靛┑鐘垫暩閸嬫盯鎮ф繝鍕灊闁规崘顕ч拑鐔兼煃閳轰礁鏆炲┑顖涙尦閺岋綁鎮㈤崨濠勫嚒濡炪値鍋勭粔鐟邦潖閾忚瀚氶柍銉ョ－娴狀參姊洪崫鍕潶闁告梹鍨垮畷娲倷閸濆嫮顓洪梺鎸庢磵閸嬫捇姊洪崡鐐村枠闁哄本娲濈粻娑欑節閸屾埃鎷ゆ繝鐢靛仜閹冲繒鏁Δ鍐╁床婵犻潧鐗嗛弸鍫濐熆鐠鸿櫣鐏遍柨娑氬枛濮婅櫣绮欏▎鎯у壉闂佹悶鍔岄悘婵嬫偩閻戣棄绠涢柡澶庢硶椤撴椽姊洪幐搴㈢５闁稿鎸鹃惀顏堝箚瑜忕粔娲煛瀹€瀣瘈鐎规洖鐖兼俊鐑藉Ψ瑜岄幃锝囩磽閸屾瑨鍏屽┑顕€鏀辩换娑㈠焵椤掍緡娈介柣鎰嚟婢ь亪鎳ｉ幇顓滀簻闁瑰搫妫楁禍鐐節绾板纾块柛蹇旓耿瀵顓奸崼顐ｎ€囬梻浣告啞閹稿爼宕濇惔锝呭灊濠电姵鑹剧粻鑽も偓瑙勬礀濞诧箑鈻撻崜褏纾藉ù锝呭閸庢挻銇勯弴鐔封枙鐎殿噮鍣ｉ崺鈧い鎺戝缁狀垶鏌涘☉娆愮稇鐎瑰憡绻傞埞鎴︽偐閹绘帩浠惧┑鐘灪閹告悂鍩為幋锔藉亹闁割煈鍋呭В鍕⒑缁嬫鍎戝┑鐐╁亾濡ょ姷鍋為幑鍥€侀弮鍫濆耿婵°倕鍟伴悺妯衡攽閻愬樊鍤熷┑顔芥尦椤㈡牠宕ㄧ€涙ê浠惧銈嗘煥椤洘绂嶅鍫熺厵闁哄瀵х粚鎸庛亜閺囧棗娉氶崶顒夋晬闁绘劘灏欓崢鎾⒑绾懏褰х紒鐘冲灴閻涱噣濮€閵堝棛鍘撻梺鍛婄箓鐎氼剟鍩€椤掍焦鍊愰柟顖欑椤劑宕奸悢鍙夊濠电偞鎸婚崺鍐磻閹惧绠惧ù锝呭暱濞诧箓宕戠€ｎ喗鐓曢柍鈺佸暟閹插潡鏌涚€ｎ偅灏柍钘夘樀楠炴帡骞樼€电绲垮┑鐘垫暩閸嬫稑螞鎼淬劌鍨傜憸鐗堝笒閻撯€愁熆鐠轰警鐓繛灏栨櫊瀵爼宕煎顓熺彣缂備浇椴搁悡鈥愁潖缂佹ɑ濯撮柛娑橈龚绾偓缂傚倷绶￠崳顕€宕归幎钘夋瀬妞ゆ洍鍋撴鐐村笒铻栭柍褜鍓熼幃锟犲即閵忥紕鍘搁梺鍛婂姂閸斿矂鍩€椤掑啫鍚瑰瑙勬礋瀹曟绮潪鎵泿闂備礁鎼崯顐﹀磹閻㈢绠柨鐔哄У閻撴洟骞栨潏鍓х？缂佺姵鐓￠弻鏇㈠炊瑜嶉顓燁殽閻愯揪鑰跨€规洘锕㈠畷锝嗗緞婵炴儳浜炬い鏍仦閸婄敻鏌涢…鎴濅簼缂佽埖鐓￠幃妤€顫濋悡搴＄闂佺懓绠嶉崹褰掑煘閹寸姭鍋撻敐搴濈敖闁挎稒绮岄埞鎴︽偐缂佹ɑ閿梺鍝ュ櫏閸嬪懐绮嬪鍡愬亝闁告劏鏅濋崢鍗烆渻閵堝骸骞楅柛銊ф暬瀵悂骞樼紒妯煎幐闂侀€炲苯澧紒鍌涘笧閳ь剨缍嗘禍鐐侯敊婵犲洦鈷戦悷娆忓閸旇埖淇婇銏狀伀濠㈣娲濋妵鎰板箳閹捐泛骞嶉梻浣虹帛椤ㄥ懘鎮ф繝鍕偨闁肩⒈鍓涘Λ顖炴煙椤栧棗鐬奸崥瀣⒑閸濆嫮鐏遍柛鐘崇墪閻ｅ嘲顭ㄩ崱鈺傂梺姹囧焺閸ㄩ亶鎯勯鐐茶摕婵炴垶鍩冮崑鎾绘晲閸涱収鏆㈤梺鍛婂笂閸楀啿螞娴ｇ懓绶為柟閭﹀幘閸欏棗鈹戦悩缁樻锭婵☆偅鐟╁畷鍐裁洪鍛化闂佽婢樻晶搴ｅ姬閳ь剟姊洪崫鍕拱缂佸鍨块崺銏℃償閿濆嫭鍕冮梺鐟扮摠鐢帡藟濮樿埖鈷掗柛灞捐壘閳ь剚鎮傚畷鎰槹鎼达絿鐒兼繛鎾村焹閸嬫挻顨ラ悙瀵稿⒌妞ゃ垺娲熸俊鍫曞幢濡炲墽鐥呭┑锛勫亼閸婃牠宕濊缁骞嬮悩宸闁荤喐鐟ョ€氼喚寮ч埀顒勬⒒閸屾氨澧涚紒瀣浮钘熼柣妯肩帛閻撴盯鏌涢埥鍡楀籍婵＄虎鍠栬彁闁搞儜宥堝惈濡炪們鍨虹粙鎴︼綖濠靛唯闁靛鍊楃槐锕傛⒒閸屾瑧绐旀繛鑹板吹閳ь剟娼ч惌鍌氱暦閵忋倕绠瑰ù锝呮憸閿涙盯姊洪悷鏉库挃缂侇噮鍨跺鏌ュ蓟閵夈儳顔愰柣搴㈢⊕椤洨绮诲鈧弻銈呯暦閸パ冨缂備胶绮换鍫熸叏閳ь剟鏌ㄥ┑鍡楊劉缂傚秴鐗嗛埞鎴︽倷鐠鸿櫣姣㈤梺鍝ュТ闁帮綁鏁愰悙鍓佺杸婵炴垶鐟﹂崕顏堟⒑闂堚晛鐦滈柛姗€绠栭弫宥咁煥閸愶絾鏂€闂佸疇妫勫Λ妤呮倶閵壯€鍋撶憴鍕闁轰礁顭峰顐㈩吋閸涱亝顫嶅┑顔筋焾娴滎剟鏁嶅┑鍥╃閺夊牆澧界粙鑽ゆ喐閺夊灝鏆炵紒鍌氱Ч閹瑩顢楅崒婊庡晭闂備礁婀遍崑鎾愁焽濞嗘挻鍊跨憸鐗堝笚閻撴洟鎮楅敐搴′簼閻忓繒鏁婚弻?aicoming 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞堟俊鐐€ら崢浠嬪垂閸偆顩叉繝闈涱儐閻撴洘绻涢崱妤冪缂佺姴顭烽弻锛勪沪缁嬪灝鈷夐悗鍨緲鐎氼噣鍩€椤掑﹦绉靛ù婊勭箞椤㈡瑩宕ㄧ€涙ê浠┑鐘诧工閹冲酣銆傛總鍛婂仺妞ゆ牗绋戠粭褍顭跨憴鍕缂佽桨绮欏畷銊︾節閸曨偄绠洪梻鍌欑缂嶅﹪宕戞繝鍥у偍闁兼祴鏅涚欢銈呪攽閻樺磭顣查柣鎾跺枛楠炴牠骞栭鐐寸亪濡ょ姷鍋為〃鍫㈡閹烘梻纾兼俊顖氬悑閸掓盯鎮楀▓鍨灈闁绘牕銈搁悰顔锯偓锝庝簴閺€浠嬫煕閵夋垟鍋撻柛瀣崌椤㈡稑顫濋敐鍡樻澑闂備胶绮崝鏍亹閸愵喖绠栭柟杈鹃檮閻撶喖鏌ｉ弬鍨骇婵炲懎鎳橀弻锝夋晲閸ャ劎鍔归梺闈涙处閸旀瑩鐛幒妤€绠ｉ柣娆忔噽鎼村﹤鈹戦悩鎰佸晱闁革綆鍨崇槐鐐哄幢濞戞ê鍋嶉梺鍏肩ゴ閺呮繄绮堟繝鍌楁斀闁绘ê寮堕幖鎰磼閻樺磭澧甸柡灞界У濞碱亪骞嶉璺ㄧ崶闂備礁鎽滈崰搴ㄥ箠韫囨稑桅闁告洦鍨扮猾宥夋煕鐏炴崘澹樺ù鐘成戠换婵嬪閵忊€虫畬濡炪倧绠撳褔锝炶箛鏇犵＜婵☆垵顕ч鎾绘⒑閸涘﹦鈽夐柨鏇樺劦瀹曟洟骞樼紒妯锋嫼闂佽崵鍠愬妯何ｇ紒妯镐簻闁瑰瓨绻嶅Σ鎼佹煟閿濆懎妲绘い顓滃姂瀹曞ジ鎮㈤摎鍌滅泿闂傚倷鑳剁划顖炲箰缁嬫娼╅柨鏇炲€哥粻娲煛閸モ晛浜归柡鈧禒瀣厽闁归偊鍘界紞鎴︽煟韫囨洖鏋涢柡灞剧洴閸┾剝鎷呴崜韫磾闁诲孩顔栭崳顕€宕戞繝鍌滄殾婵せ鍋撴い銏＄懇閹墽浠﹂挊澶嬭緢婵犵數濮烽弫鍛婄箾閳ь剚绻涙担鍐插悩濞戞ǚ鏋庨煫鍥风到閺呯姴鈹戦悩缁樻锭妞ゆ垵妫濋幃锟犳偄閸忚偐鍙嗗┑鐘绘涧濡瑦寰勯崟顖涚厸闁糕檧鏅涙晶顖炴煙娓氬灝濡界紒缁樼箞瀹曟﹢鍩炴径姝屾濠德板€楁慨鐑藉磻閻愮儤鍋嬮柣妯款嚙缁犳牗绻涢崱妤冭穿闁革富鍘搁崑鎾绘晲鎼存繄鑳烘繝銏ｎ潐濞茬喎顫忓ú顏勪紶闁告洦鍘搁弸鍡涙⒑缁嬫鍎忛柟铏锝夊礃瀹割喚鍙嗛梺鍓插亞閸犳捇宕ｉ崱娑欌拺缂備焦蓱閻撱儵鏌熺喊鍗炰簻闁烩槅鍙冨缁樻媴閼恒儺妫勯梺鍝ュ枍閸楀啿鐣锋导鏉戝唨妞ゆ挾鍋犻幗鏇㈡⒑闂堟单鍫ュ疾濠婂牆纾婚柛鏇ㄥ灡閻撴洘绻濋棃娑欘棞闁绘繃妫冮弻鏇＄疀鐎ｎ亖鍋撻弽顓熷亗闁绘柨鍚嬮悡娆撴煟閹寸伝顏堟倶閳轰急褰掓偐瀹曞洦鍒涢梺鍝勬湰濞茬喎鐣烽幆閭︽Щ濡炪倕娴氶崢浠嬨€冮妷鈺傚€烽柡澶嬪灦鐠囩偛螖閻橀潧浠滄い鎴濇嚇閸╃偤骞嬮敃鈧粻娑欍亜韫囨挻顥為柨娑樼箻濮婂宕掑顑藉亾閻戣姤鍤勯柛顐ｆ磵閳ь剨绠撳畷濂稿Ψ椤旇姤娅堥梻浣烘嚀椤曨厽鎱ㄩ棃娑氭殾闁告瑥顦辩弧鈧梻鍌氱墛娓氭宕曡箛娑欑參闁告劦浜滈弸娑㈡煛鐏炶濡奸柍瑙勫灴瀹曞崬螣閻戞ɑ鐝堕梻鍌欑閹碱偊宕锔藉亱闁糕剝绋掗崐鍧楁煕椤垵浜栧ù婊勭矒閺岀喖鎮滃Ο铏逛淮濡炪倕娴氭禍顏堝蓟濞戞埃鍋撻敐搴濇喚闁稿孩妫冮弻锝夊箼閸愩劋鍠婇悗瑙勬礀閻栧吋淇婇幖浣肝╅柨鏇楀亾闁告瑦鍨垮缁樻媴鐟欏嫬浠╅梺绋垮濡炶棄鐣峰鍐ｆ瀻闊洦姊瑰▓浼存⒒閸屾艾鈧绮堟笟鈧畷顖炲锤濡も偓缁犺銇勯幇鍓佺暠缁炬儳缍婇弻锝夊閵忊晝鍔哥紓浣哄閸ㄨ京鎹㈠☉姗嗗晠妞ゆ棁宕甸崙褰掓⒑閹惰姤鏁遍柛銊ユ健瀵鈽夊Ο閿嬵潔濠殿喗顨呴悧鍡樻叏濞戙垺鈷戦悗鍦У椤ュ銇勯敂鐐毈鐎殿喛顕ч鍏煎緞濡粯娅栨繝鐢靛仦閸ㄥ爼鎮疯钘濆ù鐓庣摠閳锋垹鐥鐐村櫤闁绘繍浜弻锝呂旈崘銊㈡瀰閻庤娲樺浠嬪极閹剧粯鍋愰柤纰卞墾缁辨煡姊绘笟鈧褔鎮ч崱妞㈡稑鈽夊杈╃厯闂佸綊鍋婇崗姗€寮ㄦ禒瀣叆婵炴垶锚椤忊晛霉濠婂啨鍋㈤柡灞剧⊕缁绘繈宕橀鍕ㄥ悅婵＄偑鍊ら崑鍕崲閹寸姵宕叉繝闈涙－濞尖晜銇勯幒鎴濅喊缂侀亶浜跺缁樻媴閻戞ê娈岄悷婊勫閸嬬喎危閹伴偊鏁婇柛鎾楀拋妲搁梻浣告惈缁嬩線宕㈡禒瀣亗婵炴垯鍨洪悡鏇㈡煏婢跺牆鐏繛鍛嚇閺岋紕鈧綆鍋勯悘鎾煛鐏炲墽鈽夐柍璇叉唉缁犳盯寮撮悪鈧崬鐟扳攽閻戝洨鍒版繛灞傚€濋弫鍐敂閸稈鍋撴担绯曟婵☆垶鏀遍～宥呪攽椤旂瓔娈旀俊顐ｎ殔閳绘挸鈹戦崼銏紳婵炶揪缍佺紓姘瀶閹间焦鐓曟慨妞诲亾缂佺姵鐗曢悾鐑藉箣閿曗偓缁犲鏌熸０浣藉厡闁?
      */
-    public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
+    public SubmitResult submitVideoFull(String prompt, byte[] imageBytes, String imageFilename,
                               String imageMime, int duration, String resolution, String ratio) {
         try {
             MultipartBodyBuilder builder = new MultipartBodyBuilder();
             builder.part("model", "doubao-seedance-2.0");
             builder.part("prompt", prompt);
             builder.part("duration", String.valueOf(duration));
-            builder.part("resolution", resolution);
+            // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
+            //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
+            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
             // ratio / watermark 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐏忓繘姊洪崨濠庢畷濠电偛锕ら锝囨嫚濞村顫嶅┑鈽嗗灦閺€閬嶅棘閳ь剟姊绘担鍛婂暈婵炶绠撳畷鎴﹀礋椤掍礁寮块梺闈涚箞閸婃牠鍩涢幋鐐电闁煎ジ顤傞崵娆愵殽閻愭惌娈滈柡宀€鍠栭獮鏍ㄦ媴閾忚姣囬梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁煕閻樺疇澹樻い顓炴喘楠炲洭顢橀悩娈垮晭闂備礁鎲￠悷銉┧囨潏銊︽珷妞ゅ繐鐗婇崑鍌炴煏閸繍妲归柣鎾卞劦閺岋繝宕堕埡浣风捕婵炲瓨绮嶆竟鍡欐閹炬剚鍚嬮柛鈩冪懃閳峰矂姊洪崫鍕効缂佺粯绻傞悾鐑藉醇閺囩倣銊╂煏婢诡垰鍊诲Λ顖炴⒒閸屾瑨鍏岀紒顕呭灦楠炴劗鎷犵憗浣告惈椤粓鍩€椤掍椒绻嗛柣銏㈩焾缁€瀣亜閺嶃劍鐨戦柣銈傚亾闂傚倷绀侀幉锟犲箰閻戣姤鍤勯柟顖滃閹冲瞼绱撻崒姘偓鎼佸磹妞嬪孩濯奸柡灞诲劚绾惧鏌熼崜褏甯涢柣鎾存礋閺岀喐瀵肩€涙ɑ閿梺鍝勵儑閸犳牠寮婚敐澶婄閻庨潧鎲￠崚娑㈡⒑閸濆嫭婀扮紒瀣灴閳ワ箓濡搁埡浣哄姦濡炪倖甯掗崐濠氭儗閸℃褰掓晲閸偅缍堝┑鐐叉噽婵炩偓闁哄瞼鍠撶槐鎺楀閻樺磭浜堕梻浣虹帛閹稿鎮烽敃鍌毼﹂柛鏇ㄥ灠缁秹鏌嶈閸撶喎顕ｉ崨濠勭瘈婵﹩鍘煎▓宀勬⒑缁夊棗瀚峰▓鏇㈡煟閹惧鎳勯柕鍥у瀵噣宕掑☉娆戝涧闂備胶鎳撻崯鍨洪銏犺摕闁绘柨鍚嬮幆鐐淬亜閹扳晛鈧鎮￠埀顒勬⒒娴ｅ摜锛嶇紒顕呭灦楠炴垿宕堕鍌氱ウ闂佸綊鍋婇崢浠嬪磿閻旀悶浜滈柡鍐ㄥ€婚幗鍌涗繆椤愩垹顏╅柍瑙勫灴閹晠宕归锝嗙槑濠电姵顔栭崰姘跺礂濮椻偓婵℃挳宕掗悙鏉戠檮婵犮垹鍘滈弲顏嗙礊娴ｅ摜鏆﹂柕濞炬櫅缁狙囨煙鐎电顎撶紒閬嶄憾濮婄粯鎷呴崨濠傛殘缂備礁顑嗛崹鍧楀箖濞差亜惟闁宠桨鑳堕弻褍鈹戦悩缁樻锭妞ゆ垵妫濋幃陇绠涘☉姘絼闂佹悶鍎滅仦钘夊闂備線鈧偛鑻晶顖涚箾閼碱剙鏋涙鐐茬箻楠炲鏁傞挊澶夌盎闂備胶顭堢换妤呭磻閹版澘鍌ㄦい蹇撶墛閳锋垿鏌涢幘鏉戠祷濞存粍绻勭槐鎺旀嫚閼碱儷銏ゅ础闁秵鐓曟繝闈涘閸斻倗鐥幆褋鍋㈤柡宀嬬到閳诲酣骞囬钘夋珣婵犵數鍋犻婊呯不閹捐绠栭柨鐔哄Т閸楁娊鏌ｉ弮鍌滅瘈缂併劏顕ч—鍐Χ閸℃ê鏆楅梺鍝ュТ闁帮綁骞冨鈧俊鐑藉煛閸屾粌骞愰梺璇插嚱缂嶅棝宕滃▎鎾冲嚑闁瑰濮风壕鑲╃磽娴ｈ鐒芥繛鎻掝嚟閳ь剝顫夊ú鏍Χ閹间礁绠栭柕蹇嬪€曠粻褰掓煟閹邦厼顎滄俊鍓ь焾閳规垿鎮╅幇浣告櫛闂佸摜濮甸悧鐘诲极閸愵喖惟闁靛鍨洪悗娲⒑閹稿海绠撴繛灞傚€濆畷鐟扳攽閸モ晝顔曢梺绯曞墲閿氶柣蹇ュ閳ь剝顫夊ú鏍囬悽绋胯摕闁哄洨鍠撶粻鍓ф喐瀹ュ鍤愭い鏍仜閺嬩線鏌ｉ幘宕囧哺闁衡偓娴犲鐓ユ繛鎴灻鈺伱瑰鍐﹀仮闁哄本绋掔换娑㈠垂椤旂懓浜炬繝闈涙閺嗭箓鏌曡箛瀣偓鏍磻閸屾侗娈介柣鎰版涧閺嬫垶淇婇悙鎵煓闁靛棔绀侀～婊堝焵椤掍焦鍙忛柍褜鍓熼弻鏇＄疀閺囩倫銉╂煏閸剛鐣垫慨濠勭帛閹峰懏绗熼娑欐殲闂備浇顫夊鎸庣閻愰潧鍨濆┑鐘宠壘缁狅綁鏌ｅΟ鍏兼毄闁绘帒銈搁弻锝嗘償椤栨粎校闂佺顑勯悞锔剧矉瀹ュ拋鐓ラ柛顐ゅ枔閸樻悂鎮楅獮鍨姎闁哥噥鍋呮穱濠冪鐎ｎ偆鍘介梺闈涱煭缁犳垿鎮橀敃鍌涚厪闁搞儜鍐句純濡ょ姷鍋為…鍥焵椤掍胶鈯曢懣褍霉閻橆喖鐏╅柍瑙勫灴椤㈡瑧娑甸柨瀣毎婵犵绱曢崑妯煎垝濞嗘挻鍋樻い鏇楀亾妤犵偛娲、姗€鎮㈠畡鏉课ら梻鍌欑閸熷潡鎮橀崼銉ョ柧婵犲﹤鎳夐崑鎾愁潩椤愩倗鐓撳┑顔硷功缁垶骞忛崨顔剧懝妞ゆ牗绋掗弳鐐寸節閻㈤潧浠滈柟鍐茬箰鐓ら柣鏃囧亹瀹撲線鏌熼幍顔碱暭闁搞倖甯￠弻鏇㈠醇濠靛洤绐涢梺缁樺笒濞硷繝骞冨Δ鍛祦闁割煈鍠栨慨搴☆渻閵堝繒绱伴柛妤€鍟块悾鐑藉箛閻楀牏鍙嗛柣搴祷閸斿鑺辨繝姘拺闁荤喓澧楅幆鍫㈢磼婢跺﹦鍩ｉ挊婵嬫煥閺冨牊鏆滈柛瀣尭閳绘捇宕归鐣屼邯闂備浇顕х换鎴犳崲閸儱鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜鹃梺缁樻惈缁绘繈寮诲☉銏犵労闁告劗鍋撻悾鍏肩箾鐎电袥闁哄懏鐩崺鐐哄箣閿旇棄鈧兘鏌ｉ幇顒€甯ㄩ柛瀣尵閳ь剨缍嗛崜姘暦閸欏绡€闂傚牊绋掗ˉ鐘绘煛閸☆參妾柕鍥у楠炲洭濡搁敃鈧妯衡攽閻愬弶鈻曞ù婊冪埣瀵偊宕掗悙瀵稿幈濠电偞鍨靛畷顒勬倶閻樻剚娈?Python api_client.py
 
             if (imageBytes != null && imageBytes.length > 0) {
@@ -259,12 +524,19 @@ public class NewApiClient {
             } else {
                 // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇牠姊绘笟鈧埀顒傚仜閼活垱鏅堕弶娆剧唵閻熸瑥瀚粈瀣偓瑙勬礈閸忔﹢銆佸鈧幃鈺冨枈婢跺苯绨ラ梻鍌欐祰椤曆囧礄閻ｅ瞼绀婇柛鈩冪☉绾惧鏌熼幑鎰厫妞ゎ偅娲熼弻宥夊传閸曨偀鍋撻懡銈囦笉闁告挆鈧崑鎾绘偡閺夋妫岄梺鍝ュУ濞叉粓鎳炴潏銊х瘈婵﹩鍓涢悾楣冩⒑缂佹ɑ鐓ラ柛姘儔閸╂盯骞嬮敂钘夆偓鐢告煕閿旇骞栭弽锟犳⒑闂堟稒顥滈柛鐔告尦瀵鏁愭径濠勵唺闂佺粯鍔楅弫鎼佸汲閵堝鈷戦悹鍥ｂ偓铏亶濡炪們鍔岄敃顏堝Υ娴ｈ倽鏃堝川椤撶媭妲规俊鐐€栭崹鍏兼叏閵堝洠鍋撳顑惧仮婵﹥妞介幊锟犲Χ閸涱喚鈧箖姊洪懡銈呮瀭闁稿孩濞婇崺鈧い鎺嶇閸ゎ剟鏌涢幘瀵搞€掗柛鎺撳浮瀹曞ジ濡烽妷褜妲版俊鐐€栧濠氬疾椤愶箑鍌ㄩ梺顒€绉甸埛鎴︽煕閹邦剙绾ч柟顖氱墦閺屾稒绻濋崟顓炵闂佸搫鎳庨悥濂稿箖閻ｅ苯鏋堟俊顖濇〃婢规洟鏌ｉ悢鍝ユ噧閻庢凹鍘炬竟鏇熺節濮橆厾鍘卞┑掳鍊愰崑鎾绘煕閻旈攱鍋ラ柟顕€绠栭幃婊堟寠婢跺矈鏀ㄩ梻浣虹帛閸斿繘寮插鍫稏鐎广儱鎳夐弨浠嬫煟閹邦剙绾фい銉у仱閺屾盯濡歌閺嗩剟鏌ｅ☉鍗炴珝鐎规洖銈告俊鐑芥晜鐟欏嫬顏烘繝鐢靛仩閹活亞绱為埀顒併亜椤愩埄妯€闁诡喗锕㈤弻鍡楊吋閸℃瑥骞愰梻浣告啞娓氭宕板顑炶櫣鈧數纭堕崑鎾舵喆閸曨剙顦╅梺鎼炲妼閻栫厧鐣峰ú顏呮櫢闁绘灏欓ˇ銊╂⒑閸愬弶鎯堥柨鏇樺€栫粋鎺懨洪鍛嫽闂佺鏈悷褏鎷规导瀛樼厱闁规儳顕幊鍛磼椤旇姤顥堥柟顔荤矙瀹曘劍绻濋崒娆戞殫濠电姷鏁搁崑鐐哄垂椤栫偛鍨傛繛宸簼閸嬪倿鏌￠崶銉ョ仾闁绘挸鍟撮弻宥嗘姜閹殿噮妲梺鍝勬閻熴儵鍩為幋锔绘晩闁稿繒鍘ч弸鐘绘⒑閸濆嫭婀伴柣鈺婂灠椤曪綁顢氶埀顒勭嵁濮椻偓瀹曟粍鎷呯憴鍕靛晫闂傚倸鍊风粈渚€骞栭锔藉剹濠㈣泛鏈～鏇㈡煛閸モ晛鏋旀い鈺冨厴閺屻劑寮崒姘闁诲孩纰嶅畝鎼佸蓟閻旇櫣纾兼俊顖濇〃閸掑﹪姊虹拠鎻掝劉濠电偛锕ら～蹇曠磼濡顎撻梺鍛婄缚閸庢煡鎮楅灏栨斀闁宠棄妫楁禍婊堟倵濮橆厼顎滄俊顐ゅ枎椤啴濡堕崱娆忊拡闂佺顑嗛惄顖炲箖閳ユ枼鏀介悗锝庝簽椤旀劕鈹戦悜鍥╃У闁告挻鐟︽穱濠囨嚃閳哄啰锛滈梺缁樼懃閹虫劗绮旈鈧弻鈥崇暆鐎ｎ剛袦濡ょ姷鍋涘ú顓€佸鈧幃銏ゆ惞閸忓鐎兼繝鐢靛Х閺佹悂宕戝☉銏犵疇閹艰揪绲鹃弳婊呯磼閺傝法鐛杕ing 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴妤犵偛鍟伴幉鎾礋椤掆偓椤繝姊洪悷鏉挎Щ闁活厼鐗撳畷婵嬪川椤撴稒鏂€闂佺粯鍔栬ぐ鍐箖閹达附鐓熸俊銈勭劍缁€瀣煕閳哄啫浠辨鐐差儔閺佸倿鎸婃径澶嬬潖闂備浇顕ф绋匡耿鏉堛劍鍙忛柟缁㈠暉婢跺ň鏀介柛顐犲灮閿涙繃绻涙潏鍓ф偧闁硅櫕鎸婚幈銊╁醇閻旂繝绨婚梺闈涱焾閸庡鐓鍌楀亾濞堝灝鏋涙い顓犲厴瀵偊骞樼紒妯轰汗闂佽偐鈷堥崜娆撳焵椤掑倸浠辨慨濠冩そ瀹曟宕楅悡搴樺亾閹邦厾绠惧ù锝呭暱濞层倝鎮″┑瀣彄闁搞儯鍔庨埊鏇㈡煃闁垮鐏存慨濠冩そ椤㈡洟濡堕崨顒傛崟闂備礁鍚嬪鍧楀垂闁秴鐤鹃柛顐ｆ处閺佸鏌嶈閸撶喎顕ｆ繝姘亜闁稿繐鍚嬮崕顏勵渻閵堝棗濮﹂柛鎾寸箞閸┾偓妞ゆ帒鍟涵鍫曟煃瑜滈崜姘额敊閺嶎厼闂い鏇楀亾鐎规洘鍨剁换婵嬪磼濠婂嫭顔曟繝娈垮枟閵囨盯宕戦幘娣簻闁靛骏绱曢幊鍥煙閾忣偆澧甸柛鈹惧墲閹峰懘骞囬悢鍛婄闁宠鍨块弫宥夊礋椤愨剝婢€闂備胶顭堥敃銉╂偋濠婂牆鏋佹い鏃傛櫕缁♀偓闂佹悶鍎崝宀勫焵椤掆偓濞硷繝寮婚妸鈺佸嵆婵°倐鍋撳ù婊堢畺濮婅櫣鈧湱濯崵娆戠磼婢舵劦妫戠紒顔款嚙閳藉螣闁垮娼旀繝鐢靛仜濡寮甸鍌楀亾濮樿櫕顥夐柍瑙勫灴閹瑩鎳滈棃娑欓敪缂傚倷娴囩亸顏堝磻閹版澘绠柛鎰靛枟閺呮繈鏌涚仦鍓р槈闁逞屽墮閻忔繆鐏冮梺鎸庣箓閹冲酣寮抽悙鐑樼厽闁规儳顕ú鎾煛鐏炲墽娲存い銏℃礋椤㈡洟锝為鐘垫晨婵犵數濮幏鍐礋椤掆偓閸炲姊洪崫鍕伇闁哥姵鐗犻妴浣糕枎閹炬潙鈧攱銇勯幒鎴濃偓鍛婃叏閼恒儰绻嗛柣鎰典簻閳ь儸鍛笉闁圭儤顨愮紞鏍ь熆閼搁潧濮囧鍛存⒑閸涘﹥澶勯柛銊ゅ嵆閿濈偤宕ㄧ€涙鍘撻梺瀹犳〃缁€渚€寮搁妶鍡曠箚妞ゆ劑鍨归弳锝夋煙椤旂瓔娈橀柟鍙夋尦瀹曠喖顢楅崒妤佹櫖缂傚倸鍊烽懗鍓佸垝椤栨粍宕查柛顐犲劤瀹撲線鏌涢幇鈺佸Ψ闁哄閰ｉ弻鐔煎箚瑜忛敍宥夋煕濡粯鍊愭慨濠呮缁瑩鎳楅锝嗚晧闂備胶顭堥敃銉╂偋濠婂懏顫?file 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛銈嗘礋閺岋紕浠︾拠鎻掑闂佺粯鎸婚惄顖炲蓟濞戞ǚ妲堥柛妤冨仦閻忓牓姊洪柅鐐茶嫰婢т即鏌℃担鍓茬吋鐎殿喛顕ч埥澶婎煥閸涱垱婢戦梻浣烘嚀閻忔繈宕婊呮噮濠电姷鏁搁崑娑㈡偤閵娧冨灊闁规儳澧庢稉宥夋煛瀹擃喖鏈紞搴♀攽閻愬弶鈻曞ù婊勭矊椤斿繐鈹戦崱蹇旀杸闂佺粯蓱瑜板啴寮冲▎鎰╀簻闁挎棁顫夊▍濠冩叏婵犲啯銇濈€规洏鍔嶇换婵嬪礃閵娾晝鈧椽姊绘担鍝勫付缂傚秴锕︾划濠氬冀椤撶偞妲梺闈涚箳婵參宕ョ€ｎ亶鐔嗛悹铏瑰皑瀹搞儵鏌涢悙顏勫妞ゎ亜鍟存俊鍫曞幢濡儤娈梻浣告憸婵敻骞戦崶褏鏆﹂柕蹇ョ磿椤╃兘鎮楅敐搴′航婵☆偄鎳庨—鍐Χ閸℃顫囬梺鎼炲妿閸庛倕顕ラ崟顖氱妞ゆ帒鍊婚鏇㈡⒑閸涘﹦鎳冩い锕侀哺閺呭爼顢楅崒婊咃紲闂佺鏈粙鎴澝归鈧弻娑㈠煛鐎ｎ剛鐦堥悗瑙勬磸閸旀垿銆佸▎鎾崇畾鐟滃秶绮婚悙鐑樷拻濞达絿鐡旈崵娆撴煕閹寸姵娅曠紒杈╁仱瀹曞崬鈽夊Ο纭风幢闂備礁鎲″ú锕傚礈濮樿泛鐭楅煫鍥ㄦ磵閸嬫捇鐛崹顔煎濡炪倧缂氶崡鎶藉箖?16x16 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閹冣挃闁硅櫕鎹囬垾鏃堝礃椤忎礁浜鹃柨婵嗙凹缁ㄧ粯銇勯幒瀣仾闁靛洤瀚伴獮鍥敂閸℃瑧鍘梻浣告惈鐞氼偊宕濋幋锕€绠栭柕蹇嬪€曟导鐘绘煕閺囩喎鐏熼柛銊ヮ煼閹偓妞ゅ繐鐗嗙粻姘辨喐濠婂牊鍋傚┑鍌氭啞閻撴盯鎮橀悙鎻掆挃婵炴彃顕埀顒侇問閸犳骞愰搹顐＄箚闁归棿绀佸敮闂侀潧锛忕仦鑺ユ珡闂傚倷娴囬褍顫濋敃鍌︾稏濠㈣泛鈯曢崫鍕垫建闁逞屽墴楠炲啴鏁撻悩铏闂佺粯顭堢亸顏堝箺閺囥垺鈷戠紓浣股戦ˉ鍡涙煏閸″繐浜鹃梻浣侯焾椤戝棝骞愰幖浣哥叀濠㈣泛艌閺嬪秹鏌ц箛锝呬簻闁诲繐顕埀?PNG 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬婊€绨婚梺鍝勫暙閸婂綊宕甸埀顒佺箾鐎涙鐭掔紒鐘崇墵瀵鈽夐姀鐘电杸闂傚倸鐗婄粙鎺楁倶閸儲鈷掑ù锝囶焾閼歌绻涘顔煎籍鐎殿喖顭烽弫鎰緞婵犲嫮娼夐梻浣侯焾鐞氼偊宕愬Δ鍛闁归棿鐒﹂崐鍨箾閸繄浠㈤柡瀣⊕缁绘稓娑垫搴ｇ槇濡ょ姷鍋涢崯顐ョ亙闂佸憡鍔忛弲娑㈠几閸岀偞鈷戦柛娑橈攻婢跺嫰鏌涢幘瀵告创閽樻繈鏌曟径鍫濆姉闁衡偓娴犲鐓熼柟閭﹀灠閻ㄧ儤绻濋埀顒勫箻椤旂晫鍘遍梺鍝勫€圭€笛囧箲閿濆鐓?
                 final String placeholderName = "_placeholder.png";
-                builder.part("input_reference",
-                    new ByteArrayResource(DUMMY_PNG_BYTES) {
-                        @Override
-                        public String getFilename() { return placeholderName; }
-                    },
-                    MediaType.IMAGE_PNG);
+                // 2026-08-13 FIX: 占位图也同时发 3 个字段名(模仿 Python api_client.submit_video)
+                ByteArrayResource ph1 = new ByteArrayResource(DUMMY_PNG_BYTES) {
+                    @Override public String getFilename() { return placeholderName; }
+                };
+                ByteArrayResource ph2 = new ByteArrayResource(DUMMY_PNG_BYTES) {
+                    @Override public String getFilename() { return placeholderName; }
+                };
+                ByteArrayResource ph3 = new ByteArrayResource(DUMMY_PNG_BYTES) {
+                    @Override public String getFilename() { return placeholderName; }
+                };
+                builder.part("image", ph1, MediaType.IMAGE_PNG);
+                builder.part("input_reference", ph2, MediaType.IMAGE_PNG);
+                builder.part("image_url", ph3, MediaType.IMAGE_PNG);
             }
 
             JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
@@ -279,25 +551,49 @@ public class NewApiClient {
                 .onErrorMap(WebClientResponseException.class, e -> {
                     String body = e.getResponseBodyAsString();
                     log.error("NewAPI /v1/videos failed: {} body={}", e.getStatusCode(), body);
-                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                        "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞楅梻渚€娼х换鍫ュ春閸曨垱鍊块柛鎾楀懐锛滈梺褰掑亰閸欏骸鈻撳鍫熺厸鐎光偓閳ь剟宕伴弽顓犲祦鐎广儱顦介弫濠勭棯閹峰矂鍝烘慨锝咁樀濮婄粯鎷呮笟顖滃姼濡炪倖鍨堕崹褰掑箲閵忕姭鏀介悗锝庝海閹芥洟姊洪崫鍕窛闁哥姴娴峰▎銏ゆ倷閻戞鍘卞銈嗗姧缁茶法绮婚幘鎰佺唵閻熸瑥瀚悡銉╂煃鐟欏嫬鐏撮柟顔界懇瀵爼骞嬮悩杈敇闂備浇澹堥敓銉╁磹濠靛钃熼柨鐔哄Т閻掑灚銇勯幒宥堝厡妞も晝鍏橀幃妤呮晲鎼粹€茬盎闂侀€炲苯澧伴柡浣割煼瀵濡搁妷銏℃杸闂佺硶鍓濋〃鍡椻枔椤撶喓绡€缁炬澘顦辩壕鍧楁煕韫囨棑鑰跨€殿喛顕ч埥澶婎潩閿濆懍澹曢梺鎸庣箓妤犲憡绂嶅┑鍫氬亾鐟欏嫭绀€闁活剙銈搁崺鈧い鎺戝枤濞兼劖绻涢崣澶樼劷闁轰緡鍣ｉ弫鎾绘偐閼碱剛鏆繝鐢靛仜濡瑩骞愰崫銉ф／鐟滄棃寮婚悢琛″亾閻㈡鐒惧ù鐘欏洦鐓涘璺侯儐閵囨繃鎱ㄦ繝鍌ょ吋鐎规洘甯掗埢搴ㄥ箣濠靛棭鐎撮梻鍌欑劍濡炴寧绂嶅鍛濠电姴鍊婚弳锕傛煟閻旂娅炴繛宸憾閺佸倻鈧箍鍎卞Λ娆忊枍閹剧粯鈷掑ù锝呮啞閹牏绱掔€ｂ晝绐旈柟顔斤耿楠炲洭顢涘Ο瑙勭潖闂備礁婀遍崕銈夊垂瑜版崵鍥级濞嗙偓瀵岄梺闈涚墕濡稒鏅堕鍌滅＜閻庯綆鍋呭畷宀€鈧娲忛崹铏圭矉閹烘柡鍋撻敐搴′簮闁圭柉娅ｇ槐鎾诲磼濞嗘垵濡介梺宕囶儠閸婃繈銆侀弮鍫濈闂傚牊绋掗鍧楁⒒娴ｇ鎮戦柟顔煎€搁…鍥槾婵炲棎鍨介幃娆撴倻濡厧骞堥梻浣告惈濞层垽宕濆畝鍕祦婵°倕鎳忛悡鏇㈡煟濡搫鏆卞┑顔肩Ч閺岋紕浠︾粙鍨拤閻庡灚婢樼€氼厾鎹㈠┑瀣妞ゅ繐娲﹂妤呮⒒閸屾瑧顦﹂柟纰卞亜铻為悗闈涙憸缁€濠傘€掑锝呬壕閻庢鍠栭…閿嬩繆閹间礁唯闁靛繆鍓濋弶鎼佹⒒娴ｇ顥忛柛瀣噽閹广垽鍩€椤掍椒绻嗛柛娆忣槸婵牏绱掔紒妯肩畵妞ゆ洏鍎靛鎼侇敃閳垛晛浜鹃柡鍥ュ灪閸嬪倿鏌熼柇锕€鏋撻柛瀣崌瀹曞綊顢曢敐鍥у殥闂佽瀛╅崙褰掑闯閿濆鏄ラ柍褜鍓氶妵鍕箳閹搭垰濮涚紓浣割槺閺佸寮诲☉銏犵閻庨潧鎲￠崳浼存⒑缂佹ü绶遍柛鐘崇墵椤㈡ɑ绺界粙璺ㄥ€為梺鍐叉惈閸犳稓妲愰幎鑺モ拻濞达絼璀﹂悞楣冩煛閸偄澧撮柟铏箖閵堬綁宕橀妸褍濮︽俊鐐€栫敮鎺楀磹閹间礁鍌ㄩ柟缁㈠枟閻撴瑦銇勯弮鈧崕铏闁秵鐓涘ù锝囶焾閺嗭絿鈧娲樼敮鎺楀煡婢跺ň鏋庨柟閭﹀枛閸撴垵鈹戦悩鍨毄濠殿喚鍏樺顐﹀川婵犲啫寮块梺姹囧灩婢瑰﹪寮繝鍥ㄧ厸鐎广儱楠搁獮鏍磼閹邦収娈滈柡灞糕偓鎰佸悑閹肩补鈧磭顔愰梻浣圭湽閸娿倝宕板Δ鍛﹂柛鏇ㄥ灠閸愨偓濡炪倖鍔﹀鈧紒顔煎缁辨挻鎷呴崫鍕戙儵鏌涚€ｃ劌鈧繂顕ｆ繝姘嵆闁绘棁娅ｉ鏇㈡⒑閸撹尙鍘涢柛鐘崇墬閹便劎鎹勭悰鈩冩杸闂佺粯鍔栭鏍磿閻樼粯鐓曢柡鍐ｅ亾闁搞劌鐏濋锝囨嫚濞村顫嶉梺闈涚箚閺呮粓寮插┑瀣拺缂備焦銆為幋锝冧汗闁告劏鏅滈崣蹇涙煛閸モ晛鍓辨繛鎾愁煼閺屾洟宕煎┑鍥ф畻濡炪倕瀛╅〃鍫㈡閹烘挸绶炲┑鐘插妤旀俊銈囧Х閸嬫盯宕銉т簷闂備礁鎲℃笟妤呭储婵傚憡鍊垫い鎾跺剱濞撳鏌曢崼婵囶棞濠殿啫鍛＜闁圭粯甯楅崑銉р偓瑙勬礃閻熲晠寮幘缁樺亹鐎规洖娲ら獮妤呮⒑閻熸澘鎮戦柣锝庝邯瀹曠銇愰幒鎴濇優濡炪倖甯掔€氼參鎮￠弴鐔剁箚妞ゆ牗绋愰懜顏堟煕鐎ｃ劌鐏查柡灞界Ч婵＄兘顢涘鍛闁诲氦顫夊ú鏍偉婵傛悶鈧線寮崼婵嗚€垮┑鐐叉閸旀牜娆㈤鈶╂斀闁绘ê鐏氶弳鈺呮煕鐎ｎ剙浠辩€规洖缍婂畷妤冪箔鏉炴壆鐭掗梻浣哥秺濡法绮堟笟鈧幃鍧楁倷椤掑倻鐦堥梻鍌氱墛娓氭宕曢幇鐗堢厓? " + e.getStatusCode() + " | " + body);
+                    // 2026-08-11 修复:4xx 是业务错误(图片敏感/参数错),不应该重试。
+                    // 用 translateNewApiError 把上游错误翻译成中文友好提示。
+                    // 5xx 才视为 NEWAPI_UNREACHABLE 重试。
+                    String friendly = translateNewApiError(body);
+                    ErrorCode code = (e.getStatusCode().is4xxClientError())
+                        ? ErrorCode.NEWAPI_REQUEST_INVALID
+                        : ErrorCode.NEWAPI_UNREACHABLE;
+                    return new BusinessException(code,
+                        "NewAPI /v1/videos " + e.getStatusCode() + ": " + friendly);
                 })
                 .block();
 
             if (response == null) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI video submit returned empty response");
             }
-            String taskId = response.path("id").asText(response.path("task_id").asText(""));
+            // 2026-08-10 修复:优先用 task_id(NewAPI 真实任务 ID)而不是 id(任务包装 ID)。
+            // 之前用 id,但 NewAPI /v1/videos/{id} 接口可能只认 task_id,导致后续 poll 一直 404,
+            // 然后被 markFailed 误判任务不存在。
+            // NewAPI 兼容 OpenAI Sora API,这两个字段语义不同:id 是请求包装 ID,task_id 才是 NewAPI 内部真实任务 ID。
+            String taskId = response.path("task_id").asText(response.path("id").asText(""));
             if (taskId.isEmpty()) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                    "NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬倵楠炲灝鍔氭い锔诲灣缁牏鈧綆鍋佹禍婊堟煙閸濆嫭顥滃ù婊堢畺閺岀喖宕楅崗鑲╃▏闂佹寧娲︽禍婊堬綖韫囨稒鎯為柛锔诲幘閻撴捇姊洪崷顓х劸閻庢稈鏅犻獮蹇旀綇閳哄啰锛濇繛鎾磋壘濞层倝寮稿☉銏♀拺閻㈩垼鍠氱粔顔筋殽閻愬弶顥滈柣锝嗙箞瀹曠喖顢曢妶搴℃櫔缂傚倸鍊搁崐鐑芥倿閿曞倹鏅梻渚€鈧偛鑻晶浼存煛娴ｅ壊鐓肩€殿喛顕ч埥澶愬煑閳规儳浜鹃柨鏇炲€哥粻锝嗙節闂堟稒鍣介柡浣圭墵濮婄粯鎷呮笟顖涙暞濠碘槅鍋勭€氭澘鐣烽鐑嗘晝闁挎洍鍋撻柣鎾达耿閺岀喐娼忛幆褏妲ｉ梺杞扮閿曨亪寮婚敃鈧灒濞撴凹鍨卞瓭闂備礁鎼鍡涙偡閳轰緡娼栨繛宸簻娴肩娀鏌涢弴銊ュ箻闁告柨婀辩槐鎾存媴娴犲鎽靛┑鐐插级椤洨鍒掔€ｎ喖绠虫俊銈勭劍濞呭棝姊虹紒妯哄Е闁告挻鐟╅幃鍨鐎涙ǚ鎷洪梺闈╁瘜閸樺墽鏁☉銏″仺妞ゆ牗绋戝ù顕€鏌ㄥ┑鍫濅粶妞ゎ偅绻堥幊婊呭枈濡顏烘繝鐢靛仩閹活亞绱為埀顒佺箾閸滃啰鎮奸柡渚囧枛閳藉濮€閿涘嫬骞嶉梻浣告啞缁嬫垿鏁冮妷鈺佺９闁归偊鍠掗崑鎾舵喆閸曨剛顦ㄩ梺鍛婃⒐閻熴儵鎮炬搴ｇ煓閻犲洨鍋撳Λ鍐春閳ь剚銇勯幒鎴濃偓缁樼▔瀹ュ鐓涚€广儱鍟俊浠嬫煕濞嗗繒绠插ǎ鍥э躬閹瑦锛愬┑鍡橆唲濠电偛鐡ㄧ划鎾剁不閺嵮屾綎闁惧繗顫夌€氭岸鏌嶉妷銊︾彧闁诲繐绉瑰娲嚒閵堝懏姣愰梺鍝勬噽婵炩偓闁诡喕鍗抽、姘跺焵椤掑嫮宓佹俊顖氬悑鐎氭岸鏌ょ喊鍗炲⒒闁哥偞妞藉缁樻媴閾忓箍鈧﹪鏌涢幘瀵哥疄闁轰礁顑夊鐑樺濞嗘垹鏆犻悗瑙勬处閸撶喖宕洪悙鍝勭闁挎棁妫勬禍褰掓⒑瑜版帩鏆掔紒鈧笟鈧鏌ユ焼瀹ュ棌鎷洪梺鍛婄缚閸庤鲸鐗庨梻浣虹帛椤ㄥ牊绻涢埀顒傗偓娈垮櫘閸嬪﹤鐣峰鈧、姘跺川椤旇姤鐝曢梻鍌欒兌绾爼宕滃┑瀣仭闁靛牆娲ㄧ粻鏂款熆閼搁潧濮堥柍閿嬪灴閺屾稑鈹戦崱妤婁紑闂佸疇顕чˇ鐢稿蓟濞戞鐔煎箒閹烘垳鍒掗梻浣哥秺閺€閬嶅垂閸ф绠栭柕蹇嬪€曠粈鍌炴煠濞村娅呮鐐搭殜濮婄粯鎷呴崨濠冨創闂佸摜鍣ラ崑濠傜暦閹版澘浼犻柕澶涢檮濞堜即姊洪崜鎻掍簼婵炲弶锕㈤幃锟犲即閵忥紕鍘繝鐢靛仜閻忔繈宕濆鑸电厓鐟滄粓宕滃▎鎴犵濠电姴鍟╃换鍡涙煟閵忋埄鐒剧紒鈧€ｎ偁浜滈柡宥冨妽閻ㄦ垿鏌ｉ妶鍌氫壕闂傚倸鍊风粈渚€鎮块崶褜娴栭柕濞炬櫆閸ゅ嫰鏌ら崫銉︽毄妞も晝鍏橀弻娑滅疀濮橆兛姹楃紓浣叉閸嬫挻绻濋悽闈涗粶闁绘妫濋幃妯衡攽鐎ｎ亜鍤戦梺鍝勫暙閻楀﹪鎮￠弴銏＄厪濠电偛鐏濇俊鑺ャ亜閵夈儺妲归柕?task_id: " + response);
+                    "NewAPI /v1/videos 响应格式错误, 缺少 id/task_id:" + response);
             }
             log.info("NewAPI video task submitted: {} (image={}, size={}B, duration={}s, resolution={})",
                 taskId,
                 imageBytes != null ? imageFilename : "placeholder",
                 imageBytes != null ? imageBytes.length : 0,
                 duration, resolution);
-            return taskId;
+            // 2026-08-11 修复:submit 响应里常常已含 video url(同步返回 + task_id 同一响应)。
+            // 之前不提取就丢了,只能等 poll 30 秒后取到 → 如果 poll 出现 400 索引延迟就会被误判 FAILED。
+            // 现在提取后,即使后续 poll 失败,job 也已保存 url,前端能直接播放。
+            String directUrl = null;
+            JsonNode topUrlNode = response.get("url");
+            if (topUrlNode != null && topUrlNode.isTextual() && !topUrlNode.asText().isBlank()) {
+                directUrl = topUrlNode.asText();
+            } else if (response.path("metadata").path("url").isTextual()) {
+                directUrl = response.path("metadata").path("url").asText();
+            }
+            if (directUrl != null) {
+                log.info("NewAPI submit 响应已含 video url: {}", directUrl);
+            }
+            return new SubmitResult(taskId, directUrl);
         } catch (Exception e) {
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI submitVideo failed: {}", e.getMessage());
@@ -331,45 +627,84 @@ public class NewApiClient {
     public String extractVideoUrl(JsonNode pollResult) {
         if (pollResult == null) return null;
 
-        // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為悷婊冪箻瀵娊鏁冮崒娑氬幗闂侀潧绻堥崺鍕倿閸撗呯＜闁归偊鍙庡▓婊堟煛瀹€鈧崰鏍蓟閸ヮ剚鏅濋柍褜鍓熷绋库槈閵忥紕鍘遍梺闈涱煭婵″洨绮婚悙鐑樼厽闁瑰灝鍟禍鎵偓瑙勬礀閻栧吋淇婂宀婃Х濠碘剝褰冮悧鎾愁潖濞差亜浼犻柛鏇ㄥ亽娴犳挳姊虹粙鎸庢崳闁轰浇顕ч锝囨嫚濞村顫嶉梺闈涚箳婵牓濡搁敂杞扮盎闂佸搫鍟崐鍝ユ暜閼哥偣浜滄い鎰枑濞呭﹥鎱ㄦ繝鍐┿仢妤犵偞鐗犻幃娆撳箵閹烘繄鈧娊姊绘担渚劸闁挎洏鍊曢敃銏ゆ焼瀹ュ懐顔夐梺闈涚箳婵厼危閸喐鍙忔俊銈傚亾婵☆偅顨婂鏌ユ偐瀹割喗瀵岄梺闈涚墕濡瑩藟閸℃瑢鍋撶憴鍕闁轰礁顭烽獮鍡涘礋椤掍礁鍔呴梺闈涱煭閼靛綊骞?1闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿噮鍣ｅ畷濂告偄閸涘鍞堕梻鍌欒兌椤牓顢栭崱娑樼闁告挆鍐ㄧ亰濡炪倖鎸鹃崑鎰ｉ崼鐔剁箚妞ゆ牗绻嶉崵娆愮箾閸涘洤娲﹂埛鎴炵箾閼奸鍤欐鐐搭殜閺岋綁鎮㈤崣澶嬬彋閻庢鍠栭…鐑藉箖閵忋倕绀傞柣鎾崇岸閸嬫挾绱掑Ο璇插伎濠德板€愰崑鎾翠繆椤愶絿鎳囨い銏☆焾閵囨劙骞掗幘顖涘闂佸搫顦遍崑鐐寸珶閸℃蛋鍥晜閹存帞绠氬銈嗗姧缁插潡骞婇崶褉鏀介柨娑樺閺嗩剛鈧娲滈崰鏍€佸☉銏℃櫜闁糕剝蓱閻濇洟姊婚崒娆掑厡缁绢厼鐖煎畷婊冣攽鐎ｃ劉鍋撻崘顔奸唶闁靛鍠楅弲鈺傜節闂堟侗妯堟繝鈧悹顩歛.url
+        // 2026-08-13 DEBUG:逐个路径打印命中情况,排查 url 在哪个字段
+        // 路径 1: data.output
+        JsonNode dataOutput = pollResult.path("data").path("output");
+        if (dataOutput.isTextual() && !dataOutput.asText().isBlank()) {
+            String url = sanitizeUrl(dataOutput.asText());
+            if (url != null) {
+                log.info("[extractVideoUrl] ✓ 命中路径 [data.output]: {}", url);
+                return url;
+            }
+        }
+
+        // 路径 2:顶层 metadata.url
         JsonNode metadata = pollResult.get("metadata");
         if (metadata != null && metadata.isObject()) {
             JsonNode url = metadata.get("url");
             if (url != null && url.isTextual()) {
-                return url.asText();
+                String cleanUrl = sanitizeUrl(url.asText());
+                log.info("[extractVideoUrl] ✓ 命中路径 [metadata.url]: {}", cleanUrl);
+                return cleanUrl;
             }
         }
 
         // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為悷婊冪箻瀵娊鏁冮崒娑氬幗闂侀潧绻堥崺鍕倿閸撗呯＜闁归偊鍙庡▓婊堟煛瀹€鈧崰鏍蓟閸ヮ剚鏅濋柍褜鍓熷绋库槈閵忥紕鍘遍梺闈涱煭婵″洨绮婚悙鐑樼厽闁瑰灝鍟禍鎵偓瑙勬礀閻栧吋淇婂宀婃Х濠碘剝褰冮悧鎾愁潖濞差亜浼犻柛鏇ㄥ亽娴犳挳姊虹粙鎸庢崳闁轰浇顕ч锝囨嫚濞村顫嶉梺闈涚箳婵牓濡搁敂杞扮盎闂佸搫鍟崐鍝ユ暜閼哥偣浜滄い鎰枑濞呭﹥鎱ㄦ繝鍐┿仢妤犵偞鐗犻幃娆撳箵閹烘繄鈧娊姊绘担渚劸闁挎洏鍊曢敃銏ゆ焼瀹ュ懐顔夐梺闈涚箳婵厼危閸喐鍙忔俊銈傚亾婵☆偅顨婂鏌ユ偐瀹割喗瀵岄梺闈涚墕濡瑩藟閸℃瑢鍋撶憴鍕闁轰礁顭烽獮鍡涘礋椤掍礁鍔呴梺闈涱煭閼靛綊骞?2闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿噮鍣ｅ畷濂告偄閸涘鍞堕梻鍌欒兌椤牓顢栭崱娑樼闁告挆鍐ㄧ亰濡炪倖鎸鹃崑鎰ｉ崼鐔剁箚妞ゆ牗绻嶉崵娆愮箾閸涘洤娲﹂埛鎴炵箾閼奸鍤欐鐐搭殜閺岋綁鎮㈤崣澶嬬彋閻庢鍠栭…鐑藉箖閵忋倕绀傞柣鎾崇岸閸嬫挾绱掑Ο璇插伎濠德板€愰崑鎾翠繆椤愶絿鎳囨い銏☆焾閵囨劙骞掗幘顖涘闂佸搫顦遍崑鐐寸珶閸℃蛋鍥晜閹存帞绠氬銈嗗姧缁茶法绮婚悙纰樺亾濞堝灝鏋涙い顓犲厴瀵偊骞囬鐐电獮闁诲函缍嗘禍鏍磻閹剧粯鍊婚柤鎭掑劗閹峰姊洪崜鎻掍簽闁哥姵鎹囨俊鎾箳閹惧彉绨婚梺鍝勫€圭€笛囶敁濞撴悤.metadata.url
+        // 路径 3: result.metadata.url
         JsonNode result = pollResult.get("result");
         if (result != null && result.isObject()) {
             JsonNode innerMeta = result.get("metadata");
             if (innerMeta != null && innerMeta.isObject()) {
                 JsonNode url = innerMeta.get("url");
                 if (url != null && url.isTextual()) {
-                    return url.asText();
+                    String cleanUrl = sanitizeUrl(url.asText());
+                    log.info("[extractVideoUrl] ✓ 命中路径 [result.metadata.url]: {}", cleanUrl);
+                    return cleanUrl;
                 }
             }
         }
 
         // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為悷婊冪箻瀵娊鏁冮崒娑氬幗闂侀潧绻堥崺鍕倿閸撗呯＜闁归偊鍙庡▓婊堟煛瀹€鈧崰鏍蓟閸ヮ剚鏅濋柍褜鍓熷绋库槈閵忥紕鍘遍梺闈涱煭婵″洨绮婚悙鐑樼厽闁瑰灝鍟禍鎵偓瑙勬礀閻栧吋淇婂宀婃Х濠碘剝褰冮悧鎾愁潖濞差亜浼犻柛鏇ㄥ亽娴犳挳姊虹粙鎸庢崳闁轰浇顕ч锝囨嫚濞村顫嶉梺闈涚箳婵牓濡搁敂杞扮盎闂佸搫鍟崐鍝ユ暜閼哥偣浜滄い鎰枑濞呭﹥鎱ㄦ繝鍐┿仢妤犵偞鐗犻幃娆撳箵閹烘繄鈧娊姊绘担渚劸闁挎洏鍊曢敃銏ゆ焼瀹ュ懐顔夐梺闈涚箳婵厼危閸喐鍙忔俊銈傚亾婵☆偅顨婂鏌ユ偐瀹割喗瀵岄梺闈涚墕濡瑩藟閸℃瑢鍋撶憴鍕闁轰礁顭烽獮鍡涘礋椤掍礁鍔呴梺闈涱煭閼靛綊骞?3闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿噮鍣ｅ畷濂告偄閸涘鍞堕梻鍌欒兌椤牓顢栭崱娑樼闁告挆鍐ㄧ亰濡炪倖鎸鹃崑鎰ｉ崼鐔剁箚妞ゆ牗绻嶉崵娆愮箾閸涘洤娲﹂埛鎴炵箾閼奸鍤欐鐐搭殜閺岋綁鎮㈤崣澶嬬彋閻庢鍠栭…鐑藉箖閵忋倕绀傞柣鎾崇岸閸嬫挾绱掑Ο鍦畾濡炪倖鐗楃换鍐敂閻樼粯鐓曢柡鍐ㄥ亞閻掗箖鏌嶇憴鍕伌闁诡喗鐟╅幊鐘活敆娴ｇ儤顎囬梻鍌欑閹碱偊骞婇幇顓犵闁逞屽墰閳ь剚顔栭崰鏍€﹀畡閭﹀殨闁圭虎鍠楅崑鍕煣韫囨凹鍤冮柛鐔烽叄濮婄粯鎷呯粙娆炬闂佺粯鎸搁悧鎾崇暦娴兼潙鍐€闁靛ě鍛獎闂備礁鎲″ú锕傚磻閳ь剟鏌￠埀顒佺鐎ｎ偆鍘介梺褰掑亰閸撴瑧鐥閺屽秶绱掑Ο鑽ゎ槬闂傚洤顦扮换婵囩節閸屾凹浼€闂佹椿鍘界敮锟犲蓟閿涘嫪娌悹鍥ㄥ絻椤洦绻濈喊妯峰亾瀹曞洤鐓熼悗瑙勬礋娴滆泛顕ｉ幘顔藉亹闁汇垹鐏氬В搴ㄦ⒒閸屾艾鈧娆㈠顒夌劷鐟滄棃骞冭瀹曞崬鈽夊Ο纭风串闂備礁鎲＄粙鎴︽晝閿曞倶鈧懘寮婚妷锔惧幈闂佸湱鍋撻〃鍛村箠閹扮増鏅繝闈涙川缁犻箖寮堕崼婵嗏挃闁告帊鍗抽弻鐔哄枈閸楃偘绨奸梺缁橆殔妤犳悂鍩為幋锔藉亹闁割煈鍋呭В鍕⒑缁嬫鍎愰柣鈺婂灦瀵偊宕橀鍛櫆闂佸憡娲熷褍鈻撻妸锔剧瘈闁汇垽娼ф牎闂佺厧缍婄粻鏍х暦閿熺姴绠柤鎭掑劤閸樹粙姊洪崫鍕殭闁绘绮岃灋闁瑰濮风壕濂告煙闁箑鏋涘ù鐘洪哺閹便劍绻濋崘鈹夸虎閻庤娲樼划鎾荤嵁閹捐绠崇€广儱娲ら崵顒傜磽閸屾艾鈧嘲霉閸ヮ剦鏁嬬憸鏂跨暦閹邦垬浜归柟鐑樺灩閻ゅ嫰姊洪棃娴ュ牓寮插☉銏犵闁规儼濮ら悡蹇涚叓閸パ嶆敾妞ゅ骸妫濋弻?result 闂?
+        // 路径 4: result.url
         if (result != null) {
             JsonNode url = result.get("url");
             if (url != null && url.isTextual()) {
-                return url.asText();
+                String cleanUrl = sanitizeUrl(url.asText());
+                log.info("[extractVideoUrl] ✓ 命中路径 [result.url]: {}", cleanUrl);
+                return cleanUrl;
             }
         }
 
-        // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為悷婊冪箻瀵娊鏁冮崒娑氬幗闂侀潧绻堥崺鍕倿閸撗呯＜闁归偊鍙庡▓婊堟煛瀹€鈧崰鏍蓟閸ヮ剚鏅濋柍褜鍓熷绋库槈閵忥紕鍘遍梺闈涱煭婵″洨绮婚悙鐑樼厽闁瑰灝鍟禍鎵偓瑙勬礀閻栧吋淇婂宀婃Х濠碘剝褰冮悧鎾愁潖濞差亜浼犻柛鏇ㄥ亽娴犳挳姊虹粙鎸庢崳闁轰浇顕ч锝囨嫚濞村顫嶉梺闈涚箳婵牓濡搁敂杞扮盎闂佸搫鍟崐鍝ユ暜閼哥偣浜滄い鎰枑濞呭﹥鎱ㄦ繝鍐┿仢妤犵偞鐗犻幃娆撳箵閹烘繄鈧娊姊绘担渚劸闁挎洏鍊曢敃銏ゆ焼瀹ュ懐顔夐梺闈涚箳婵厼危閸喐鍙忔俊銈傚亾婵☆偅顨婂鏌ユ偐瀹割喗瀵岄梺闈涚墕濡瑩藟閸℃瑢鍋撶憴鍕闁轰礁顭烽獮鍡涘礋椤掍礁鍔呴梺闈涱煭閼靛綊骞?4闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿噮鍣ｅ畷濂告偄閸涘鍞堕梻鍌欒兌椤牓顢栭崱娑樼闁告挆鍐ㄧ亰濡炪倖鎸鹃崑鎰ｉ崼鐔剁箚妞ゆ牗绻嶉崵娆愮箾閸涘洤娲﹂埛鎴炵箾閼奸鍤欐鐐搭殜閺岋綁鎮㈤崣澶嬬彋閻庢鍠栭…鐑藉箖閵忋倕绀傞柣鎾崇岸閸嬫挾绱掑Ο鍦畾濡炪倖鐗楃换鍐敂閻樿褰掓偐鐏炲倸浠┑顔硷攻濡炶棄鐣烽锕€绀嬫い鎺戭槹椤ワ絾绻濈喊妯活潑闁稿鎳愰幑銏ゅ醇濠垫劕娈ㄦ繝鐢靛У绾板秹宕戦崟顖涚厱闊洦鎸惧В鐐烘煙瀹勯偊鐓奸柡宀嬬稻閹棃濡搁敂浠嬫暘濠电姰鍨婚幊鎾绘晝閵堝懎绁俊鐐€栧ú宥夊磻閹惧灈鍋撳▓鍨灈闁绘牕銈稿畷娲晸閻樿尙锛滃┑鐘诧工閹虫劙寮抽銈囩＝闁稿本鐟ㄩ崗宀€绱掗鍛仯闁瑰箍鍨藉畷濂稿Ψ閵壯呮毇濠电偛顕慨鎾敄閸℃蛋澶愬醇閻旇櫣顔曠紒鐐劤椤戝洭宕奸鍫熺厱闁靛鍊楅惌娆愵殽閻愭彃鏆欓摶鏍煃瑜滈崜鐔兼晲閻愭祴鏀介悗锝庡亐閹峰鏌ｆ惔銊︽锭闁硅姤绮岄埢鏃堝锤濡や讲鎷?url
+        // 路径 5: 顶层 url (文档 §七 示例)
         JsonNode topUrl = pollResult.get("url");
         if (topUrl != null && topUrl.isTextual()) {
-            return topUrl.asText();
+            String cleanUrl = sanitizeUrl(topUrl.asText());
+            log.info("[extractVideoUrl] ✓ 命中路径 [顶层 url]: {}", cleanUrl);
+            return cleanUrl;
         }
 
-        log.warn("Could not extract video URL from NewAPI response: {}", pollResult);
+        log.warn("[extractVideoUrl] ✗ 所有 5 个路径都没找到 url, 响应 fields=[{}], body={}",
+            collectFieldNames(pollResult),
+            pollResult.toString().length() < 500 ? pollResult.toString() : pollResult.toString().substring(0, 500) + "...");
         return null;
     }
 
+
+    /**
+     * 清洗 URL:去除反引号、前后空格、markdown 符号
+     */
+    private static String sanitizeUrl(String url) {
+        if (url == null || url.isBlank()) return null;
+        String cleaned = url.trim();
+        cleaned = cleaned.replaceAll("^`+|`+$", "");
+        cleaned = cleaned.replaceAll("^['\"]+|['\"]+$", "");
+        cleaned = cleaned.trim();
+        if (cleaned.isEmpty()) return null;
+        if (!cleaned.startsWith("http://") && !cleaned.startsWith("https://")) {
+            log.warn("[NewAPI] 清洗后的 URL 格式异常: 原始={}, 清洗后={}", url, cleaned);
+        }
+        return cleaned;
+    }
     /**
      * 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻缁炬儳顑愰崬褰掓⒑闁偛鑻晶鍓х磼閻樿櫕宕岄柕鍡曠铻栭柛娑卞幘椤︽澘顪冮妶鍡楀闁稿ě鍛潟闂侇剙绉甸埛鎺懨归敐鍛暈闁哥喓鍋炵换娑氭嫚瑜忛悾鐢碘偓瑙勬礃閸旀鍩€椤掑﹦绉甸柛妯款潐缁傚秷銇愰幒鎾跺幍闂佺粯鍨堕敋闁诲繆鏅犻弻銊モ槈濞嗘垹鐓夊┑顔硷龚濞咃絿妲愰幒鎳崇喖宕崟鍨稇闂備浇顕х换鎰崲閹达附鍋￠柍鍝勬噹閺嬩胶鈧箍鍎遍幊澶娢ｉ崼鐔虹闁糕剝锚閻忊晠鏌ｉ敃鈧悧鎾愁潖閸濆嫅褔宕惰娴煎牆鈹戦悙鏉垮皟闁告劦浜濋幊鍐╃節閻㈤潧啸闁轰焦鎮傚畷鎴濃槈閵忊€冲壋婵炴潙鍚嬪娆戝鐟欏嫮绡€闂傚牊渚楅崕蹇曠磼閻樺磭澧甸柡宀嬬秮楠炲洭顢楁担鐟板壍闂備焦鎮堕崝宀勫磹瑜版帒桅闁告洦鍨扮粻娑欍亜閺傝￥浠氶柨娑樺绾惧ジ鏌曟繛鍨姶闁绘挸鍚嬮幈銊︾節閸愨斂浠㈤悗瑙勬礈閸忔﹢銆佸鈧幃娆撳箵閹烘繄鈧亶姊婚崒娆戝妽闁诡喖鐖煎畷婵囨償閵娿儲鐎繝鐢靛У閼归箖寮伴妷鈺傜厓鐟滄粓宕滃璺何﹂柛鏇ㄥ灠缁犲磭鈧箍鍎卞ú銈嗕繆娴犲鈷戠紒瀣皡閺€濠氭煕閺冣偓椤ㄥ﹪宕洪埀顒併亜閹哄秶璐伴柛鐔风箻閺屾盯鎮╁畷鍥р拰濡ょ姷鍋涢ˇ鐢稿极閹剧粯鍋愰柤纰卞墰閺嗕即姊绘担鍛婃儓闁哥噥鍋婇幃褔宕卞☉娆忊偓鍨旈敐鍛殲闁稿绲借灃闁挎棁妫勯婊勩亜韫囨洖啸缂佽鲸甯楀鍕偓锝庡亖娴犮垽姊洪崫鍕伇闁哥姵鐗犻妴浣糕枎閹寸偛鏋傞梺鍛婃处閸撴稖銇愮€ｎ喗鈷掑ù锝囧劋閸も偓缂佸墽铏庨崢鐣屾崲濞戙垹鐒垫い鎺嶉檷娴滄粓鏌曡箛濠冾潑婵炲牊娲熼弻鐔风暋閻楀牆娈楅梺璇″枤閸忔﹢骞冭瀹曞ジ锝為銏犱粣闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊炲銈嗗笒椤︿即寮查鍫熲拺闁告繂瀚埢澶愭煕濡亽鍋㈢€规洖缍婂畷鎺楁倷鐎电骞堟繝寰锋澘鈧洟宕锕€鐒垫い鎺戯功閸掍即鏌嶉挊澶樻█濠殿喒鍋撻梺缁樕戦鏍ｉ悧鍫滅箚闁绘劦浜滈埀顒佺墪铻炲ù锝呮贡閻濆爼鏌涢鐘插姎缂佺姵妞介弻锟犲炊閵夈儳浠鹃梺鎶芥敱閸ㄥ灝顫忔繝姘唶闁绘梹鍎奸崥鍌氣攽閻愭潙鐏熼柛銊ョ秺閹偤宕归鐘辩盎闂佸湱鍎ら崹鐢割敂閳哄啰妫柟顖嗗瞼鍚嬮梺鍝勭灱閸犳牕鐣峰鍡╂Ь闁汇埄鍨遍惄顖炲蓟閿熺姴宸濇い鏃€鍎冲銊╂⒑閸濆嫭婀扮紒瀣灴閸┿儲寰勯幇顒傤攨闂佺粯鍔曢崥鈧柟鎾棑缁辨捇宕掑▎鎴ｇ獥闂佸摜濮靛畝绋款嚕椤愩倖瀚氱€瑰壊鍠楃紞搴♀攽閻愬弶鈻曞ù婊勭矌缁顢氶埀顒勫蓟閵堝绠掗柟鐑樺灥婵洟姊洪崫鍕棤濠殿喗鎸抽崺鐐哄箣閿旇棄鈧兘鎮规ウ鎸庮仩婵絻鍨藉娲传閵夈儛銏ゆ⒑鐢喚绉柡?闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌欒兌閸嬫捇宕曢幎瑙ｂ偓锕傛倻閽樺鎽曢梺鍝勬川閸犳挾绮绘ィ鍐╃厽闁逛即娼ф晶顖炴煟濠靛洦鈷掔紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠剧痪顓㈩棑缁♀偓閻庢鍠栭…鐑藉极瀹ュ绀嬫い蹇撴噹婵即姊洪懡銈呅㈡繛璇х畳閵囨劙宕橀埡鍌氬伎闁瑰吋鐣崝宥夊煕閹达附鐓㈡俊顖欒濡叉悂鏌￠崱娆忔灈闁哄本鐩幃鈺佺暦閸パ€鎷伴柣搴㈩問閸犳牠鈥﹂柨瀣╃箚闁归棿绀侀悡娑㈡煕鐏炲墽鐓紒銊ヮ煼濮婄粯鎷呴崨濠傛殘缂備浇顕ч崐濠氬焵椤掍浇澹橀柟铏戦幈銊╁焵椤掑嫭鐓忛柛顐ｇ箖椤ョ娀鏌?婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄婵犲灚鍔栫紞妤呮⒑闁偛鑻晶顕€鏌涙繝鍌涘仴妤犵偞鍔栫换婵嬪礃椤忓棗楠勯梻浣稿暱閹碱偊顢栭崶鈺冪煋妞ゆ棃鏁崑鎾舵喆閸曨剛锛橀梺鍛婃⒐閸ㄧ敻顢氶敐澶婇唶闁哄洨鍋熼娲⒑缂佹鎳冮柟铏姍閻涱噣濮€閵堝棌鎷婚梺绋挎湰閻熝呯玻閺冨牊鐓冪憸婊堝礈濞戙垹纾绘繛鎴欏灪閸ゆ劖銇勯弽銊р姇婵炲懐濞€閺岀喓绱掗姀鐘崇亶闂佺粯鎸婚惄顖炲箖濮椻偓閹瑩骞撻幒鍡樺瘱闂備線娼уΛ娆戞暜閿熺姴钃熺€广儱鐗滃銊╂⒑閸涘﹥灏柛鏂挎捣濡叉劙鎮欓崫鍕€垮┑鐐村灦椤洭鏁嶅☉銏♀拺闁告稑锕ｇ欢閬嶆煕椤垵鐏﹂柟顔惧仦缁绘繈宕堕妸褍骞嶆繝鐢靛仜閻楀棝鎮樺┑瀣嚑闁靛牆娲ㄥΛ?NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇洟姊绘担钘壭撻柨姘亜閿旇鏋ょ紒杈ㄦ瀵挳濮€閳锯偓閹风粯绻涙潏鍓хК婵炲拑缍佹俊瀛樼節閸ャ劎鍘遍梺瑙勫劤椤曨厾绮婚悙鐑樼厵妞ゆ梻鍋撻悞鎸庛亜閿曗偓缂嶅﹪寮婚悢纰辨晬婵浜崝顖毼旈悩闈涗沪妞ゎ厼娲ㄥΣ鎰板箳閹冲磭鍠撻幃浼村灳閸忓懎顥氶梻浣稿閻撳牓宕戦崱娆戜笉濡わ絽鍟悡娆撴倵閻㈡鐒鹃柛鎾冲船闇夐柣鎾冲椤ャ垽鏌″畝鈧崰鎰焽韫囨稑绀堢憸蹇涘汲閻樼粯鈷戞繛鑼额嚙楠炴銇勯妸銉含闁诡噯绻濋、鏇㈡晝閳ь剟鎮欐繝鍥ㄧ厪濠电倯鈧崑鎾斥攽椤斿吋鍠樻慨濠呮缁辨帒螣鐠囧弶娈梻浣告憸婵敻鎮ч悩宸殨濠电姵纰嶉弲鎼佹煟濡灝鐨烘い锔哄姂濮婃椽妫冨☉杈╁姼闂佺瀵掗崳锝呯暦閹达箑绠婚悹鍥紦缁卞爼姊洪棃娑辨闂傚嫬瀚埢鎾村鐎涙ǚ鎷洪梺鍛婃尰瑜板啯绂嶅┑鍥╃闁告瑥顧€閼板潡鏌熼鍡欑瘈鐎殿喗鎸抽幃銏ゆ惞鐠団€虫櫗闂傚倷鑳剁涵鍫曞礈濠靛鈧啯绻濋崶銊ヤ粧濠电姴锕ら悧濠囨偂濞戙垺鐓冪憸婊堝礈濮樿鲸宕叉繝闈涙－濞尖晜銇勯幘璺盒㈤悽顖炵畺濮婄粯鎷呯憴鍕哗闂佺瀛╃划鎾崇暦濮椻偓瀹曪綁濡疯閿涚偤姊绘担绛嬪殭閻庢稈鏅犻、娆撳冀椤撶偟鐛ラ梺鍝勬川婵挳宕瑰┑鍥╃闁糕剝锚婵啰绱掔拠鍙夘棡闁逛究鍔岄埞鎴﹀幢濞嗘垵濮兼繝纰樷偓鎻掑珟闁告梹鍨甸～蹇撁洪鍕炊闂佸憡娲﹂崜銊ф閵娧呯＝濞达綀娅ｇ敮娑氱磼鐠囨彃鈧潡鏁愰悙鍓佺杸婵炴垶鐟﹂崕顏堟⒑闂堚晛鐦滈柛姗€绠栭幃锟犲箻缂佹ǚ鎷虹紓浣割槸濡鈧艾鍢查埢鎾诲閵堝棛鍘撻悷婊勭矒瀹曟粌顫濋煬娴嬪亾閸愨晝绡€闁搞儜鍡樻啺闂備線娼ц墝闁哄懏鐩畷锟犲箮閼恒儳鍘繝鐢靛仜閻忔繈鍩€椤掍胶绠炵€规洘鍨佃灃闁告侗鍠栭埀顒€鐏氱换娑㈠醇濠靛牅铏庨梺鍝勵儜闂勫嫰濡甸崟顖氬嵆闁糕剝顨嗛幖鎰版煟閹绢垪鍋撻幇浣哄數闁荤姴鎼妶浠嬫晸閻樺啿浜滈梺绋跨箺閸嬫劙宕ｉ崱娑欑厽閹兼惌鍨崇粔鐢告煕韫囨棑鑰跨€规洘鍨块獮姗€鎳滈棃娑氬酱婵犵數鍋炲娆擃敄閸℃稑妫橀柍褜鍓熷缁樻媴閸濄儲鐎┑鈽嗗亜鐎氼剝鐏嬪┑掳鍊曢幊蹇涘磹閸洘鐓忓鑸电☉椤╊剛绱掗悩鑽ょ暫闁哄本绋戦…銊╁礃閵婏附顔嶇紓鍌欑椤戝牆鐣烽悽鍨潟闁圭儤顨呯壕鍏肩箾閹寸倖鎴犳嫚閻愬樊娓婚柕鍫濆暙閻忣亪鏌ｉ埡濠傜仸妤犵偛鍟埢搴ㄥ箣濠靛棛浜伴梺鑽ゅ枑閻熴儳鈧凹鍓熼、?
      * <p>
@@ -439,7 +774,7 @@ public class NewApiClient {
                     log.error("NewAPI /v1/images/generations failed: {} {}",
                         e.getStatusCode(), e.getResponseBodyAsString());
                     return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                        "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸婚悷褎绔熼弴銏╂晣闁靛繆鏅滈弲鈺呮⒑绾懏褰ч梻鍕閸╂盯骞掗幊銊ョ秺閺佹劙宕熼鍛Τ闂備胶绮敮鐐哄磻閹捐桅闁告洦鍨扮粻锝嗙節闂堟稒顥炴繛鍫濐煼閹鎲撮崟顒傤槰缂備浇顕ч悧鎾绘偘椤旈敮鍋撻敐搴℃灍闁哄懏绻堥弻宥堫檨闁告挾鍠栭獮蹇涘箣閿旇棄浜滈梺绋跨箺閸嬫劙宕ｉ崱妞绘斀闁绘绮☉褎淇婇顐㈠箹閸楅亶鏌涘┑鍕姢缁炬儳鍚嬮妵鍕箛閳轰胶浼勯柡浣哥墦濮婃椽宕崟顒佹嫳缂備礁顑嗛幐鑽ょ矉閹烘鏅滈柣鎰靛墮閻濇澘鈹戦悙瀛樼稇妞ゆ垵鎳忕粋宥夋倷椤戣法绠氶梺闈涚墕閹冲繘宕抽崷顓犵＜闁逞屽墯瀵板嫰骞囬鐘插箥闂傚倸鍊搁崐鎼侇敋椤撱垹绀夌€广儱顦伴悡鍐⒑閸噮鍎忛柣蹇旀尦閺岀喖顢欓懖鈺冃ㄩ悗瑙勬礀閻栧ジ銆侀弮鍫濈妞ゆ挾鍣ラ崵鍕磽閸屾艾鈧兘鎳楅懜鍨弿闂佸灝顑嗗▍鐘充繆閵堝懎鏆炵€规洖寮剁换娑㈠箣閻愮數鍙濆┑鐐茬焾娴滎亪寮诲☉姘勃闁诡垎鍛Р闂備胶顭堥鍡涘箰閹间礁鐓橀柟瀵稿Л閸嬫捇鏁愭惔婵堟晼婵炲鍘ч澶婎潖濞差亜绠伴幖娣灮椤︺儵姊虹粙鍖℃敾闁诡喖鍊垮濠氬Ω閳轰絼褔鏌涢埄鍐╃缂佺姵宀稿娲濞戞艾顣洪梺绋匡工閹诧紕绮嬪澶婄鐟滃繒澹曢挊澹濆綊鏁愰崨顔藉創闁哄稄绻濋幃妤呭礂婢跺﹣澹曢梻浣哥秺濡法绮堟笟鈧幏鎴︽偄閸忚偐鍘介梺鍝勫€藉▔鏇炩枔闁秵鐓涢悗锝庡亝椤ュ牓鏌＄仦鍓ф创闁炽儻绠撻獮瀣攽閸モ晙鎲鹃梻鍌欐祰椤曆呮崲閹达箑绠伴柛鎾楀嫷娼熼梺瑙勫礃椤曆呭閸忓吋鍙忔俊顖氭惈閼稿綊鏌嶉鍕粵缂佺粯绋撻埀顒佺⊕椤洭鎯屾繝鍥ㄧ厽闁哄稁鍋勭敮鑸点亜? " + e.getStatusCode() + " " + e.getStatusText());
+                        "NewAPI 调用失败:" + e.getStatusCode() + " " + e.getStatusText());
                 })
                 .onErrorMap(e -> {
                     if (e instanceof BusinessException) return e;
@@ -455,7 +790,7 @@ public class NewApiClient {
             // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌氬€烽懗鑸垫叏闁垮绠鹃柍褜鍓熼弻鈥崇暆閳ь剟宕伴弽褏鏆︽繝濠傛－濡查箖鏌ｉ姀鈺佺仭闁烩晩鍨跺璇测槈濞嗘垹鐦堥梺鍛婁緱閸橀箖宕㈤锔解拺闂侇偅绋撻埞鎺楁煕閺傝法鐒烽柣蹇斿浮濮婃椽宕烽褏鍔稿┑鐐差嚟閸忔ɑ淇婇幘顔肩疀妞ゆ柨澧介敍婵囩箾鏉堝墽鍒伴柟纰卞亝閻楀骸鈹戦悩顔肩伄闁硅櫕鎸歌灋婵炴垶顭傞敐澶婄疀闁哄娉曢濠囨⒑閸濆嫬鈧悂骞栭锝囶洸濡わ絽鍟悡銉︾節闂堟稒顥㈡い搴㈩殕椤ㄣ儵鎮欓幖顓熺暭闂佹眹鍎烘禍顏堛€佸鈧幃娆撴濞戞艾骞楅梻鍌欑閹碱偊鎯屾径灞惧床婵犻潧妫涢弳锕傛⒑椤掆偓缁夊绮诲☉娆嶄簻闁硅揪绲鹃ˉ澶娒瑰鍛壕缂佺粯绻堝Λ鍐ㄢ槈閸楃偛澹堥梻浣芥閸熶即宕伴幇顔藉床婵炴垯鍨圭粻锝嗙箾閸℃绠冲ù鐘哄亹缁辨挻鎷呴崫鍕戯綁鏌ｉ埡濠傜仩妞ゎ偄绻戠换婵嗩潩椤掑嫬鏁归梻浣虹帛濡線濡撮埀顒€鈹戦鍏煎枠婵﹨娅ｉ幏鐘绘嚑椤掑偆鍞堕梻浣虹帛椤ㄥ懘鏁冮敃鍌氱闁靛繒濮Σ鍫熸叏濮楀棗澧绘俊顐ｇ矒閺岋絾鎯旈婊呅ｆ繛瀛樼矋閻熴儲鏅ュ┑掳鍊撻懗鍓佸姬閳ь剙鈹戦悙鑼闁诲繑绻堝鎼佸Χ婢跺鍘遍棅顐㈡处濡垿鎳撶捄銊㈠亾鐟欏嫭绀冩俊鐐扮矙瀹曟椽鍩€椤掍降浜滈柟鍝勭Ч濡惧嘲霉濠婂嫮鐭掗柡宀€鍠栧畷顐﹀礋椤掑顥ｅ┑鐐茬摠缁本鏅堕悾灞绢潟闁规儳鐡ㄦ刊鎾煕濠靛棗鐝旈柕蹇嬪灮绾剧厧顭跨捄鐑樻拱闁搞倐鍋撻梻浣风串缁插潡宕楀Ο渚殨闁圭虎鍠栭～鍛存煥濞戞ê顏╁┑顔芥倐閺岋絾鎯旈敍鍕殯闂佺閰ｆ禍鍫曠嵁婵犲洤绠涢柣妤€鐗嗘禒楣冩⒑閹肩偛鍔撮柛鎾村哺閸╂盯骞嬮悩鍐叉瀾闂佺粯顨呴悧鍡欑箔閹烘嚚鐟邦煥閳ь剟宕￠幎钘夎摕婵炴垯鍨洪崑鎰版煕閹邦剙绾ч悹鍥╁仱閹鎲撮崟顒傤槰闂佹悶鍔屽锟犳偘椤斿槈鐔兼嚃閳哄喛绱叉繝纰樻閸ㄩ潧顩奸妸鈺傚仺濠电姵纰嶉埛鎺楁煕鐏炲墽鎳呴悹鎰嵆閺屾稑鈻庤箛鏇狀啋濠殿喖锕ｇ划娆忕暦閻旂⒈鏁嗗璺侯儛閸炶尙绱撻崒姘偓鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為梺闈涱煭缁茶偐鍒掗幘缁樷拺鐟滅増甯楅敍鐔虹磼閳ь剚鎷呴搹閫涚瑝闂佸搫顦花閬嶅绩娴犲鐓熸俊顖濇閺嬪啫顭跨憴鍕电劷缂佽鲸甯￠幃顏堝焵椤掑嫬鍨傞柛顐ｆ礀閽冪喐绻涢幋鐐冩艾危閸儲鐓曟俊銈呭暙娴犙兠归悪鈧崣鍐潖濞差亜浼犻柕澶堝剾閵忊€茬箚妞ゆ劧绲跨粻鐐碘偓娈垮枦椤曆囧煡婢舵劕顫呴柣妯诲絻缁侇噣姊绘笟鈧褔鈥﹂崼銉ョ？濞村吋娼欑粣妤€鈹戦悩鍙夊闁抽攱鍨块幃褰掑炊閵娿儳绁峰銈嗗竾閸ㄧ儤绌辨繝鍥ㄥ€烽柤鍛婎問濡嫬顪冮妶搴′簻缂佺粯甯炲Σ鎰板箳閹冲磭鍠撻幏鐘差啅椤旂懓浜鹃柟鎯у绾捐棄霉閿濆懏璐￠柍钘夘槹閵囧嫰骞嬪┑鍥ф闂佸磭绮幑鍥€佸鈧慨鈧柨娑樺楠炴姊虹涵鍛棈闁规椿浜炲Σ鎰板即閻斾警娴勫┑鐐村灟閸ㄦ椽宕戦妸锔轰簻闁哄秲鍔婃禒婊堟煕鐎ｎ偅灏柣锝囧厴瀹曞爼濡搁敂璇叉櫗闂備浇宕甸崰鎰垝鎼淬垺娅犳俊銈呭暞閺嗘粓鏌熼悜姗嗘畷闁绘挷绶氶弻娑㈠Ψ椤旂厧顫梺缁樻尰閻╊垶寮诲☉銏犖ㄩ柕蹇婂墲閻濇梹绻涚€电顫掗柛銉ｅ妿閸樹粙姊洪幐搴ｇ畵婵炲眰鍊濆畷婵堚偓锝庡墰绾捐偐绱撴担璇＄劷闁靛棙甯￠弻宥堫檨闁告挻鐩顐﹀箹娴ｆ祴鍋撻敃鍌氶唶婵犻潧鐗婇幊鍐╃節绾板纾块柛瀣灴瀹曟劙寮介鐐茬€梺姹囧灮椤牏绮婚悩鑽ゅ彄闁搞儯鍔庨埥澶岀棯閻愵剙顕滈柕鍥у楠炲洭宕奸弴鐕佲偓宥夋⒑閹惰姤鏁遍悽顖涘浮婵℃挳骞掗幋顓熷兊闂佹寧绻傞幊宥嗙珶閺囩喓绡€闁汇垽娼ф禒鎺楁煕閺嶎偄鈻堢€规洖鐖兼俊鎼佸Ψ閵堝洨绉块梻鍌氬€烽懗鍓佹兜閸洖绀堟繝闈涚懁閸ヮ剙浼犻柛鏃囧Г濡炰粙銆侀弮鍫濈妞ゆ挾鍋涚粻浼存⒒閸屾瑨鍏屾い顓炵墦瀵敻顢楅崒姘亰闁瑰吋鐣崐鎴炵瑜版帗鐓欐い鏍ф閸嬫捇鏌￠埀顒勬嚍閵夛絼绨婚梺鍝勫€归娆忣焽閻旇褰掓偐瀹曞洨鐓夐梺鍝勬湰缁嬫捇鍩€椤掑﹦绉甸柛瀣噹閻ｅ嘲鐣濋崟顒傚幐闁诲繒鍋熺涵鍫曞磻閹惧磭鏆﹂柛銉ｅ妽閻ｇ兘姊虹拠鎻掑毐缂傚秴妫濆畷婊冣槈濠ф儳寰嶉梻鍌氬€搁崐宄懊归崶顒夋晪闁哄稁鍘肩粣妤呮煙閻戞﹩娈旈柣銈囧亾缁绘盯骞嬪▎蹇曞姶闂佽桨绀侀敃顏堟偂椤愶箑鐐婇柕濞垮€楃换渚€姊烘潪鎵槮闁挎洦浜濠氭晲婢跺﹦顔掗梺鐟板閻℃棃鍩€椤掍緡娈曢柕鍥у婵＄兘濡烽‖顔ㄥ嫭鍙忓┑鐘插亞閻撹偐鈧娲樼敮鎺楀煝鎼淬劌绠ｆい鎾跺晿濠婂牊鈷掑ù锝勮閺€鏉库攽椤斿搫鈧宕氶幒妤€绠荤€规洖娲﹀▓鐐箾閺夋垵鎮戞繛鍏肩懅缁鈽夊▎宥勭盎闂佽宕樺▔娑樻毄婵＄偑鍊栧鐟懊哄Ο鍏煎床婵犻潧顑嗛崑銊╂⒒閸喎鍨侀柕蹇ョ磿缁犻箖鎮橀悙鎻掆偓鎼佸焵椤掍緡娈橀柛?
             java.util.List<String> topFields = new java.util.ArrayList<>();
             response.fieldNames().forEachRemaining(topFields::add);
-            log.info("NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬倵楠炲灝鍔氭い锔诲灣缁牏鈧綆鍋佹禍婊堟煙閸濆嫭顥滃ù婊堢畺閺岀喖宕楅崗鑲╃▏闂佹寧娲︽禍婊堬綖韫囨稒鎯為柛锔诲幘閻撴捇姊洪崷顓х劸閻庢稈鏅犻獮蹇旀綇閳哄啰锛濇繛鎾磋壘濞层倝寮稿☉銏♀拺閻㈩垼鍠氱粔顔筋殽閻愬弶顥滈柣锝嗙箞瀹曠喖顢曢妶搴℃櫔缂傚倸鍊搁崐鐑芥倿閿曞倹鏅梻渚€鈧偛鑻晶浼存煛娴ｅ壊鐓肩€殿喛顕ч埥澶愬煑閳规儳浜鹃柨鏇炲€哥粻锝嗙節闂堟稒鍣介柡浣圭墵濮婄粯鎷呮笟顖涙暞濠碘槅鍋勭€氭澘鐣烽鐑嗘晝闁挎洍鍋撻柣鎾达耿閺岀喐娼忛幆褏妲ｉ梺杞扮閿曨亪寮婚敃鈧灒濞撴凹鍨卞瓭闂備礁鎼鍡涙偡閳轰緡娼栨繛宸簻娴肩娀鏌涢弴銊ュ闁圭柉浜槐鎾存媴閸撴彃鍓遍梺鎼炲妼濞尖€崇暦濞差亜顫呴柍鈺佸暙閸斿懘姊洪棃娑氬婵炲眰鍔戝鍫曞箹娴ｅ厜鎷洪梺鍦焾濞撮绮婚幘缁樼厸閻忕偞鏋婚煬顒€鈹戦垾宕囧煟鐎规洖宕埢搴ㄥ箣椤撶偞娅楅梻鍌欐祰椤曆呪偓娑掓櫇缁瑩骞掑鐑╁亾閿曞倸鐐婃い鎺嶇閸撳綊鏌ｆ惔顖滅У闁告挻绋撴竟鏇㈠礂缁楄桨绨婚梺鍝勫暙濞层倛顣块柣搴ゎ潐濞叉牠寮甸鍕┾偓鍐Ψ閳哄倸鈧兘鏌熺紒妯虹瑲婵炲牆鐖煎娲偡閺夎法楠囬梺鍦焾閸熷潡鎮鹃悜鑺ュ亜闁绘挸娴烽崢鍛婄箾鏉堝墽鍒伴柛銏＄叀瀵悂宕奸妷锔规嫽闂佺鏈悷褔藝閿旂晫绡€闁逞屽墴閺屽棗顓兼担鎻掍壕闁挎洖鍊搁柋鍥煃閸ㄦ稒娅呭ù婊堢畺閺屾盯鈥﹂幋婵呯盎缂備焦顨嗗銊ф閹烘纾兼繛鎴炆戠拠鐐烘⒑缁洘鏉归柛鎾寸箞楠炲繘宕ㄩ弶鎴犵厬婵犮垼娉涢鍡楊熆閹达附鈷掗柛灞剧懆閸忓瞼绱掗鍛仸闁轰礁鍟撮崺锟犲川椤撶媴绱遍梻浣告啞濞诧箓宕滃☉顫偓鍛村箵閹广劍妫冮弫鎰板川椤撶喐顔夐梻浣瑰▕閺€閬嶅垂閸ф钃熸繛鎴欏灪閺呮粓鎮归崶銊ョ祷缂備讲鏅涢埞鎴︽晬閸曨偂澹曢梺璇″枛閸婂灝顕ｇ拠娴嬫闁靛繆鈧厖姹楅梻浣哥秺椤ｏ箓鎮為敃鍌涘仾濞撴埃鍋撻柟顔筋殘閹叉挳宕熼鍌ゆО闂備礁鎲″褰掓偡閵夆晜鍋╅柣銈庡灛娴滃綊鏌熼悜妯肩畺闁哄懏绻堝娲濞戞艾顣哄┑鐐存綑閸婂灝鐣烽娑欏劅闁靛鑵归幏缁樼箾鏉堝墽鎮奸柛搴涘€濆畷鐢稿焵椤掆偓椤啴濡堕崱妯侯槱闂佸憡鐟ラ崯顐︽偩閻戣棄绠ｉ柨鏃囨娴滄粓姊虹紒妯诲碍婵炲鍏橀幃鍧楀炊椤掍讲鎷洪悷婊呭鐢帗绂嶆导瀛樼厱婵☆垰鎼埛鏃傜磼椤斿墽甯涢柕鍫秮瀹曟﹢鍩￠崘銊ョ疄濠碉紕鍋戦崐鏍礉閹达箑纾归柡鍥ュ灩閸戠娀鏌熺€电啸缁炬儳銈搁弻宥堫檨闁告挾鍠庨悾宄邦潨閳ь剟銆佸▎鎾村仼閻忕偠妫勬俊? {}", topFields);
+            log.info("NewAPI 响应解析, topFields={}", topFields);
 
             // 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄婵犲灚鍔栫紞妤呮⒑闁偛鑻晶顕€鏌涙繝鍌涘仴妤犵偞鍔栫换婵嬪礃椤忓棗楠勯梻浣稿暱閹碱偊顢栭崶鈺冪煋妞ゆ棃鏁崑鎾舵喆閸曨剛锛橀梺鍛婃⒐閸ㄧ敻顢氶敐澶婇唶闁哄洨鍋熼娲⒑缂佹鎳冮柟铏姍閻涱噣濮€閵堝棌鎷婚梺绋挎湰閻熝呯玻閺冨牊鐓冪憸婊堝礈濞戙垹纾绘繛鎴欏灪閸ゆ劖銇勯弽銊р姇婵炲懐濞€閺岀喓绱掗姀鐘崇亶闂佺粯鎸婚惄顖炲箖濮椻偓閹瑩骞撻幒鍡樺瘱闂備線娼уΛ娆戞暜閿熺姴钃熺€广儱鐗滃銊╂⒑閸涘﹥灏柛鏂挎捣濡叉劙鎮欓崫鍕€垮┑鐐村灦椤洭鏁嶅☉銏♀拺闁告稑锕ｇ欢閬嶆煕濮椻偓缁犳牕顕ｉ幎鑺ユ櫆闂佹鍨版禍楣冩煕韫囨搩妲稿ù婊堢畺濮婃椽宕ㄦ繝鍐槱闂佸憡鎸婚惄顖氱暦?data 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤濠€閬嶅焵椤掑倹鍤€閻庢凹鍙冨畷宕囧鐎ｃ劋姹楅梺鍦劋閸ㄥ綊宕愰悙鐑樺仭婵犲﹤瀚惌濠囨婢舵劖鐓涚€广儱楠搁獮妤呮煟閹惧磭绠伴柍瑙勫灴閹瑩妫冨☉妤€顥氭繝鐢靛仜閹冲骸螞濠靛钃熸繛鎴炵懅缁♀偓闂佺鏈粙鎴炵閹绢喗鈷戦柛婵嗗椤箓鏌涢弮鈧崹鐢割敋閿濆鏁嬮柍褜鍓欓悾鐑藉箳閹存梹顫嶅┑鐐叉閸ㄩ潧鈽夎濮婂宕掑▎鎺戝帯缂備緡鍣崹鎶藉箲閵忋倕纾奸柣鎰綑娴滎垱绻濋棃娑樷偓濠氣€﹂崼銉﹀珔闁绘柨鎽滅粻楣冩煙鐎涙鎳冮柣蹇婃櫊閺岋綁骞掗幘娣虎闂佸搫鏈惄顖炵嵁閸ヮ剙绀傞柛婵勫劚閸ゎ剟姊绘笟鈧濠氬箑閵夆晛鐐婇柕濞垮灪鐎?
             if (!response.has("data")) {
@@ -473,8 +808,8 @@ public class NewApiClient {
                 }
                 // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁惧墽鎳撻—鍐偓锝庝簼閹癸綁鏌ｉ鐐搭棞闁靛棙甯掗～婵嬫晲閸涱剙顥氬┑掳鍊楁慨鐑藉磻閻愮儤鍋嬮柣妯荤湽閳ь兛绶氬鏉戭潩鏉堚敩銏ゆ⒒娴ｈ鍋犻柛搴㈡そ瀹曟粓鏁冮崒姘€梺鍛婂姦閸犳鎮￠妷鈺傜厸闁搞儺鐓堝▓鏂棵瑰鍫㈢暫婵﹤鎼晥闁搞儜鈧崑鎾澄旈崨顓狅紱闂佽宕橀崺鏍х暦閸欏绡€闂傚牊绋掑婵堢磼閳锯偓閸嬫捇姊绘担渚劸闁哄牜鍓涢崚鎺戠暆閸曗斁鍋撻崒姣椽顢旈崨顏呭闂備浇濮ら敋妞わ富鍨跺鎶芥偄閸忚偐鍘遍梺缁樏壕顓熸櫠閻㈢鍋撳▓鍨灈妞ゎ厼鍢查锝夊箻椤旇棄浜滈梺鎯х箺椤曟牠宕惔銊︹拻濞达絿顭堥ˉ蹇涙煟閹惧磭澧︾€规洑鍗冲浠嬪Ω瑜忚ぐ楣冩⒑閸涘﹥澶勯柛瀣у亾闂佽　鍋撳ù鐘差儐閻撶喖鏌熼柇锕€澧紒鐙欏洦鐓冪紓浣股戠粈鈧梻鍥ь槹缁绘繃绻濋崒姘间紑闂佹椿鍘界敮鐐哄焵椤掑喚娼愭繛鍙夛耿閺佸啴濮€閵堝懏妲梺閫炲苯澧柕鍥у楠炴帡宕卞鎯ь棜濠碉紕鍋戦崐銈嗙濠婂牆鐤悗娑櫭肩换鍡涙煕椤愶絾绀€妤犵偑鍨烘穱濠囶敍濠婂啫濡哄┑鐐茬墱閸嬪﹤顫忕紒妯诲闁告稑锕ラ崰鎰節濞堝灝鏋ら柡浣割煼閻涱噣骞嬮敃鈧悙濠勬喐韫囨稑姹查柨鏇炲€归悡銉︾節闂堟稒锛嶆俊鎻掓啞椤ㄣ儵鎮欓鍕痪婵烇絽娲ら敃顏堝箖濞嗘挻鍋ㄩ梻鍫熺〒椤愬ジ姊绘担鍛婃儓闁稿﹦鏁诲畷鎴﹀箻缂佹ǚ鎷婚梺绋挎湰閻熴劑宕楀畝鈧槐鎺楊敋閸涱厾浠搁悗瑙勬礃缁诲牆顕ｉ幘顔藉€婚柛鈩冾殕椤撳潡姊绘担绋款棌闁稿鎳庨埢鏂库枎閹邦剛绐為梺褰掑亰閸樺ジ鍩€椤掑倸鍘撮柡宀嬬秮楠炲鎮樺ú璁崇凹缂佸倹甯″畷顐﹀礋閸偄鐦滈梻渚€娼ч悧鍡椢涘☉娆愭珷妞ゆ帊闄嶆禍婊堟煏婵炲灝鍔滄い銉︾矒閺屽秶鎷犻懠顑絿绱掔紒妯肩疄鐎规洜鍠栨俊鎼佸Ψ閵堝拋妫滈梻浣藉吹閸犳劙鎮烽妷褉鍋撳鐓庡箻缂侇喖鐗撳畷濂稿Ψ閿旀儳骞愬┑鐐舵彧缁插潡鎮洪弮鍫濆惞婵炲棙鍔戞禍婊堟煛閸ユ湹绨界紒瀣吹缁辨帡宕掑☉妯碱儌闂侀€炲苯澧鹃柟顑惧劦閸┾偓妞ゆ帒瀚壕濠氭煙閹规劦鍤欓柛鎰ㄥ亾婵＄偑鍊栭幐楣冨磹閿濆惟闁冲搫鍊婚崢顏呯節閵忥絾纭炬俊顐ｇ懃閳诲秹宕ㄩ妤€浜炬繛鍫濈仢閺嬫瑩鏌涘Δ浣糕枙妤犵偛鍟灃闁告劏鏅涢弸鍌炴⒑閸涘﹥澶勯柛鎾寸洴钘濋柕澶嗘櫆閳锋垹绱撴担璇＄劷濠⒀屼邯閺屾洟宕奸姀鈺冨姼濡炪倖娲╃紞渚€銆侀弴銏℃櫇闁逞屽墰缁鈽夐姀锛勫幐婵犮垼娉涢敃锔界閵忋垻纾奸柟閭﹀幘閳藉銇勯鍕殻濠碘€崇埣瀹曞崬螣濞差亞鈧櫣绱撻崒娆戭槮妞ゆ垵妫涢弫顕€鎮欓崫鍕姦濡炪倖甯婇悞锕傛儍閹达附鐓曢柣妯哄暱婵鏌?
                 String errMsg = response.has("error") ? response.get("error").toString() : "Image generation failed";
-                log.error("NewAPI generateImage 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁惧墽鎳撻—鍐偓锝庝簼閹癸綁鏌ｉ鐐搭棞闁靛棙甯掗～婵嬫晲閸涱剙顥氬┑掳鍊楁慨鐑藉磻閻愮儤鍋嬮柣妯荤湽閳ь兛绶氬鏉戭潩鏉堚敩銏ゆ⒒娴ｈ鍋犻柛搴㈡そ瀹曟粓鏁冮崒姘€梺鍛婂姦閸犳鎮￠妷鈺傜厸闁搞儺鐓堝▓鏂棵瑰鍫㈢暫婵﹤鎼晥闁搞儜鈧崑鎾澄旈崨顓狅紱闂佽宕橀崺鏍х暦閸欏绡€闂傚牊绋掑婵堢磼閳锯偓閸嬫捇姊绘担渚劸闁哄牜鍓涢崚鎺戠暆閸曗斁鍋撻崒姣椽顢旈崨顏呭闂備浇濮ら敋妞わ富鍨跺鎶芥偄閸忚偐鍘遍梺缁樏壕顓熸櫠閻㈢鍋撳▓鍨灈妞ゎ厼鍢查锝夊箻椤旇棄浜滈梺鎯х箺椤曟牠宕惔銊︹拻濞达絿顭堥ˉ蹇涙煟閹惧磭澧︾€规洑鍗冲浠嬪Ω瑜忚ぐ楣冩⒑閸涘﹥澶勯柛瀣у亾闂佽　鍋撳ù鐘差儐閻撶喖鏌熼柇锕€澧紒鐙欏洦鐓冪紓浣股戠粈鈧梻鍥ь槹缁绘繃绻濋崒姘间紑闂佹椿鍘界敮鐐哄焵椤掑喚娼愭繛鍙夛耿閺佸啴濮€閵堝懏妲梺閫炲苯澧柕鍥у楠炴帡宕卞鎯ь棜濠碉紕鍋戦崐銈嗙濠婂牆鐤悗娑櫭肩换鍡涙煕椤愶絾绀€妤犵偑鍨烘穱濠囶敍濠婂啫濡哄┑鐐茬墱閸嬪﹤顫忕紒妯诲闁告稑锕ラ崰鎰節濞堝灝鏋ら柡浣割煼閻涱噣骞嬮敃鈧悙濠勬喐韫囨稑姹查柨鏇炲€归悡銉︾節闂堟稒锛嶆俊鎻掓啞椤ㄣ儵鎮欓鍕痪婵烇絽娲ら敃顏堝箖濞嗘挻鍋ㄩ梻鍫熺〒椤愬ジ姊绘担鍛婃儓闁稿﹦鏁诲畷鎴﹀箻缂佹ǚ鎷婚梺绋挎湰閻熴劑宕楀畝鈧槐鎺楊敋閸涱厾浠搁悗瑙勬礃缁诲牆顕ｉ幘顔藉€婚柛鈩冾殕椤撳潡姊绘担绋款棌闁稿鎳庨埢鏂库枎閹邦剛绐為梺褰掑亰閸樺ジ鍩€椤掑倸鍘撮柡宀嬬秮楠炲鎮樺ú璁崇凹缂佸倹甯″畷顐﹀礋閸偄鐦滈梻渚€娼ч悧鍡椢涘☉娆愭珷妞ゆ帊闄嶆禍婊堟煏婵炲灝鍔滄い銉︾矒閺屽秶鎷犻懠顑絿绱掔紒妯肩疄鐎规洜鍠栨俊鎼佸Ψ閵堝拋妫? {}, 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鐗堟櫏婵犵數濮崑鎾炽€掑锝呬壕濠殿喖锕ㄥ▍锝囨閹烘嚦鐔兼惞闁稓绀冨┑鐘殿暯濡插懘宕戦崟顓涘亾濮樼厧鏋ら柛鎺撳笚缁绘繂顫濋鐐版睏缂傚倸鍊烽悞锕傗€﹂崶顒€鍌ㄩ柣銏犳啞閳锋垹鐥鐐村婵炲吋鍔欓弻娑㈠籍閹惧墎鏆ら悗瑙勬礋濞佳囧煝鎼淬劌绠婚柡澶嬪灍閸嬫捇宕归锝呭伎濠殿喗顨呭Λ妤佹櫠缂佹ü绻嗛柟缁樺笧缁夋椽鏌＄仦鐐鐎规洘鍎奸ˇ鍙夈亜韫囷絽骞楁い銊ｅ劦閹瑩寮堕幋鐐剁檨婵°倗濮烽崑娑㈩敄閸涙潙鐓橀柟杈剧畱缁犳稒銇勮箛鎾村櫣濞存粍绻冪换婵嬫偨闂堟刀锝嗐亜閺冣偓閻楃姴鐣烽弶搴撴妞ゎ偒鍠氱粙蹇旂節閵忥絽鐓愰柛鏃€鐗犲畷鎴﹀磼閻愬鍙嗛梺缁樻煥閹碱偄鐡梻浣芥閸熶即宕伴弽顓炶摕闁哄洨鍠撶粻楣冩煕椤垵鏋涘┑顔碱樀濮婅櫣鎮伴垾鍏呭濠电偛顕慨鎾敄閸℃稒鍋傞柡鍥ュ灪閻撳啴姊哄▎鎯х仩濞存粓绠栧娲传閸曨剙娅ょ紓渚囧枛闁帮綁骞冮悿顖ｆЪ缂備胶绮换鍫ュ箖娴犲顥堟繛鎴烆殕閸╂稒淇婇悙顏勨偓鎴﹀磿閺屻儱绀夋繛鍡楃箳閺嗭箓鏌熸潏鍓х暠缂佺姵绋掗妵鍕箻鐠虹儤鐎婚悗娈垮枛濞尖€愁潖閾忓湱纾兼俊顖濇娴煎洤鈹戦埥鍡椾簻閻庢矮鍗抽獮鍐倷閸濆嫬鐎銈嗗姉婵磭鑺辨繝姘拺闁荤喓澧楅幆鍫熶繆椤愶綆娈曠紒鍌氱Ч瀹曟粏顦寸痪鎹愭闇夐柨婵嗘噺閹牏鈧稒绻勭槐鎾存媴閸撳弶楔闂佺娅曢幑鍥箖妤ｅ啯鍊婚柦妯侯槸瀹撳棝姊洪棃娑㈢崪缂佽鲸娲熷畷婵嬪醇閺囩喎鈧灚顨ラ悙鑼虎闁告梹宀搁弻鐔兼惞椤愩垹顫掗梺璇″枛濞尖€崇暦閸洦鏁嗗ù锝呭级鐎氬ジ鏌ｉ悢鍝ョ煂濠⒀勵殘閺侇噣骞掗幘棰濇锤婵炲鍘ч悺銊╂偂閺囥垺鐓熸俊顖氭惈閺嗚鲸绻涢幖顓炴灓闁? {}", errMsg, response.toString());
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁惧墽鎳撻—鍐偓锝庝簼閹癸綁鏌ｉ鐐搭棞闁靛棙甯掗～婵嬫晲閸涱剙顥氬┑掳鍊楁慨鐑藉磻閻愮儤鍋嬮柣妯荤湽閳ь兛绶氬鏉戭潩鏉堚敩銏ゆ⒒娴ｈ鍋犻柛搴㈡そ瀹曟粓鏁冮崒姘€梺鍛婂姦閸犳鎮￠妷鈺傜厸闁搞儺鐓堝▓鏂棵瑰鍫㈢暫婵﹤鎼晥闁搞儜鈧崑鎾澄旈崨顓狅紱闂佽宕橀崺鏍х暦閸欏绡€闂傚牊绋掑婵堢磼閳锯偓閸嬫捇姊绘担渚劸闁哄牜鍓涢崚鎺戠暆閸曗斁鍋撻崒姣椽顢旈崨顏呭闂備浇濮ら敋妞わ富鍨跺鎶芥偄閸忚偐鍘遍梺缁樏壕顓熸櫠閻㈢鍋撳▓鍨灈妞ゎ厼鍢查锝夊箻椤旇棄浜滈梺鎯х箺椤曟牠宕惔銊︹拻濞达絿顭堥ˉ蹇涙煟閹惧磭澧︾€规洑鍗冲浠嬪Ω瑜忚ぐ楣冩⒑閸涘﹥澶勯柛瀣у亾闂佽　鍋撳ù鐘差儐閻撶喖鏌熼柇锕€澧紒鐙欏洦鐓冪紓浣股戠粈鈧梻鍥ь槹缁绘繃绻濋崒姘间紑闂佹椿鍘界敮鐐哄焵椤掑喚娼愭繛鍙夛耿閺佸啴濮€閵堝懏妲梺閫炲苯澧柕鍥у楠炴帡宕卞鎯ь棜濠碉紕鍋戦崐銈嗙濠婂牆鐤悗娑櫭肩换鍡涙煕椤愶絾绀€妤犵偑鍨烘穱濠囶敍濠婂啫濡哄┑鐐茬墱閸嬪﹤顫忕紒妯诲闁告稑锕ラ崰鎰節濞堝灝鏋ら柡浣割煼閻涱噣骞嬮敃鈧悙濠勬喐韫囨稑姹查柨鏇炲€归悡銉︾節闂堟稒锛嶆俊鎻掓啞椤ㄣ儵鎮欓鍕痪婵烇絽娲ら敃顏堝箖濞嗘挻鍋ㄩ梻鍫熺〒椤愬ジ姊绘担鍛婃儓闁稿﹦鏁诲畷鎴﹀箻缂佹ǚ鎷婚梺绋挎湰閻熴劑宕楀畝鈧槐鎺楊敋閸涱厾浠搁悗瑙勬礃缁诲牆顕ｉ幘顔藉€婚柛鈩冾殕椤撳潡姊绘担绋款棌闁稿鎳庨埢鏂库枎閹邦剛绐為梺褰掑亰閸樺ジ鍩€椤掑倸鍘撮柡宀嬬秮楠炲鎮樺ú璁崇凹缂佸倹甯″畷顐﹀礋閸偄鐦滈梻渚€娼ч悧鍡椢涘☉娆愭珷妞ゆ帊闄嶆禍婊堟煏婵炲灝鍔滄い銉︾矒閺屽秶鎷犻懠顑絿绱掔紒妯肩疄鐎规洜鍠栨俊鎼佸Ψ閵堝拋妫? " + errMsg);
+                log.error("NewAPI generateImage 失败: {}, response={}", errMsg, response.toString());
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI generateImage 失败:" + errMsg);
             }
 
             JsonNode dataArray = response.get("data");
@@ -486,7 +821,7 @@ public class NewApiClient {
             // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌氬€烽懗鑸垫叏闁垮绠鹃柍褜鍓熼弻鈥崇暆閳ь剟宕伴弽褏鏆︽繝濠傛－濡查箖鏌ｉ姀鈺佺仭闁烩晩鍨跺璇测槈濞嗘垹鐦堥梺鍛婁緱閸橀箖宕㈤锔解拺闂侇偅绋撻埞鎺楁煕閺傝法鐒烽柣蹇斿浮濮婃椽宕烽褏鍔稿┑鐐差嚟閸忔ɑ淇婇幘顔肩疀妞ゆ柨澧介敍婵囩箾鏉堝墽鍒伴柟纰卞亝閻楀骸鈹戦悩顔肩伄闁硅櫕鎸歌灋婵炴垶顭傞敐澶婄疀闁哄娉曢濠囨⒑閸濆嫬鈧悂骞栭锝囶洸濡わ絽鍟悡銉︾節闂堟稒顥㈡い搴㈩殕椤ㄣ儵鎮欓幖顓熺暭闂佹眹鍎烘禍顏堛€佸鈧幃娆撴濞戞艾骞楅梻?data[0] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛銈嗘礋閺岋紕浠︾拠鎻掑闂佺粯鎸婚惄顖炲蓟濞戞ǚ妲堥柛妤冨仦閻忓牓姊洪柅鐐茶嫰婢т即鏌℃担鍓茬吋鐎殿喛顕ч埥澶婎煥閸涱垱婢戦梻浣烘嚀閻忔繈宕婊呮噮濠电姷鏁搁崑娑㈡偤閵娧冨灊闁规儳澧庢稉宥夋煛瀹擃喖鏈紞搴♀攽閻愬弶鈻曞ù婊勭矊椤斿繐鈹戦崱蹇旀杸闂佺粯蓱瑜板啴寮冲▎鎰╀簻闁挎棁顫夊▍濠冩叏婵犲懏顏犵紒顔界懃閳诲酣骞嗚婢瑰牊淇婇悙顏勨偓褔姊介崟顒傜濠电姴鎳愰悢鍛存⒒娴ｄ警鐒鹃柣顒€銈稿畷鎴︽倷閸濆嫮鍘遍梺纭呮彧闂勫嫰宕戦敐澶嬬厱闁靛绲芥俊鍧楁煕濞嗗苯浜惧┑锛勫亼閸婃洜鈧稈鏅犻妴鍐醇閵忊槅娼熼梺鍦劋椤ㄥ棝宕戦幇鐗堢厾缁炬澘宕崝顔炬喐韫囨稑鐒垫い鎺戝枤濞兼劖绻涢崣澹濐亞鍙呴梺缁樻椤ユ捇寮抽敃鍌涚叆闁绘柨鎼牎闂佺锕ゆ晶搴ｆ閹惧瓨濯撮柤娴嬪墲閸ㄦ寧淇婇棃娑掓斀閻庯綆鍋嗛崢鍛婄箾鏉堝墽鎮兼い顓炵墦瀵娊鏁愰崶锝呬壕閻熸瑥瀚粈鍐偨椤栨稑娴柨婵堝仜閳规垹鈧絽鐏氶弲锝夋⒑閹稿海鈽夐悗姘煎墲閵囨劙宕掗悙绮规嫽闂佺鏈懝楣冨焵椤掍焦鍊愰柍銉畵椤㈡宕熼銈忕幢闂備礁鎲″ú锕傚磹鐎ｎ€㈡椽顢旈崨顔界彇闂備胶顭堥張顒€顫濋妸鈺婃晩闁糕剝绋掗悡鐔煎箹閹碱厼鐏ｇ紒澶屾暬閺屾盯鎮╅幇浣圭杹閻庤娲橀崹鍧楀极閹剧粯鍋愰柡鍌樺劜鐎氬吋淇婇悙顏勨偓鏍箰閸洖绀夌€光偓閸曗斁鍋撻崨鎼晢闁告洦鍓涢崢鍗炩攽閻愬弶顥滅紒缁樺灴钘熼柕蹇婂墲閸欏繐鈹戦悩鎻掓殲闁靛洦绻勯埀顒冾潐濞插繘宕濆鍥ㄥ床婵犻潧顑呯壕鍏兼叏濡搫鎮戠紓宥呭€垮濠氬磼濞嗘埈妲梺鍦拡閸嬪﹪鐛繝鍛杸婵炴垶鐟ラ崜顔碱渻閵堝棛澧柛鎴濈秺瀹曠敻寮撮姀锛勫帾婵犵數鍋熼崑鎾斥枍閹剧粯鐓涘ù锝呮啞閸犳﹢鏌＄仦鐐缂佺姵绋掔换婵嬪礃闁款垰浜鹃柛鈩冪⊕閻撴瑧鈧懓瀚晶妤呭箚閸儲鐓冮悷娆忓閻忓瓨銇勯姀锛勬噰闁诡喗鐟╅、妤呭焵椤掆偓閳绘挾浠︾憴锝嗘杸闂佺粯鍔樼亸娆忥耿閹绢喗鐓曞┑鐘插暟婢ь剛绱掑畝鍐摵缂佺粯绻堝畷鎯邦樄闁轰焦绮岄埞鎴炲箠闁稿﹥鎹囬幊妤呭醇閺囩偛鍋嶉梻渚囧墮缁夌敻鍩涢幋鐘电＝濞达絿娅㈡笟娑㈡煟閹烘柨浜剧紒缁樼洴瀹曘劑顢欓悾宀婃К闂備椒绱紞渚€藟閹惧顩烽柨鏂垮⒔绾惧ジ鏌曡箛濠冾潑闁?
             java.util.List<String> firstFieldNames = new java.util.ArrayList<>();
             first.fieldNames().forEachRemaining(firstFieldNames::add);
-            log.info("NewAPI data[0] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛? {}", firstFieldNames);
+            log.info("NewAPI data[0] 字段名={}", firstFieldNames);
 
             // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不缂佹﹩娈介柣鎰綑閻忔潙鈹戦鐟颁壕闂備線娼ч悧鍡涘箠閹扮増鍋柍褜鍓氭穱濠囨倷椤忓嫧鍋撻弽顬稒鎷呴懖婵囩洴瀹曠喖顢楁担绋垮Τ濠电姷鏁告慨鏉懨洪敃鍌氱厱闁硅揪闄勯悡鐔兼煟閺冨倸甯跺ù婊€鍗抽弻娑㈠Χ閸パ勭€婚梺瀹狀潐閸ㄥ潡銆佸璺虹劦妞ゆ巻鍋撴い顓炴穿椤﹀綊鏌熼鈧粻鏍箖濠婂牊瀵犲璺哄閹蹭即姊绘笟鈧褔篓閳ь剙鈹戦垾铏枠鐎规洏鍨介弻鍡楊吋閸″繑瀚奸梻浣告惈閸婂爼宕曢幓鎺嗘瀺闁告稑鐡ㄩ悡鏇㈡煟閺冨洦纭剧€规挸妫濋弻娑㈠煛娓氬﹨鍚悗娈垮枟閹歌櫕鎱ㄩ埀顒勬煥濞戞ê顏╂鐐茬墦濮婅櫣娑甸崨顓濇睏闁荤偞绋忛崕鍗炲祫闂佸憡娲﹂崹鎵磼閳轰讲鏀介柣妯虹－椤ｆ煡鏌ｉ幘宕囩闁哄本鐩俊鐑藉箣濠靛棙鐏撴繛瀵稿帶閸熸挳骞冨Δ鈧埢鎾诲垂椤旂晫浜炵紓鍌欑贰閸犳鎮烽敂鐣屸攳濠电姴鍋嗗鎵偓鍏夊亾濠电姴鍞妷锔剧瘈缁剧増锚婢ц尙鎲搁弶鍨殻闁诡啫鍡欑杸闁哄洨鍣ュ鐔兼⒑鐟欏嫬鍔ら柣掳鍔嶉崚濠勨偓闈涙憸绾惧ジ鎮楅敐搴′航闁稿簺鍎甸弻锟犲幢閹邦剛浼堝┑顔硷龚濞咃絿鍒掑▎蹇婃瀻闁诡垎鍐棎闂傚倷鑳堕…鍫ヮ敄閸愵喖纾规繝闈涱儐閸嬫ɑ銇勯弴妤€浜鹃悗瑙勬礀閵堝憡淇婇悜钘壩ㄩ幖瀛樕戝▍濠囨煛鐏炵偓绀冪€垫澘瀚灒闁绘垶顭囨禍鍫曟煟鎼达絽浠柛濠冪墪椤啴鎸婃径妯荤稁濠电偛妯婃禍婵嬫倿婵犳碍鐓熼柟閭﹀灠閽勫ジ鎮楀顓熺凡妞ゎ叀鍎婚ˇ鏉戭熆瑜庨〃鍫ュ箲閵忕姭妲堥柕蹇曞Х椤撴椽姊虹紒姗嗙劸婵炲懏娲栬闁告洦鍘剧壕钘夈€掑顒佹悙闁哄鍠栭弻锝夋偄閺夋垵濮﹂梺绯曟杺閸ㄦ椽骞嗛弮鍫澪╅柕澹本肖闂佽崵鍠愮划宀€绮旈悽绋跨疄闁靛ň鏅滈崐缁樹繆椤栨繂浜归柣锕€鐗嗛埞鎴︽倷閼碱剙顣洪梺璇茬箲缁诲牆顕ｉ幖浣瑰亜闁硅偐鍋樼花璇差渻閵堝棙灏甸柛瀣枑閺呭爼鏁傞柨顖氫壕閻熸瑥瀚粈鍐╀繆閻愯埖顥夋い鏇稻缁傛帞鈧絽鐏氶弲锝夋⒑缂佹ɑ顥嗘繛鎾虫贡閼洪亶鎮介崨濞炬嫽婵炶揪绲介幉锟犲箚閸喓绠鹃悘鐐插€告慨鍌溾偓瑙勬磻閸楁娊鐛鈧畷婊勬媴妞嬪海鎲规繝寰锋澘鈧呭緤娴犲鐤い鏍仦閸嬪倿鏌￠崶銉ョ仾闁绘挸鍟撮弻宥嗘姜閹殿噮妲梺鍝勬閿曘儲绌辨繝鍥舵晝闁绘ɑ褰冮‖澶愭⒑闂堟稒鎼愰悗姘煎灣缁鈽夐姀鐘殿啋闁荤姾妗ㄧ拃锕傚级閹间焦鈷掑ù锝勮閻掗箖鏌ㄩ弴妯衡偓婵嬪箖閵夛妇闄勭紒瀣劵閹芥洟姊洪崫鍕窛闁哥姴娴峰▎銏ゆ倷閻戞鍘遍梺鏂ユ櫅閸欐劙骞嬮敂钘変户闂佸搫娲㈤崹娲煕閹寸姷纾藉ù锝堝亗閹寸姳鐒婇柣妤€鐗忕粻楣冩煠绾板崬澧柡瀣洴閺岀喖顢氶崱娆戠槇濡炪們鍨哄ú鐔煎极閸愵喖鐒垫い鎺戝閸婂嘲鈹戦悩鍙夊闁绘挸绻愰埞鎴︽偐閼碱剛顔囬梺浼欓檮缁秵绌辨繝鍥舵晝闁挎繂娲ら埛灞解攽椤旂》鏀绘俊鐐舵閻ｅ嘲螖閸涱厾顦ч梺鍏肩ゴ閺呮盯宕甸幒鎾剁瘈闁汇垽娼ф禒褔鏌曢崱妤婂剳闁瑰箍鍨归埞鎴﹀幢閳轰焦顓?URL 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛銈嗘礋閺岋紕浠︾拠鎻掑闂佺粯鎸婚惄顖炲蓟濞戞ǚ妲堥柛妤冨仦閻忓牓姊洪柅鐐茶嫰婢т即鏌℃担鍓茬吋鐎殿喛顕ч埥澶婎煥閸涱垱婢戦梻浣烘嚀閻忔繈宕婊呮噮濠电姷鏁搁崑娑㈡偤閵娧冨灊闁规儳澧庢稉宥夋煛瀹擃喖鏈紞搴♀攽閻愬弶鈻曞ù婊勭矊椤斿繐鈹戦崱蹇旀杸闂佺粯蓱瑜板啴寮冲▎鎰╀簻闁挎棁顫夊▍濠冩叏婵犲懏顏犵紒顔界懃閳诲酣骞嗚婢瑰牊淇婇悙顏勨偓褔姊介崟顒傜濠电姴鎳愰悢?
             String[] urlFields = {"url", "image_url", "imageUrl", "img_url", "imgUrl"};
@@ -507,13 +842,13 @@ public class NewApiClient {
 
             // data[0] 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐎涙繄绱撻崒姘毙㈤柨鏇ㄤ簻椤曪絿鎷犲顔兼倯婵犮垼娉涢敃锝囨閸洘鈷戦柛娑橈攻婢跺嫰鏌涢幘瀵告噧闁宠绉归弫鎰緞鐎Ｑ勫缂傚倷绀侀鍫ュ磿婵犳熬缍栭柨鏇炲€归悡鏇㈡煛閸愶絽浜鹃梺鎼炲妼閻忔繈顢氶敐鍡欑瘈婵﹩鍘藉▍鍥⒑闁偛鑻晶鏌ユ煟韫囨柨绗氱紒缁樼洴楠炴﹢寮堕幋婵囩槗闂備焦鎮堕崝鎴炵閸洏鈧線骞樼拠鎻掕€垮┑鐐村灦閻熴垽骞忓ú顏呪拺闁稿繗鍋愰妶鎾煛閸涱喚娲撮柕鍡楀€圭缓浠嬪川婵犲倵鍋撻悽鐢电＜婵°倓鑳堕埥澶嬬箾鐏炲倸鈧牠銆佹繝鍥ㄢ拻濞达絽鎲￠崯鐐寸箾鐠囇呯暤鐎规洖缍婇獮宥夘敊閸欍儳鐟濆┑鐘垫暩婵數鍠婂澶嬪亗闁哄洨鍠嶇换鍡涙煏閸繃鍣归柡鍡樼懃闇夐柣妯荤懃閸樻崘銇愰幒鎾充汗闂佸憡绻傜€氼亜效濡ゅ啰纾藉ù锝勭矙閸濇椽鏌熺粙娆剧吋妤犵偛绻樺畷銊╁级閹存粎鐐婇梻浣告啞濞叉﹢宕硅ぐ鎺戠；闁靛牆顦拑鐔哥箾閹寸偟鎳勯柛搴ｅ枛閺屻劌鈹戦崱姗嗘！濠殿噯绲介悧鎾诲箖濡も偓閳绘捇宕归鐣屼邯婵＄偑鍊ら崢楣冨礂濮椻偓閻涱噣宕橀纰辨綂闂侀潧绻掓慨鐢告倵閹惰姤鐓涘璺猴功婢ф垿鏌涢弬璺ㄐ㈤柍璇茬Ч瀵粙顢橀悢鍙夊濠电偠鎻紞鈧繛鍜冪秮婵″瓨绻濋崶銊у幈闂佽鍎抽顓犵不閻愮儤鐓忛柛鈩冾殔閺嗭絿鈧娲忛崝鎴濐嚕閸洖绠ｉ柣鎰閸欐垿姊婚崒娆掑厡缂侇噮鍨跺濠氬Ω閳轰浇袝闁诲函缍嗛崰妤呭磻閸岀偞鐓涢柛銉㈡櫅閺嬪秶绱掔拠鍙夘棡闁靛洤瀚板浠嬪Ω瑜忛濂告⒑閹肩偛鈧牠鎮烽敂鐐床婵炴垯鍨圭粻瑙勩亜閹捐泛浠﹂柣蹇撶Ч濮婃椽鏌呭☉姘ｆ晙闂佸憡鏌ㄧ粔鍫曞箲閵忕姭鏀介悗锝庝簽椤︺劑姊哄畷鍥ㄥ殌闁靛洦锕㈤幖瑙勬償椤厾绠氶梺闈涚墕濞层倕鏆╅梻浣侯焾椤戝洭宕戦妶澶婄畺鐟滄棃骞冮埡鍐╁珰闁肩⒈鍓涢弳顐ｇ節閻㈤潧浠滄俊顐ｇ懇楠炴劙宕妷褌绗夐梺姹囧灩閹诧繝鎮″▎鎾寸厽闁瑰浼濋鍫熷€块柣鎰靛墰缁犻箖鏌涜箛姘汗闁愁垱娲滅槐鎺旂磼濡偐鐤勯梺璇″枙缁瑥螞閸愵煁褰掓嚋閻㈠灚鍒涢梺鍝勭灱閸犲酣鎮鹃敓鐘茬骇闁圭瀛╅鎺楁煟鎼淬値娼愭繛鍙夌墪閻ｇ兘顢楅崟銊㈠亾閺冨牆绀冩い鏂挎閵娾晜鐓ラ柡鍐ㄦ处椤ュ鐥悙顒€鈻曟慨濠冩そ瀹曨偊宕熼鐘插Ы缂傚倷鑳剁划顖滄崲閸岀偞鍋╅柣鎴ｆ鎯熼梺鍐叉惈閿曘儵寮查敐澶嬧拺缂備焦锕╅悞楣冩倶韫囨梻鎳囩€规洏鍨虹粋鎺斺偓锝庡亞閸樹粙鏌熼崗鑲╂殬闁糕晛瀚板畷顖濈疀濞戞瑧鍘遍梺缁橆焾濞呮洜绮堥崼銉︾厱闁圭儤鎸哥粭鎺楁煃鐠囨煡鍙勬鐐达耿楠炲秵鎷呴梹鎰棜濠电偠鎻徊鑺ョ珶婵犲偆鐒介柕濞炬櫆閻撳啰鎲稿鍫濈闁绘棁鍋愬畵渚€鏌涢幇鈺佸Ψ闁哄閰ｉ弻鐔衡偓娑櫳戦悡銉ッ瑰鍫㈢暫闁哄矉缍佹慨鈧柕蹇婂墲濮ｅ嫰姊洪棃娑欘棞闁挎洦浜璇测槈濮橈絽浜鹃柨婵嗛娴滄繄鈧娲栭張顒勫Φ閸曨垰顫呴柍钘夋閻や線鎮楃憴鍕闁哥姵鐗犻妴渚€寮介鐔锋疅闂侀潧顦崕鐑樺閺嶎偆纾介柛灞捐壘閳ь剚鎮傚畷鎰板箹娴ｅ摜锛欓梺缁樺灱婵倝宕愰崸妤佺叆闁哄洨鍋涢埀顒€缍婂鎻掆攽鐎ｎ偆鍘撻柡澶屽仦婵粙顢欐径鎰厸閻庯綆鍋呴ˉ鍫ユ煛瀹€瀣瘈鐎规洘锕㈡俊姝岊槻妞ゃ倐鍋撻梻鍌欒兌缁垶骞愭ィ鍐ㄧ獥闁归偊鍘鹃埞宥呪攽閻樺弶鎼愰崶鎾⒑缁嬫寧婀伴柣顓у枟缁旂喖寮撮悢铏圭槇缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簼閸ｇ晫绱掗鐣屾噰妤犵偞顭囬幏鐘绘嚑椤掑孝闂傚倷绀佸﹢閬嶅磿閵堝绠伴柛鎾楀啫袣闂侀€炲苯澧存慨濠冩そ楠炴牠鎮欓幓鎺戭潙闂備礁鎲￠弻銊х矓閹绢喖鐓濈€广儱顦悙濠冦亜閹哄秷顔夐柟鐤缁辨挻鎷呴崜鎻掑壉闁诲海鐟抽崘鑳偓鍧楁煙濞堝灝鏋ょ痪鎯с偢閹鏁愭惔鈥茬盎闂佽绻戦幐鎶藉蓟濞戙垹鐓橀柟顖嗗倸顥氭繝纰夌磿閸嬫垿宕愰弽褜鍟呭┑鐘宠壘绾惧鏌熼崜褏甯涢柣鎾跺枛閻擃偊宕堕妸锔规嫻闂佹眹鍔嶉崹鍧楀蓟閻旇偐宓侀柛顭戝枤娴犲ジ姊虹€圭姵顥夋い锕€鐏氶幈銊╁焵椤掑嫭鐓熸俊顖涙た閸熷繘鏌涘顒佸殗婵﹦绮幏鍛存惞閻熸壆顐奸梻浣告啞濮婄懓煤閻旂厧绠栨俊顖欒濞尖晠鎮归悜妯汇仢婵☆偆鍏樺娲嚍閵夊喚浜棟妞ゆ劧绠戠紒鈺伱归悩宸剱闁绘挾鍠栭弻鐔兼焽閿曗偓閻忕娀鏌ｉ妸銉︽儓妞ゎ叀鍎婚ˇ宕囩磼鐎ｎ偄绗ч柟骞垮灩閳藉濮€閻樼數鍘┑鐘灱閸╂牜绮欓弽顓炵劦妞ゆ巻鍋撻柣蹇旂箞閸╃偤骞嬮敂鑺ユ珫闂佸憡娲﹂崜姘掗崼銉﹀€甸悷娆忓缁€鍫ユ煕閻樺磭澧甸柕鍡曠閳藉顫滈崱妯哄厞婵＄偑鍊栭幐鍡涘礋閸偓绱欓梻鍌氬€搁崐宄懊归崶褏鏆﹂柛顭戝亝閸欏繘鏌涢…鎴濅簽妞も晜褰冮湁闁绘ê妯婇崕蹇曠磼閳ь剚寰勯幇顒傤啇濠电儑缍嗛崜娆愪繆閼测晝纾奸柍褜鍓氬鍕偓锝冨妺缁ㄥ姊洪崫鍕枆闁稿瀚粋鎺楁晝閸屾稓鍘撻梻浣哥仢椤戝懘鎮樼€电硶鍋撳▓鍨灈闁绘牕銈搁獮鍐ㄢ枎閹惧磭楠囬梺瑙勬儗閸樹粙藟鐎ｎ偂绻嗛柣鎰典簻閳ь儸鍛闁挎繂妫旂换鍡涙煕閵夈垺娅嗘い顐ｆ礋閺岀喖鎮滃Ο璇茬缂備礁澧庨崑銈夌嵁閺嶃劍缍囬柛鎾楀拑绱甸梻浣告啞閿曗晠宕戦崱娆愵潟闁规儳鐡ㄦ刊瀵哥磼鐎ｎ亞姘ㄩ柛瀣崌瀹曠兘顢橀悢鍛婎唶闂備浇娉曢崰鎾存叏閹绢喖鍑犲〒姘ｅ亾闁哄本鐩獮鍥濞戞瑧浜紓浣哄亾閸庢娊宕ョ€ｎ剚宕叉繛鎴欏灩缁狅綁鏌ｈ箛姘煎殭闁靛牊鎮傞悰顕€宕橀鑺ユ珳婵犮垼娉涢鍌炲箯濞差亝鐓熼柣妯哄级缁屽潡鎮樿箛鏃傛噮缂侇喖顭烽獮搴ㄦ嚍閵壯冨箞闂佽鍑界紞鍡涘礈濞嗘挸鍑犳繛鎴欏灪閻撴瑩鏌よぐ鎺戜喊婵炲吋鍔欓弻鐔碱敍濞戞瑯妫冩繝纰樺墲閹倹淇婇悿顖ｆЪ闂佺粯甯＄粻鏍ь潖缂佹ɑ濯寸紒瀣儥濡矂姊虹粙娆惧剮缂佽埖鑹鹃悾鐑藉即閵忕姾鎽曢梺闈涱槶閸庢娊宕㈤柆宥嗏拺缁绢厼鎳忚ぐ褔姊婚崟顐㈩伃鐎规洘鍨块弫鎰緞鐎ｎ剙骞堥梻渚€娼ч¨鈧紒鑼跺Г娣囧﹪宕稿Δ浣哄幈濠电偛妫楅懟顖涚閹€鏀介柨娑樺娴滃ジ鏌涙繝鍐╃闁逞屽墯缁嬪牓寮查悩璇参ラ柛鎰靛枛楠炪垺绻涢崱妯哄閹兼潙锕ら埞鎴︽偐缂佹ɑ閿銈嗗灥閹虫﹢骞冮悙鍝勫瀭妞ゆ劗濮崇花濠氭⒑閸︻厼鍔嬮柛銊ф暬椤㈡棃顢旈崼鐔哄幗闂佸湱鍎ゅú鏍ㄧ瑜版帗鐓冪憸婊堝礈濞嗘垹涓嶇€广儱顦壕鍧楁⒑椤掆偓缁夊绮婚悩缁樼厵闁规鍠栭。濂告煛閸滀礁澧紒缁樼洴楠炲鈻庤箛鏇氱棯闂備焦濞婇弨閬嶅垂閸噮娼栧┑鐘宠壘闁卞洭鏌ｉ弮鈧禍浠嬪焵椤掍礁绗掓い顓″劵椤﹁櫕绻涢懠顒€鏋涚€殿喖顭烽幃銏☆槹鎼淬垺鐤傞梻鍌欑贰閸欏繒绮婚幋锕€绀堥柛顐ｆ礃閳锋垿鎮归崶锝傚亾閾忣偆浜舵俊鐐€戦崝宀勬晝椤忓牏宓佸┑鐘插亞閻撱儵鏌涢銈呮瀻闁逞屽墰閸忔ê顫忓ú顏嶆晝闁挎繂娲㈤埀顒佸浮閺岋綁鍩℃笟鈧崣鍕叏婵犲嫮甯涢柟宄版嚇瀹曘劍绻濋崘銊ュ缂傚倸鍊风粈渚€藝娴煎瓨鍋傞柍銉ョ－閺嗭附绻濋棃娑欘棤闁哄棗妫濋弻娑㈠即閻戝洤浼愬銈忓瘜閸ㄥ爼鏁愰悙娴嬫斀閻庯綆鍋勫▓婵嬫⒑濮瑰洤鐏叉繛浣冲洨宓侀柛顐犲劜閳锋垿鎮归崶銊ョ祷闁搞倛浜槐鎾愁吋閸涱噮妫﹂悗瑙勬礃閸ㄥ灝鐣烽妸鈺婃晬婵炲棙鍨垫晶鐐繆閻愵亜鈧牠骞愰崼鏇炲瀭婵炲樊浜濋崑鍌炴煕閹伴潧鏋熼柣鎾卞灪娣囧﹪顢涘▎鎺濆妳濠碘槅鍨伴悧濠冪┍婵犲洤鐭楀璺侯儏閳ь剚鍔欓弻锛勪沪閻ｅ睗銈夋煙妞嬪骸鈻堢€殿喖顭锋俊鐑筋敊閻熼澹曞┑掳鍊曢幊蹇涘箠濮樿埖鐓ユ繝闈涙－濡插綊鏌ｉ幘璺盒㈤柍瑙勫灴椤㈡瑩鎸婃径濠庢綋闂備線鈧偛鑻晶顖炴煟濡や焦绀嬮柛鈹垮灲楠炴鎷犻懠顒傛毎闁荤喐绮岄ˇ闈涱嚕閵婏妇顩烽悗锝庡亞閸欏棗鈹戦悙鏉戠仸闁挎碍銇勮箛濠冩珔闂囧绻濇繝鍌氭殧闁稿鍨介弻锛勪沪閸撗€濮囩紓浣虹帛缁诲牆鐣峰鈧、鏃堝礋閵婏箑顏梻浣筋嚙鐎涒晠顢欓弽顓炵獥闁哄稁鍘搁埀顒婄畵閺屻劎鈧絺鏅濈粻姘舵⒑瑜版帗锛熺紒鈧笟鈧幃鈥斥槈閵忥紕鍘遍柣蹇曞仦瀹曟ɑ绔熷Ο渚唵閻熸瑥瀚ù顔芥叏婵犲嫮甯涢柟宄版噺缁楃喖顢涘鍐ㄐ梻鍌欑閹碱偊鎮у鍫濈婵炲棙鎼紞鏍ㄧ節闂堟侗鍎忛幆鐔兼⒑鐎圭姵銆冮柣鎺為檮濞煎繘宕奸妷锔规嫼闂佸湱顭堢€涒晝绮堥埀顒勬⒑缁嬪尅宸ョ紓宥咃躬楠炲啴妾辩紒鐘崇洴楠炴瑩宕橀鍕毄闂備浇宕垫繛鈧紓鍌涜壘閳诲秹鏁愰崱妯荤彿闂佸搫娲㈤崹娲偂閺囥垺鐓涢柛鎰剁到娴滈箖姊洪悷鐗堝暈濠电偛锕ら锝囨嫚濞村顫嶅┑顔筋殔濡瑩宕撻棃娑辨富闁靛牆妫楃粭鎺撱亜閿旇鐏︾€规洘绮撳畷濂稿即閻斿弶瀚奸梻浣告啞缁诲倻鈧凹鍘奸敃銏ゅ箥椤斿墽锛滈柣搴秵閸嬪嫰鎮橀幘顔界厱闁崇懓鐏濋崝婊呪偓鍨緲鐎氫即鐛崶顒夋晢闁稿被鍊栭弫銈夋⒒閸屾瑨鍏岀紒顕呭灦瀹曟繂螣闂傚鍓ㄥ┑鐐叉閹尖晠寮繝鍥ㄧ厵闁绘垶蓱鐏忕數绱掗埦鈧崑鎾剁磽娴ｇ鈷斿褎顨夐幗顐㈩渻閵堝骸浜滈柨鏇ㄤ邯瀵鈽夐埗鈹惧亾閿曞倸绠ｆ繝闈涚墔閸栨牗绻濋悽闈涗粶婵☆偄閰ｅ畷纭呫亹閹虹偟绋忓┑鐘绘涧椤戞劙寮崱妤婄唵閻犺桨璀﹂崕鎴犵磼鐎ｂ晝鍔嶇紒缁樼箞閹粙妫冨☉妤冩崟婵犵妲呴崹浼存晝閵壯呯焿鐎广儱鎷嬮悡銉╂煕閹邦厼鍔ら柡鍛Т閳规垿鎮╃紒妯婚敪濠碘槅鍋勯惌鍌氼嚕閵婏妇顩烽悗锝庡亞閸樿棄鈹戦埥鍡楃仴妞ゆ泦鍛筏濠电姵纰嶉悡鍐喐濠婂牆绀堟繛鎴旀噰閳ь剨绠撳畷濂告晲鎼淬垺鐦為梻鍌氬€风粈浣圭珶婵犲洤纾诲〒姘ｅ亾鐎规洘娲熷濠氬Ψ閵壯冨箞闂備胶鎳撻顓熸叏妞嬪骸顥氬┑鍌氭啞閸婄敻鏌ㄥ┑鍡涱€楀ù婊€绮欓弻娑欐償濞戞ê濮﹂梺鍝勬湰缁嬫帡骞嗛弮鍫熸櫖闁告洦鍙庨崯瀣⒒娴ｇ瓔鍤冮柛鐘愁殜閵嗗啴宕ㄦ潏鍓х◤濠电娀娼ч鍡涘磻閸岀偛绠圭紒顔款潐椤庡棝鏌熸總澶婁喊婵﹦绮幏鍛存嚍閵夛絺鍋撻崘顏嗙＜闁逞屽墯缁楃喖鍩€椤掆偓閻ｇ兘顢涘┃鎯т壕婵炴垶顏伴幋锕€鐭楅煫鍥ㄧ⊕閻撳啰鎲稿鍫濈闁绘梻鍘ч拑鐔兼煛閸ャ儱鐏╅梺鍗炴处缁绘繈妫冨☉娆欑礊闂佸憡鏌ㄩˇ闈涱潖濞差亜浼犻柛鏇ㄥ墮濞呫倗绱撴笟鍥ф灍闁瑰憡鎮傞敐鐐剁疀閹句焦妞介、鏃堝礋椤撗勑ら梻鍌欑濠€杈╁垝椤栨粍鏆滃┑鐘插婵啿霉閻樺樊鍎愰柍閿嬪灴閺屾稑鈹戦崟顐㈠闁哄稄绻濆娲捶椤撶喎娈屽┑鐐茬湴閸婃繈骞冩ィ鍐╁€婚柤鎭掑劜濞呮粍绻濋姀锝嗙【闁挎洏鍊濋幊鎾诲垂椤旇鏂€闂佹寧绋戠€氼剚绂掕缁辨帡顢氶崨顓犱桓閻庢鍣崜鐔煎春閳ь剚銇勯幒鎴濐仾闁抽攱甯掗湁闁挎繂鐗婇鐘绘偨椤栨稓娲撮柡灞剧洴瀵噣鍩€椤掆偓鐓ら柡宥庡弾閺佸鏌ㄥ┑鍡╂Ц闂佸崬娲弻锟犲炊閿濆懍澹曞┑鐘灱閸╂牠宕濋弽顓炵９闁绘垼濮ら悡鐔兼煙鐎甸晲绱虫い蹇撴噽椤╃兘鏌涘┑鍡楊伌婵炴挸顭烽弻鏇㈠醇濠靛浂妫ゆ繝鈷€灞藉闁靛洤瀚版俊鎼佸Ψ閿旂粯顥ｉ梻浣哥枃椤曆呯矓閻㈠灚宕叉繝闈涱儏缁€瀣煏婵炲灝鍔欏瑙勬礋閺岋綁鎮㈤崫銉﹀櫑闁诲孩鍑归崢鍓у垝閸儱閱囬柕澶涘閸樺憡绻涙潏鍓ф偧闁烩剝妫冨畷闈涒枎閹扳晙绨婚梺鍝勬祩娴滅偟绮欓懡銈囩＜闁稿本绋戠粭褔鏌嶈閸撱劑骞€閵夆晛鐒垫い鎺戝绾惧鏌熼幑鎰靛殭闁告劏鍋撴俊鐐€栭幐楣冨磹閿濆惟闁冲搫鍊婚崢顏呯節閵忥絾纭炬俊顐ｇ懃閳诲秹宕ㄩ妤€浜炬繛鍫濈仢閺嬫瑩鏌涘Δ浣糕枙妤犵偛鍟灃闁告劏鏅涢弸鍌炴⒑閸涘﹥澶勯柛鎾寸洴钘濋柕澶嗘櫆閳锋垹绱撴担璇＄劷濠⒀屼邯閺屾洟宕奸姀鈺冨姼濡炪倖娲╃紞渚€銆侀弴銏℃櫇闁逞屽墰缁鈽夐姀锛勫幐婵犮垼娉涢敃锔界閵忋垻纾奸柟閭﹀幘閳藉銇勯鍕殻濠碘€崇埣瀹曞崬螣濞差亞鈧櫣绱撻崒娆戭槮妞ゆ垵妫涢弫顕€鎮欓崫鍕姦濡炪倖甯婇悞锕傛儍閹达附鐓曢柣妯哄暱婵鏌熼獮鍨仼闁宠鍨归埀顒婄秵閸嬪嫭绂掑ú顏呪拻闁稿本姘ㄦ晶娑氱磼鐎ｎ偄濮夐柛鎺撳笧閹瑰嫭绗熼娑樼槣闂備線娼ч悧鍡椢涘▎鎰窞闁告洦鍨遍悡鏇熺箾閸℃绠伴柡鍡樼懇閺岋綁鏁愰崶褍骞嬫繝娈垮枓閸嬫捇姊洪幐搴ｇ畵閻庢稈鏅犻崺銏沪閸欍儳绠氶梺闈涚墕濞层倕鏆╅梻浣侯焾椤戝棝鎯勯鐐叉瀬闁告劦鍠栨儫閻熸粌绻戠粙澶婎吋閸℃瑧顔曢梺鐟扮摠閻熴儵鎮橀埡鍛厱婵°倓绀侀埢鏇㈡煛瀹€瀣埌閾伙綁鏌涜箛鎾虫倯婵絽瀚板?
             String dataContent = first.toString().length() > 500 ? first.toString().substring(0, 500) : first.toString();
-            log.error("NewAPI data[0] 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐎涙繄绱撻崒姘毙㈤柨鏇ㄤ簻椤曪絿鎷犲顔兼倯婵犮垼娉涢敃锝囨閸洘鈷戦柛娑橈攻婢跺嫰鏌涢幘瀵告噧闁宠绉归弫鎰緞鐎Ｑ勫缂傚倷绀侀鍫ュ磿婵犳熬缍栭柨鏇炲€归悡鏇㈡煛閸愶絽浜鹃梺鎼炲妼閻忔繈顢氶敐鍡欑瘈婵﹩鍘藉▍鍥⒑闁偛鑻晶鏌ユ煟韫囨柨绗氱紒缁樼洴楠炴﹢寮堕幋婵囩槗闂備焦鎮堕崝鎴炵閸洏鈧線骞樼拠鎻掕€垮┑鐐村灦閻熴垽骞忓ú顏呪拺闁稿繗鍋愰妶鎾煛閸涱喚娲撮柕鍡楀€圭缓浠嬪川婵犲倵鍋撻悽鐢电＜婵°倓鑳堕埥澶嬬箾鐏炲倸鈧牠銆佹繝鍥ㄢ拻濞达絽鎲￠崯鐐寸箾鐠囇呯暤鐎规洖缍婇獮宥夘敊閸欍儳鐟濆┑鐘垫暩婵數鍠婂澶嬪亗闁哄洨鍠嶇换鍡涙煏閸繃鍣归柡鍡樼懃闇夐柣妯荤懃閸樻崘銇愰幒鎾充汗闂佸憡绻傜€氼亜效濡ゅ啰纾藉ù锝勭矙閸濇椽鏌熺粙娆剧吋妤犵偛绻樺畷銊╁级閹存粎鐐婇梻浣告啞濞叉﹢宕硅ぐ鎺戠；闁靛牆顦拑鐔哥箾閹寸偟鎳勯柛搴ｅ枛閺屻劌鈹戦崱姗嗘！濠殿噯绲介悧鎾诲箖濡も偓閳绘捇宕归鐣屼邯婵＄偑鍊ら崢楣冨礂濮椻偓閻涱噣宕橀纰辨綂闂侀潧绻掓慨鐢告倵閹惰姤鐓涘璺猴功婢ф垿鏌涢弬璺ㄐ㈤柍璇茬Ч瀵粙顢橀悢鍙夊濠电偠鎻紞鈧繛鍜冪秮婵″瓨绻濋崶銊у幈闂佽鍎抽顓犵不閻愮儤鐓忛柛鈩冾殔閺嗭絿鈧娲忛崝鎴濐嚕閸洖绠ｉ柣鎰閸欐垿姊婚崒娆掑厡缂侇噮鍨跺濠氬Ω閳轰浇袝闁诲函缍嗛崰妤呭磻閸岀偞鐓涢柛銉㈡櫅閺嬪秶绱掔拠鍙夘棡闁靛洤瀚板浠嬪Ω瑜忛濂告⒑閹肩偛鈧牠鎮烽敂鐐床婵炴垯鍨圭粻瑙勩亜閹捐泛浠﹂柣蹇撶Ч濮婃椽鏌呭☉姘ｆ晙闂佸憡鏌ㄧ粔鍫曞箲閵忕姭鏀介悗锝庝簽椤︺劑姊哄畷鍥ㄥ殌闁靛洦锕㈤幖瑙勬償椤厾绠氶梺闈涚墕濞层倕鏆╅梻浣侯焾椤戝洭宕戦妶澶婄畺鐟滄棃骞冮埡鍐╁珰闁肩⒈鍓涢弳顐ｇ節閻㈤潧浠滄俊顐ｇ懇楠炴劙宕妷褌绗夐梺姹囧灩閹诧繝鎮″▎鎾寸厽闁瑰浼濋鍫熷€块柣鎰靛墰缁犻箖鏌涜箛姘汗闁愁垱娲滅槐鎺旂磼濡偐鐤勯梺璇″枙缁瑥螞閸愵煁褰掓嚋閻㈠灚鍒涢梺鍝勭灱閸犲酣鎮鹃敓鐘茬骇闁圭瀛╅鎺楁煟鎼淬値娼愭繛鍙夌墪閻ｇ兘顢楅崟銊㈠亾閺冨牆绀冩い鏂挎閵娾晜鐓ラ柡鍐ㄦ处椤ュ鐥悙顒€鈻曟慨濠冩そ瀹曨偊宕熼鐘插Ы缂傚倷鑳剁划顖滄崲閸岀偞鍋╅柣鎴ｆ鎯熼梺鍐叉惈閿曘儵寮查敐澶嬧拺缂備焦锕╅悞楣冩倶韫囨梻鎳囩€规洏鍨虹粋鎺斺偓锝庡亞閸樹粙鏌熼崗鑲╂殬闁糕晛瀚板畷顖濈疀濞戞瑧鍘遍梺缁橆焾濞呮洜绮堥崼銉︾厱闁圭儤鎸哥粭鎺楁煃鐠囨煡鍙勬鐐达耿楠炲秵鎷呴梹鎰棜濠电偠鎻徊鑺ョ珶婵犲偆鐒介柕濞炬櫆閻撳啰鎲稿鍫濈闁绘棁鍋愬畵渚€鏌涢幇鈺佸Ψ闁哄閰ｉ弻鐔衡偓娑櫳戦悡銉ッ瑰鍫㈢暫闁哄矉缍佹慨鈧柕蹇婂墲濮ｅ嫰姊洪棃娑欘棞闁挎洦浜璇测槈濮橈絽浜鹃柨婵嗛娴滄繄鈧娲栭張顒勫Φ閸曨垰顫呴柍钘夋閻や線鎮楃憴鍕闁哥姵鐗犻妴渚€寮介鐔锋疅闂侀潧顦崕鐑樺閺嶎偆纾介柛灞捐壘閳ь剚鎮傚畷鎰板箹娴ｅ摜锛欓梺缁樺灱婵倝宕愰崸妤佺叆闁哄洨鍋涢埀顒€缍婂鎻掆攽鐎ｎ偆鍘撻柡澶屽仦婵粙顢欐径鎰厸閻庯綆鍋呴ˉ鍫ユ煛瀹€瀣瘈鐎规洘锕㈡俊姝岊槻妞ゃ倐鍋撻梻鍌欒兌缁垶骞愭ィ鍐ㄧ獥闁归偊鍘鹃埞宥呪攽閻樺弶鎼愰崶鎾⒑缁嬫寧婀伴柣顓у枟缁旂喖寮撮悢铏圭槇缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簼閸ｇ晫绱掗鐣屾噰妤犵偞顭囬幏鐘绘嚑椤掑孝闂傚倷绀佸﹢閬嶅磿閵堝绠伴柛鎾楀啫袣闂侀€炲苯澧存慨濠冩そ楠炴牠鎮欓幓鎺戭潙闂備礁鎲￠弻銊х矓閹绢喖鐓濈€广儱顦悙濠冦亜閹哄秷顔夐柟鐤缁辨挻鎷呴崜鎻掑壉闁诲海鐟抽崘鑳偓鍧楁煙濞堝灝鏋ょ痪鎯с偢閹鏁愭惔鈥茬盎闂佽绻戦幐鎶藉蓟濞戙垹鐓橀柟顖嗗倸顥氭繝纰夌磿閸嬫垿宕愰弽褜鍟呭┑鐘宠壘绾惧鏌熼崜褏甯涢柣鎾跺枛閻擃偊宕堕妸锔规嫻闂佹眹鍔嶉崹鍧楀蓟閻旇偐宓侀柛顭戝枤娴犲ジ姊虹€圭姵顥夋い锕€鐏氶幈銊╁焵椤掑嫭鐓熸俊顖涙た閸熷繘鏌涘顒佸殗婵﹦绮幏鍛存惞閻熸壆顐奸梻浣告啞濮婄懓煤閻旂厧绠栨俊顖欒濞尖晠鎮归悜妯汇仢婵☆偆鍏樺娲嚍閵夊喚浜棟妞ゆ劧绠戠紒鈺伱归悩宸剱闁绘挾鍠栭弻鐔兼焽閿曗偓閻忕娀鏌ｉ妸銉︽儓妞ゎ叀鍎婚ˇ宕囩磼鐎ｎ偄绗ч柟骞垮灩閳藉濮€閻樼數鍘┑鐘灱閸╂牜绮欓弽顓炵劦妞ゆ巻鍋撻柣蹇旂箞閸╃偤骞嬮敂鑺ユ珫闂佸憡娲﹂崜姘掗崼銉﹀€甸悷娆忓缁€鍫ユ煕閻樺磭澧甸柕鍡曠閳藉顫滈崱妯哄厞婵＄偑鍊栭幐鍡涘礋閸偓绱欓梻鍌氬€搁崐宄懊归崶褏鏆﹂柛顭戝亝閸欏繘鏌涢…鎴濅簽妞も晜褰冮湁闁绘ê妯婇崕蹇曠磼閳ь剚寰勯幇顒傤啇濠电儑缍嗛崜娆愪繆閼测晝纾奸柍褜鍓氬鍕偓锝冨妺缁ㄥ姊洪崫鍕犻柛鏂块叄婵℃挳骞掗弮鍌滐紲闂佹娊鏁崑鎾绘煕鐎ｎ偅灏电紒杈ㄦ尰閹峰懐绮欐惔鎾村瘱濠电姭鎷冮崟鍨暯閻熸粎澧楃划鎾愁潖閾忓湱鐭欐繛鍡樺劤閸撻亶姊洪悷鐗堝暈闁诡喖鍊块獮鍐┿偅閸愨晛鈧鏌﹀Ο渚Ш闁稿﹦鍋ゅ娲濞戣京鍙氱紓浣哄У閸ㄥ灝顕ｇ粙搴撴婵浜敍婵嬫⒑缁嬫寧婀伴柤褰掔畺閸┾偓妞ゆ帒瀚峰Λ鎴犵磼椤旇偐澧涚紒妤冨枛閸┾偓妞ゆ帒瀚粻姘扁偓鍏夊亾闁告洦鍋嗛敍婊冣攽閻愭潙鐏﹂柛鎴犳嚀鐓ら柟闂寸劍閳锋垿鎮归崶锝傚亾瀹曞洣鍖栧┑鐘媰閸曞灚鐤侀柦妯煎枛閺屾洟宕煎┑鎰ч梺鎶芥敱鐢帡濡撮幒鎴僵闁挎繂鎳嶆竟鏇熺節閻㈤潧浠╁鐟扮墕閻ｇ兘妫冨☉鍗炴婵犵數濮村ú锕傚磹闁垮浜滈柟杈剧稻绾墎绱掗悩铏殤缂?] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛? {}, 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬悧鍫㈠幘缂佺偓婢樺畷顒佹櫠缂佹ü绻嗛柤纰卞墮閸樺瓨鎱ㄦ繝鍕笡闁瑰嘲鎳樺畷銊︾節閸愩劌澹嶅┑鐘垫暩閸嬫盯鎯囨导鏉戝瀭闁芥ê顦遍弳锔炬喐閻楀牆绗掗柟纭呭煐閵囧嫰骞樼捄鐩掞紕绱掑Δ鈧ˇ闈涱潖閾忓湱纾兼慨妤€妫涢崝绋款渻閵堝棙鑲犻柛娑卞灟缁楀鎮峰鍛暭閻㈩垱顨婇幃鈥斥枎閹寸姵锛忛梺鍝勵槸閻忔繈鎳滅憴鍕垫闁绘劘鎻懓鍧楁煛鐏炲墽鈽夐摶锝夋煠婵劕鈧牠宕氬☉銏♀拺? {}", firstFieldNames, dataContent);
+            log.error("NewAPI data[0] 缺少字段, 字段={}, 内容={}", firstFieldNames, dataContent);
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸婚悷褎绔熼弴銏╂晣闁靛繆鏅滈弲鈺呮⒑绾懏褰ч梻鍕閸╂盯骞掗幊銊ョ秺閺佹劙宕熼鍛Τ闂備胶绮敮鐐哄磻閹捐桅闁告洦鍨扮粻锝嗙節闂堟稒顥炴繛鍫濐煼閹鎲撮崟顒傤槰缂備浇顕ч悧鎾绘偘椤旈敮鍋撻敐搴℃灍闁哄懏绻堥弻宥堫檨闁告挾鍠栭獮蹇涘箣閿旇棄浜滈梺绋跨箺閸嬫劙宕ｉ崱妞绘斀闁绘绮☉褎淇婇顐㈠箹閸楅亶鏌涘┑鍕姢缁炬儳鍚嬮妵鍕箛閳轰胶浼勯柡浣哥墦濮婃椽宕崟顒佹嫳缂備礁顑嗛幐鑽ょ矉閹烘鏅滈柣鎰靛墮閻濇澘鈹戦悙瀛樼稇妞ゆ垵鎳忕粋宥夋倷椤戣法绠氶梺闈涚墕閹冲繘宕抽崷顓犵＜闁逞屽墯瀵板嫰骞囬鐘插箥闂傚倸鍊搁崐鎼侇敋椤撱垹绀夌€广儱顦伴悡鍐⒑閸噮鍎忛柣蹇旀尦閺岀喖顢欓懖鈺冃ㄩ悗瑙勬礀閻栧ジ銆侀弮鍫濈妞ゆ挾鍣ラ崵鍕磽閸屾艾鈧兘鎳楅懜鍨弿闂佸灝顑嗗▍鐘充繆閵堝懎鏆炵€规洖寮剁换娑㈠箣閻戝洣绶甸梺鍝ュ枎閹冲繘濡甸崟顖氱睄闁稿本鑹炬禒妯肩磽娓氬洤浜滅紒澶婄秺楠炲啫螖閳ь剟鍩㈤幘璇插瀭妞ゆ梻鏅禒灞句繆閻愵亜鈧牕鈻旈敃鍌氱倞鐟滃繘宕ｉ埀顒€鈹戦悩顔肩伇婵炲绋栭惂宀勬⒑缂佹ɑ鐓ラ柛姘儔閹繝濡烽埡鍌氣偓鐢告煥濠靛棝顎楀ù婊勭箖缁绘繈濮€閳ュ磭浼屽┑顔硷工椤嘲鐣烽幒鎴旀瀻闁圭儤鍨电敮顖滅磽娴ｉ缚妾搁柛妯恒偢閹儵鎮℃惔锝嗘濠电姴锕ら崯鐘诲绩娴犲鍊甸柨婵嗘噽娴犳盯鏌￠崨顔剧煉婵﹨娅ｇ槐鎺懳熼搹閫涚礃婵犵妲呴崑鍕偓姘嵆閺佹劙鎮欓崫鍕獩闁诲孩绋掗…鍥储椤忓牊顥婃い鎰╁灪閹兼劖銇勯幋婵囧殗闁诡喗锕㈤、姘跺焵椤掑嫬钃熼柕濞垮劗濡插牊绻涢崱妯虹仼闁绘挸顦埞鎴︻敊绾攱鏁惧┑锛勫仩濡嫯鐏嬮梺鍛婂姂閸斿危閸儱绾ч柛顐ｇ濞呭懎鈹戦绗哄仮婵﹦绮幏鍛瑹椤栨粌濮兼繝娈垮枟閿曨偊姊介崟顓犵焿鐎广儱顦介弫鍡涙煕閺囥劌澧柛鎿勭畱椤啴濡堕崨顖滎唶濠电偞娼欓崐绋垮祫闂佸憡鎸嗛崨顖ょ闯濠电偠鎻徊鑲╁垝濞嗘挸浼犳繛宸簼閸嬨劍銇勯弽銊х煀濞寸娀浜堕弻娑㈠煘閹傚濠碉紕鍋戦崐鏍暜閹烘鏅濋柨鏂垮⒔閻捇姊婚崼鐔烩偓浠嬫偡闁妇鍙嗛梺绯曞墲椤洭濡撮幇鐗堢叄濞村吋鐟х粔顕€鏌＄仦鐣屝ユい褌绶氶弻娑㈠箻鐎靛憡鍣伴梺鐐藉劜濡啫鐣峰鈧、娆撳床婢诡垰娲﹂悡鏇㈡煙閹佃櫕娅呭┑鈥崇仢闇夐柣妯垮吹閻ｇ儤鎱ㄦ繝鍐┿仢妤犵偞鍔栭幆鏃堝椤喚鍠橀梻鍌欑劍閹爼宕濈€ｎ剙鍨濇繛鍡樻尰閸嬫ɑ銇勯弴妤€浜鹃悗瑙勬礃閿曘垽銆佸▎鎴濇瀳閺夊牄鍔庣粔閬嶆⒒閸屾瑧绐旀繛浣冲懏宕查柛顐犲劚閸ㄥ倸鈹戦悩宕囶暡闁稿鍊块弻鐔煎礈瑜忕敮娑㈡煟閹捐泛鏋涢柡宀嬬到铻ｉ柛婵嗗缁楊參姊洪悡搴☆棌濞存粠浜璇测槈閵忕姵顥濋柣鐘充航閸斿酣宕濋鐐寸參婵☆垵宕电粻鐐烘煛鐏炵晫效鐎规洦鍋婂畷鐔碱敆閳ь剙鈻嶉妶澶嬧拺闁规儼濮ら弫閬嶆偨椤栥倗绡€鐎殿喛顕ч埥澶婎潩椤愶絽濯伴梻浣告啞閹稿棝宕熼锝囧讲闂傚倸鍊烽懗鍫曗€﹂崼銏″床闁规壆澧楅崕妤呮煕瀹€鈧崑娑㈡嫅閻斿吋鐓熼柡鍌氱仢閹垿鏌熼婊冧沪闁靛洤瀚伴獮鍥礈娴ｇ鐓傜紓浣稿⒔閸嬫挻绻涙繝鍌ゆ綎闁惧繗顫夌€氭岸鏌嶉妷銊︾彧闁诲繐绉瑰娲箰鎼达綆鏆￠梺闈涙搐鐎氫即銆侀弴銏℃櫜闁搞儮鏅濋弳顓㈡⒒娴ｅ憡璐￠柟铏尵閳ь剚鐭崡鎶界嵁閺嶎兙浜归柟鐑樻尭閸擃剟姊洪崨濠勭細闁稿酣浜堕獮鍡涙倷閻戞ǚ鎷婚梺绋挎湰閼归箖鍩€椤掆偓閸㈡煡婀侀梺鎼炲労閸撱劎绱為弽褜鐔嗛柤鎼佹涧婵洨鐥幆褎鍋ラ柡宀嬬秮楠炴﹢宕樺顔兼暔婵犵數鍋為崹顖炲垂閸︻厾鐭嗛悗锝庡亖娴滄粓鏌″鍐ㄥ濠㈣顭囬埀顒侇問閸犳岸宕楀Ο渚綎婵炲樊浜濋ˉ鍫熺箾閹存繄锛嶇痪顓涘亾闂傚倷绶氶埀顒傚仜閼活垱鏅剁€电硶鍋撶憴鍕闁搞劌娼￠悰顔嘉熼崗鐓庣彴闂佽偐鈷堥崜锕€危椤栨埃鏀介柣姗嗗枛閻忚鲸绻涙径瀣创闁轰礁鍟撮弫鎰板幢濞嗘垵楠勯梻浣告惈濞层垽宕瑰ú顏勭厱闁圭儤鍤氳ぐ鎺撴櫜闁告侗鍠栭弳鍫ユ⒑閸濄儱鏋旈柛瀣仧閹广垹鈽夊顓炵彴閻熸粌绻橀幃楣冩偨绾版ê浜鹃悷娆忓缁€鍐煕閵娿儳浠㈤柣锝囧厴瀹曪繝鎮欓埡鍌ゆ綌婵犵妲呴崹鎶藉Υ鐎ｎ剚顫曟い鏇楀亾婵﹦绮幏鍛存惞閻熸壆顐奸梻浣告啞濮婂綊銆冩繝鍌滄殾闁哄洢鍨瑰洿婵犮垼娉涢敃锕傚储闁秵鈷戠痪顓炴噺瑜把囨⒒閸曨偄顏柟顕嗙節瀵挳鎮㈤搹璇″晭闂備胶鎳撻顓㈠磿閹达箑绀傛い鎺戝閻撴盯鏌嶈閸撴氨鎹㈠┑鍡╂僵妞ゆ挾鍋愰崑鎾绘偨閸涘﹦鍘卞銈庡幗閸ㄥ灚绂嶉悙鐑樼厵闁告劕寮堕崰姗€鏌″畝瀣？濞寸媴绠撳畷婊嗩槼闁告帗绋戣灃闁绘﹢娼ф禒婊勭箾瀹割喖寮柕鍡曠閳诲酣骞樼划瑙勫闂備礁鎼ˇ浼村春閸惊娑橆煥閸愶絾鏂€闂佺粯蓱閸撴岸宕箛娑欑厱闁挎繂楠搁悘锝団偓鍨緲閿曘儳绮嬮幒鏂哄亾閿濆骸浜滃ù婊堜憾濮婃椽宕烽鐐板闂佸憡鎸婚懝楣冣€﹂崶顒€鍐€妞ゆ劑鍊楅敍婵囩箾鏉堝墽绉柛瀣€块獮瀣倷閹绘帞浜栭梻浣告贡閾忓酣宕板Δ鍛亗闁绘绮悡娆愩亜閹捐泛鏋庣紒妤佸浮閺屾盯寮埀顒勬晝閵忋倕钃熺€广儱鐗滃銊╂⒑閸涘﹥灏伴柣鐔叉櫅閻ｇ兘顢涢悙鑼啋濡炪倖妫佹竟鍫ュ箺閺囥垺鈷戦梻鍫熺〒婢ф洘绻涢懠顒€鈻堢€规洘鍨块獮妯兼嫚閸欏绁舵俊鐐€栭幐楣冨磹椤愶箑顫呴柕鍫濇閸樹粙姊洪崷顓炰壕婵炲吋鐟﹂幈銊ヮ吋婢跺鍘搁悗鍏夊亾閻庯綆鍓涢惁鍫ユ倵鐟欏嫭纾搁柛鏃€鍨块獮鍐樄鐎规洖銈搁敐鐐侯敄閽樺澹曢梺瑙勫婢ф鎮￠敐鍥╃＝濞达綀顕栭悞钘夘熆瑜忛弫濠氬蓟閿涘嫪娌柣锝呯潡閵夛负浜滅憸宀€娆㈠璺鸿摕婵炴垯鍨圭粻濠氭偣閾忕懓鍔嬮柣蹇撶墕铻栭柣姗€娼ф禒婊堟煕閻曚礁鐏﹀┑鈥崇埣閺佹劖寰勬繝鍕垫О闂備線娼ч…鍫ュ磿閹惰棄鐒垫い鎺戭槸楠炴牗銇勯鍕殻濠碘€崇埣瀹曞崬螖閳ь剝銆栫紓鍌氬€峰ù鍥ь嚕閹捐泛鍨濇繛鍡樻尪閳ь兛绶氶獮妯兼嫚閼碱剦鍟嬬紓鍌氬€烽悞锕傗€﹂崶顒€鍌ㄥù鐘差儐閳锋垹绱撴担濮戭亝鎱ㄩ崶銊ｄ簻闁哄洢鍔屽顕€鏌涢埞鍨伈妤犵偞顭囩槐鎺懳熼悡搴＄瑲闂佽崵鍠愮划宥囧垝閹惧磭鏆︽繝濠傚暊閺嬪酣鏌熼幆褍鏆遍柛瀣Ч濮婃椽宕崟顓夌娀鏌涢弬鍧楀弰闁诡喚鏁诲畷濂稿即閻斿搫骞愰梻浣规偠閸庮噣寮插☉娆戭洸鐟滅増甯楅悡娑㈡煃瑜滈崜姘辩矉閹烘柡鍋撻敐搴′簽闁告ü绮欏楦裤亹閹烘垳鍠婇梺鍛婎焽閺咁偆妲愰悙鍝勭闁挎梻鏅崢浠嬫椤愩垺鍌ㄩ柛搴㈠▕閹箖鎮介崨濠勫幐閻庡厜鍋撻悗锝庡墰琚﹂梻浣筋嚃閸犳捇宕愰弽顓炵闁告稒娼欐导鐘绘煏婢跺牆鈧洟骞楃€ｎ喗鈷掗柛灞剧懅椤︼妇鐥紒銏犲箻闁告帗甯￠、娑㈡倷閼碱剦鍞归梻浣规偠閸庢粎浠﹂懞銉悪闂傚倷绀佸﹢閬嶆惞鎼淬劌绐楁俊銈呮噹绾惧鏌涢弴銊ュ箻缁惧彞绮欓弻娑㈩敃閻樿尙浠奸柛鐔告倐濮婃椽鎮滈埡鍌涚彅闂備礁搴滅徊浠嬶綖韫囨洜纾兼俊顖濐嚙椤庢捇姊洪崨濠勨槈闁挎洏鍎靛畷鏇㈠箻缂佹ǚ鎷虹紓浣割儏鐏忓懏螞濮橆厺绻嗘い鎰╁灩椤忣參鏌涢埞鍨伈鐎殿噮鍣ｅ畷鐓庘攽閸℃銈梻鍌欑窔濞佳呮崲閸℃稑鐒垫い鎺嶇劍閻忛亶鏌涚€ｎ偅宕岀€规洜顭堣灃濞达絽鎼獮宥夋⒒閸屾艾鈧悂宕愰幖渚囨晪妞ゆ挶鍨圭粈澶屸偓骞垮劚椤︿即鎮￠悢鍏肩厵闁诡垎灞芥闂佸疇妫勯ˇ闈浳涙担鐟扮窞闁归偊鍘鹃崣鍡椻攽閻樼粯娑ф俊顐ｇ懇瀹曞啿煤椤忓懐鍘甸梺鍛婄懃椤︿即宕愰幇鐗堢厵闁惧浚鍋嗘晶鐢碘偓娈垮枙缁瑩銆佸鈧幃銏ゅ矗婢跺浼栭梻鍌氬€搁崐椋庢閿熺姴纾婚柛鈩冪☉绾剧粯绻涢幋娆忕仾闁搞倖鍔栭妵鍕冀閵娧€濮囧┑鐐叉噽婵炩偓闁哄本绋戦埢搴ょ疀閿濆柊銈嗙箾鐎涙鐭嬬紒顔肩Ч婵＄敻宕熼姘辩杸闂佸疇妗ㄩ懗鍫曞礉閺夋垟鏀介梽鍥╀焊濞嗘挸绠犻柟鍓ф嚀缁插綊姊绘担瑙勫仩闁稿孩绮岄濂稿川椤撗勬祮闂傚倸鍊烽懗鍫曞储瑜旈獮鏍敃閵忋垺娈惧銈嗗笒鐎氼參宕戦埡鍛厓闁靛绠戞晶顖涚箾?] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬悧鍫㈠幈闂佸綊鍋婇崹鎵閿斿墽纾介柛鎰ㄦ櫆缁€瀣叏婵犲嫮甯涢柟宄版嚇瀹曘劍绻濋崘銊ュ濠电姷鏁搁崑娑㈡儑娴兼潙鍨傞柦妯侯槺閺嗭妇鎲搁悧鍫濈瑨闁圭鍩栭妵鍕箻鐠虹洅锛勭磼濡も偓椤﹂潧顫忛搹鍦＜婵妫涢崝绋款渻閵堝棙鑲犻柛娑卞灟缁楀鏌ｉ悢鍝ユ噧閻庢凹鍠氱划缁樸偅閸愨晝鍙嗗┑鐘绘涧濡繈顢撳Δ鈧…鑳檨闁哥姵鐗犻崺鐐哄箣閿旂瓔鈧劙姊虹粙娆惧剱闁告梹顨呭嵄闁圭増婢樼粻铏繆閵堝嫮顦﹀ù婊冪秺濮婃椽宕ㄦ繝鍌氼潔閻熸粍婢橀崯鎾嵁濡ゅ懏鍋ㄩ柛娑樑堥幏娲⒑閸涘﹦绠撻悗姘煎幖閿曘垺瀵肩€涙鍘介梺鍐叉惈閿曘倝鎮橀敃鍌涚厪闁糕剝娲滅粣鏃傗偓娈垮枟閹歌櫕鎱ㄩ埀顒勬煃閵夈儱甯犵紒銊ㄥ吹缁辨捇宕掑▎鎴М濡炪倖鍨靛Λ娑㈠焵椤掑倻鎳楅柛銉ｅ妼娴犙勭箾鐎电甯堕柣掳鍔戦崺娑㈠箳閹炽劌缍婇弫鎰板礋椤曞懎濡抽梻浣虹帛鐢偤宕戦幘璇参﹂柛鏇ㄥ灠缁狅絾绻濋棃娑欑ォ婵☆偓绠戣灃闁绘﹢娼ф禒锕傛煕閺冣偓閻熲晠鎮伴鈧浠嬪Ω閿曗偓椤庢捇姊洪崨濠勭細闁稿骸宕锝夊Ω閵夈垺鏂€闂佺粯锕╅崰鏍倶鏉堛劎绠惧璺侯儑椤厧顭胯缁诲牆顫忓ú顏勪紶闁告洟娼ч崜浼存煟鎼淬垻鈻撻柡鍛矌缁碍娼忛妸褏鐦堥梺鎼炲劥閸╂牠寮查鈧埞鎴︽偐缂佹ɑ閿┑鈽嗗亝椤ㄥ﹪鐛崱娑欏€烽柣鎴炃氶幏娲⒑閸涘﹦绠撻悗姘煎弮閺佸秹寮崼鐔叉嫽闂佸憡娲﹂崑鍕敂椤忓棛纾? " + firstFieldNames);
+                "NewAPI data[0] 缺少字段:" + firstFieldNames);
         } catch (Exception e) {
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI generateImage failed: {}", e.getMessage());
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸婚悷褎绔熼弴銏╂晣闁靛繆鏅滈弲鈺呮⒑绾懏褰ч梻鍕閸╂盯骞掗幊銊ョ秺閺佹劙宕熼鍛Τ闂備胶绮敮鐐哄磻閹捐桅闁告洦鍨扮粻锝嗙節闂堟稒顥炴繛鍫濐煼閹鎲撮崟顒傤槰缂備浇顕ч悧鎾绘偘椤旈敮鍋撻敐搴℃灍闁哄懏绻堥弻宥堫檨闁告挾鍠栭獮蹇涘箣閿旇棄浜滈梺绋跨箺閸嬫劙宕ｉ崱妞绘斀闁绘绮☉褎淇婇顐㈠箹閸楅亶鏌涘┑鍕姢缁炬儳鍚嬮妵鍕箛閳轰胶浼勯柡浣哥墦濮婃椽宕崟顒佹嫳缂備礁顑嗛幐鑽ょ矉閹烘鏅滈柣鎰靛墮閻濇澘鈹戦悙瀛樼稇妞ゆ垵鎳忕粋宥夋倷椤戣法绠氶梺闈涚墕閹冲繘宕抽崷顓犵＜闁逞屽墯瀵板嫰骞囬鐘插箥闂傚倸鍊搁崐鎼侇敋椤撱垹绀夌€广儱顦伴悡鍐⒑閸噮鍎忛柣蹇旀尦閺岀喖顢欓懖鈺冃ㄩ悗瑙勬礀閻栧ジ銆侀弮鍫濈妞ゆ挾鍣ラ崵鍕磽閸屾艾鈧兘鎳楅懜鍨弿闂佸灝顑嗗▍鐘充繆閵堝懎鏆炵€规洖寮剁换娑㈠箣閻愮數鍙濆┑鐐茬焾娴滎亪寮诲☉姘勃闁诡垎鍛Р闂備胶顭堥鍡涘箰閹间礁鐓橀柟瀵稿Л閸嬫捇鏁愭惔婵堟晼婵炲鍘ч澶婎潖濞差亜绠伴幖娣灮椤︺儵姊虹粙鍖℃敾闁诡喖鍊垮濠氬Ω閳轰絼褔鏌涢埄鍐╃缂佺姵宀稿娲濞戞艾顣洪梺绋匡工閹诧紕绮嬪澶婄鐟滃繒澹曢挊澹濆綊鏁愰崨顔藉創闁哄稄绻濋幃妤呭礂婢跺﹣澹曢梻浣哥秺濡法绮堟笟鈧幏鎴︽偄閸忚偐鍘介梺鍝勫€藉▔鏇炩枔闁秵鐓涢悗锝庡亝椤ュ牓鏌＄仦鍓ф创闁炽儻绠撻獮瀣攽閸モ晙鎲鹃梻鍌欐祰椤曆呮崲閹达箑绠伴柛鎾楀嫷娼熼梺瑙勫礃椤曆呭閸忓吋鍙忔俊顖氭惈閼稿綊鏌嶉鍕粵缂佺粯绋撻埀顒佺⊕椤洭鎯屾繝鍥ㄧ厽闁哄稁鍋勭敮鑸点亜? " + e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 调用失败:" + e.getMessage());
         }
     }
 
@@ -546,15 +881,16 @@ public class NewApiClient {
         }
 
         // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇洜绱撻崒姘偓鐑芥倿閿曚焦鎳屾繝鐢靛仜閹冲酣鎮ч幘鎰佹綎缂備焦蓱婵挳鏌涘☉姗堝伐闁哄棗鐗婄换娑㈠箻鐎靛壊鏆″銈冨妼閿曘倝鎮鹃悿顖樹汗闁圭儤绻冮弲婊堟⒑閸撴彃浜濈紒璇插閺佸秴鈽夐姀鈾€鎷洪梺闈╁瘜閸樺吋绂嶆ィ鍐╃厱闁瑰墽顥愭竟妯汇亜椤撶偞鍠橀柛鈺嬬節瀹曘劑顢欓幆褍绠洪梻鍌欑濠€閬嶅磻閹惧绠惧┑鐘叉祩閺佷焦淇婇妶鍕濞存粍绮嶉妵鍕箛闂堟稐绨绘繛瀛樼矌閸嬬喓妲?multipart 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞堟俊鐐€ら崢浠嬪垂閸偆顩叉繝闈涱儐閻撴洘绻涢崱妤冪缂佺姴顭烽弻锛勪沪缁嬪灝鈷夐悗鍨緲鐎氼噣鍩€椤掑﹦绉靛ù婊勭箞椤㈡瑩宕ㄩ娑欐杸闂佺粯鍔曞鍫曞煝閺囩伝鐟邦煥閸愵亜鐓熼悗娈垮櫘閸嬪﹤鐣烽崼鏇ㄦ晢濞达絽鎼敮楣冩⒒婵犲骸浜滄繛璇х畱鐓ら柡宓嫭鐦庨梻鍌氬€风粈渚€骞夐敍鍕床闁告劦鍠撻埀顒€鍟换婵嬪磼閵堝棛绋佺紓鍌氬€烽悞锕傗€﹂崶顒佸仭鐟滅増甯楅悡鏇㈡煏婢跺鐏ラ柛鐘宠壘椤洭鎳￠妶鍥╋紳闂佺鏈悷褔藝閿斿浜滈柨鏇炲€烽幉鍓р偓娈垮櫘閸嬪棝骞忛悩缁樺殤妞ゆ帊鐒﹂鏇㈡⒒娴ｅ憡鎯堟繛灞傚灲瀹曞綊宕烽鐘辩瑝闂佹寧绻傞ˇ浼存偂閵夆晜鐓涢柛鎰╁妼閳ь剛鎳撻埢宥夊即閵忥紕鍘卞┑鈽嗗灡鐎笛囁夋径鎰厓閻熸瑥瀚悘锔筋殽閻愯韬柡灞剧⊕缁绘繈宕橀妸銉綒闁诲氦顫夊ú姗€宕归崸妤冨祦婵☆垵鍋愮壕鍏间繆椤栨粌甯舵鐐搭殕缁绘繂顕ラ柨瀣凡闁逞屽墯閸旀瑥鐣烽幋锕€绠荤紓浣诡焽閸欏棝姊洪崫鍕闁挎岸鏌涢弮鎾愁洭闁?
-        MultipartBodyBuilder bodyBuilder = new MultipartBodyBuilder();
+        // 2026-08-13 FIX: WebClient multipart -> RestTemplate multipart (avoid chunked encoding issue)
+        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
 
         // 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄闁挎繂妫Λ鍕⒑閸濆嫷鍎庣紒鑸靛哺瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈嗙箾绾绡€鐎殿喖顭烽幃銏㈡偘閳ュ厖澹曢梺姹囧灪椤旀牠鎮炴ィ鍐ㄧ柈闁告縿鍎崇壕钘壝归敐鍡楃祷濞存粎鍋撶换婵嬫偨闂堟刀銏＄箾鐠囇呯暤闁诡噯绻濆畷姗€顢旈崨顓熺€炬繝鐢靛Т閿曘倝鎮ч崱娆戠焼闁割偆鍠愰崣蹇斾繆椤栨稑顕滅痪顓熷劤椤╁ジ宕ㄧ€涙ǚ鎷洪梺鍛婄☉閿曘儲寰勯崟顖涚厱闁靛鍊曞畵鍡欌偓瑙勬穿缁绘繈鐛惔銊﹀殟闁靛／鍐ㄧ疄闂傚倷鐒﹂弸濂稿疾濞戙垹绐楁慨姗嗗厴閺嬫棃鏌￠崘锝呬壕闂侀潧娲ょ€氼垳绮诲☉銏℃櫜闁告洦鍨版禒鎰版⒒娴ｅ憡鎯堥柡鍫墰缁瑩骞嬮敃鈧悡婵嬪箹濞ｎ剙鈧鎮块埀顒勬⒑閸濆嫭宸濆┑顖ｅ弮瀹曨垳鈧綆鍠楅埛鎺懨归敐鍛暈闁诡垰鐗撻弻锝夘敇閻戝棙楔缂備浇浜崑鐐电箔閻旂厧鐒垫い鎺戝閸嬫ɑ銇勯弴妤€浜鹃悗瑙勬礀閻栧ジ銆佸Δ浣哥窞閻庯綆鍋呴悵婊勭節閻㈤潧浠╅柟娲讳簽瀵板﹪宕稿Δ鈧粻鐘绘煙閹规劦鍤欑紒鈧崼銉︾厱妞ゎ厽鍨垫禍鐐电磼閳锯偓閸嬫挾绱撴担绋库挃濠⒀勵殙閹筋偄顪冮妶搴′簻闁挎洦浜璇测槈濮橈絽浜鹃柨婵嗙凹缁ㄥジ鏌涢妶鍛枠闁哄备鍓濋幏鍛矙閹稿孩顔掑┑鐘愁問閸犳帡宕戦幘缁樷拺闂傚牊绋撴晶鏇㈡煙閾忣偅宕屾鐐搭殜瀵挳鎮欓埡鍌涙澑闂備胶绮崝鏍ь焽濞嗘挻鍊堕柣鏂垮悑閻撴洟鏌曟繛褍瀚▓宀勬⒑鏉炴壆璐伴柛锝忕到椤繒绱掑Ο璇差€撻梺鑽ゅ枛閸嬪﹪宕电€ｎ剛纾藉ù锝囩摂閸ゆ瑩鏌涙繝鍌涘仴闁绘侗鍠楃换婵嬪礃閳轰礁濡抽梻渚€娼ц墝闁瑰啿娲畷鎴﹀箻鐠囨彃鍞ㄩ梺闈涱焾閸庡磭绮ｉ悙鐑樷拺鐟滅増甯掓禍浼存煕濡粯鍊愭鐐茬箰鐓ゆい蹇撴噳閹锋椽姊婚崒姘卞闁哄懏鐩幆浣割煥閸喓鍘卞┑鈽嗗灡娴滀粙宕戦姀鈶╁亾鐟欏嫭纾搁柛銊ㄦ椤曪綁宕奸弴鐐电枃闂侀潧臎閸曨偅鐣俊鐐€ら崢褰掑礉閹存繄鏆︽慨妞诲亾妞ゃ垺妫冨畷鐔碱敇閻愯尙顔戦梻鍌欐祰椤曆呪偓娑掓櫊椤㈡瑩寮介鐐电崶濠电偞鍨崺鍕极鐎ｎ剚鍠愰柡鍐ㄧ墕閺勩儵鏌曟径娑氱暠缂佸墎鍋涢埞鎴︽倷椤忓嫮浼勯梺鍝ュУ閻楃姴顕ｆ繝姘╃憸澶愬磻閹剧粯鏅查幖绮光偓鍐茬闂備胶顭堥鍡涘箰閼姐倖宕叉繝闈涙－濞尖晜銇勯幘妤€瀚峰Λ鍛攽閿涘嫬浜奸柛濠冪墵瀹曟繈骞嬮敃鈧崹鍌炴煟閹寸伝顏嗘閻愮儤鐓曢柡鍥ュ妼閻忥繝鏌ｉ幘瀵告噰闁哄本绋戦埥澶婎潨閸喐鏆伴梺璇茬箰妤犲繑淇婇崶顒€鐒垫い鎺戝枤濞兼劖绻涢崣澶涜€跨€规洖缍婂畷绋课旈崘銊с偊婵犳鍠楅妵娑㈠磻閹剧粯鐓熸繛鎴濆船閺嬬喓鈧灚婢樼€氭澘鐣烽妸锔剧瘈闁告洦鍓涚粙渚€姊婚崒姘偓鎼佸磹妞嬪海鐭嗗ù锝夋交閼板潡姊洪鈧粔瀵稿閸ф鐓忛柛顐ｇ箥濡叉悂鏌涢妸銉モ偓鍧楀蓟閵堝洨鐭欓悹鎭掑妺缁數绱?
-        bodyBuilder.part("model", "gpt-image-2-2k");
-        bodyBuilder.part("prompt", prompt);
-        bodyBuilder.part("size", size != null ? size : "1024x1024");
-        if (quality != null) bodyBuilder.part("quality", quality);
-        if (style != null) bodyBuilder.part("style", style);
-        bodyBuilder.part("response_format", "b64_json");
+        body.add("model", "gpt-image-2-2k");
+        body.add("prompt", prompt);
+        body.add("size", size != null ? size : "1024x1024");
+        if (quality != null) body.add("quality", quality);
+        if (style != null) body.add("style", style);
+        body.add("response_format", "b64_json");
 
         // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞楅梻渚€娼х换鍫ュ春閸曨垱鍊块柛鎾楀懐锛滈梺褰掑亰閸欏骸鈻撳鍫熺厸鐎光偓閳ь剟宕伴弽顓犲祦鐎广儱顦介弫濠勭棯閹峰矂鍝烘慨锝咁樀濮婄粯鎷呮笟顖滃姼濡炪倖鍨堕崹褰掑箲閵忕姭鏀介柛鈾€鏅涘▓銊╂⒑閸撴彃浜濇繛鍙夌墵閺屽宕堕妸锕€寮垮┑顔筋殔濡鐛Δ鍛厽婵犻潧娲﹂埛鎺旂磼鏉堛劍灏伴柟宄版嚇閹墽浠﹂悾灞筋潽闂傚倷鑳堕…鍫ユ晝閵壯勫床闁割偅绻嶉崵鏇㈡偣閸ャ劎銈存俊鎻掔墛缁绘繃绻濋崒姘煎妷婵繂娲ら埞鎴︽晬閸曨偂鏉梺绋匡攻閸ㄥ灝鐣峰┑鍫滄勃閺夌偞瀵х粙鎴﹀煘閹达箑骞㈡繛鍡樺姈椤?base64 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊炲銈嗗笒椤︿即寮查鍫熷仭婵犲﹤鍟扮粻濠氭煕閳规儳浜炬俊鐐€栫敮濠囨嚄閸洖鐓濋柟鍓х帛閻撴盯鏌涘☉鍗炵仩闁宠鐗撻弻鏇㈠幢閺囩媭妲梺瀹狀嚙闁帮綁鐛鈧畷姗€骞撻幒鎾存婵犵绱曢崑鎴﹀磹閺嶎厼绠板Δ锝呭暙绾惧鏌ｉ弬鍨倯闁稿锕㈤弻鏇熷緞閸繂濮夐梺琛″亾濞寸姴顑呯粻鎶芥煙閹増顥夌痪鎯х秺閺岀喖鎮ч崼鐔哄嚒缂佺偓鍎抽…鐑藉蓟閻旂厧绀堢憸蹇曟暜濞戙垺鐓曢悗锝庝簻閳ь剙娼″濠氬即閵忕娀鍞跺┑鐘绘涧濞村倸螞閵堝洨纾藉ù锝呭级椤庡棝鏌涚€ｎ偅灏柍瑙勫灴閹晠宕归锝嗙槑濠电姵顔栭崰妤呭箰閸愯尙鏆﹂柟閭﹀枤绾惧吋淇婇婊呭笡闁绘繄鍏樺娲传閸曨剙鍋嶉梺鎼炲妽濡炰粙骞冮垾鏂ユ闁靛繆鈧枼鍋撻悽鍛婄叆婵犻潧妫楅埀顒傛嚀閳诲秹宕堕埡鍐紲闂佸綊鍋婇崢浠嬎夐崼銉︾厸鐎光偓鐎ｎ剛锛熸繛瀵稿缁犳捇骞冨▎鎿冩晢闁稿被鍊栨晥闂備浇顕у锕傦綖婢跺⊕鍝勵煥閸繂鍋嶉悷婊勬瀹曟椽鎮欓崫鍕吅闂佹寧娲嶉崑鎾剁磼閻樺磭鈯曢柕鍥у楠炴﹢骞囨担璇♀偓鍡欑磽娴ｅ搫校闁瑰憡鎮傞敐鐐剁疀濞戞瑦鍎梺闈╁瘜閸橀箖鏁嶅鍐ｆ斀闁宠棄妫楅悘鐘绘煙绾板崬浜伴柨婵堝仜閻ｆ繈宕熼鑺ュ闂備礁婀遍…鍫⑩偓娑掓櫆瀵板嫰宕熼鈧悷閭︾叆閹煎瓨绻勯惄搴☆渻閵堝棙绌跨紒鎻掓健楠炲繘鎮╃憗浣告贡閳ь剨缍嗛崑鎺戭焽閺冨牊鈷掑〒姘ｅ亾婵炰匠鍛床闁圭儤鎸婚崣蹇涙煟閹寸姷鎽傞柡浣革躬閺岀喖鎮滃Ο铏逛憾闂佽　鍋撳ù鐘差儏缁犳娊鏌熼幆鐗堫棄缁炬儳缍婇弻鐔兼偋閸喓鍑＄紒鐐劤椤兘寮婚悢鐓庣鐟滃繒鏁☉銏＄厽闁规儳鐡ㄧ粈瀣煛瀹€瀣埌閾伙綁鏌涘┑鍡楊仾婵絾鍔欏娲川婵犲嫮鐣惧┑鐐叉嫅缂嶄線宕洪埀顒併亜閹哄秶璐伴柛鐔风箻閺屾盯鎮╅幇浣圭暦缂備胶绮粙鎺旀崲濠靛鐐婇柕澶堝灩娴滄儳霉閿濆牆鈧粙寮崼婵嗙獩濡炪倖鎸炬慨瀛樻叏閿旀垝绻嗛柣鎰典簻閳ь剚鐗滈弫顕€骞掑Δ鈧悿顕€鏌ｅΔ鈧悧蹇涖€呴崣澶岀闁糕剝蓱鐏忎即鏌嶉柨瀣瑨闂囧鏌ㄥ┑鍡欏妞ゅ繒濞€閹粙顢涘☉姘垱闂佸搫琚崝鎴濐嚕閺夋嚦鐔兼惞闁稒鍋呭┑锛勫亼閸娿倝宕㈤悡骞熸椽鍩￠崥钘夋搐閻ｇ兘宕堕埡鍐跨床闂備胶顭堥張顒傜矙閹存緷褰掝敋閳ь剟寮诲☉銏犵厸閻庯綆鍓涢惁鍫ユ倵鐟欏嫭纾搁柛鏃€鍨块妴浣糕枎閹惧磭鐣鹃悷婊冪Ф缁鎮欓悜妯锋嫽闂佺鏈悷褔藝閿曞倹鐓曢柣鏃堟敱閸嬨儲顨ラ悙瀵稿⒌妞ゃ垺娲熼弫鍐焵椤掑倸顥氶柛锔诲幘绾捐棄霉閿濆牆浜楅柟瀛樼妇閺嬪秹鏌ｅΟ鑲╁笡闁绘挾鍠栭弻鏇＄疀鐎ｎ亞鍔撮梺鍝勬－閸ㄥ爼寮诲☉姘ｅ亾閿濆骸浜濋悘蹇曟暬閺岀喖宕ｆ径瀣攭閻庤娲滈崰鏍€佸Δ鍛＜闁靛牆鏌婂鑸碘拻闁稿本鐟ㄩ崗灞俱亜閵忕媴韬い銏¤壘椤劑宕ㄩ鍛稐闂備礁鎼ú銏ゅ垂閸︻厾涓嶉柡灞诲劜閻撳繘鐓崶銊︾鐞氥儵姊虹悰鈥充壕婵炲濮撮鍡涘磹閻㈠憡鐓ユ繝闈涙閸戝湱绱掗妸銈囩煓闁哄本绋掔换婵嬪礋椤愨剝顫曢梻浣筋嚃閸犳牠宕查弻銉⑩偓锕傚Ω閳轰胶顦ㄥ銈呯箰濡參宕€ｎ喗鈷戦柤鎭掑剶閹寸姵宕查柛鎰靛枛妗呴梺鍛婃处閸ㄤ即宕￠搹顐＄箚闁靛牆鍊告禍鐐箾鐎涙鐭嬮柛搴㈠▕閸╃偤骞嬮敂缁樻櫓缂佺虎鍘鹃崗妯兼閺夋垟鏀介柣鎰级鐎氬懐绱掗幓鎺斾虎閸楅亶鏌熼悧鍫熺凡缂佺姵濞婇弻鐔煎箹椤撶偛绠洪悗鐐瑰€栧钘夘潖閾忕懓瀵查柡鍥╁仜閳峰姊洪懡銈呮瀭闁稿孩鐓￠獮鍫ュΩ閳哄倸娈愰梺鍐叉惈閸熶即鏁嶅┑瀣拺缂佸瀵у﹢浼存煟閻旀繂鎳忕€氳霉閻撳海鎽犻柣鎾存礋閺岋絽螣閾忕櫢绱炴繝鈷€灞藉⒋闁哄矉绻濆畷銊╊敇閻樿尙鍘介梻浣筋嚃閸犳牗鏅堕懞銉ь浄闁挎洖鍊圭€电姴顭跨捄鍝勵殭闁?multipart 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇牠姊绘笟鈧埀顒傚仜閼活垱鏅堕弶娆剧唵閻熸瑥瀚粈瀣偓瑙勬礈閸忔﹢銆佸鈧幃鈺冨枈婢跺苯绨ラ梻鍌欐祰椤曆囧礄閻ｅ瞼绀婇柛鈩冪☉绾惧鏌熼幑鎰厫妞ゎ偅娲熼弻宥夊传閸曨偀鍋撻懡銈囦笉闁告挆鈧崑鎾绘偡閺夋妫岄梺鍝ュУ濞叉粓鎳炴潏銊ч檮闁告稑锕﹂崢鎼佹⒑閸涘﹣绶遍柛鐘冲哺瀹曪綁鍩€椤掑嫭鈷戦柛婵嗗濠€鎵磼鐎ｎ偄鐏撮柛鈹垮劜瀵板嫰骞囬鍌滃幀婵犵妲呴崹鎶藉储瑜斿畷鐢割敆閸曨兘鎷?
         int imgIndex = 0;
@@ -566,15 +902,17 @@ public class NewApiClient {
                 final int currentIdx = imgIndex;
 
                 // gpt-image 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄婵犲灚鍔栫紞妤呮⒑闁偛鑻晶顕€鏌涙繝鍌涘仴妤犵偞鍔栫换婵嬪礃椤忓棗楠勯梻浣稿暱閹碱偊顢栭崶鈺冪煋妞ゆ棃鏁崑鎾舵喆閸曨剛锛橀梺鍛婃⒐閸ㄧ敻顢氶敐澶婇唶闁哄洨鍋熼鍝勨攽閻樼粯娑ч柣妤€鍟村畷鎴﹀箻濞茬粯鏅ｉ梺缁樺灥濡瑧鈧潧鐭傚娲濞戞艾顣洪梺纭呮珪閸旀鍒掔紒妯侯嚤閻庢稒顭囬崢钘夆攽鎺抽崐鎰板磻閹剧繝绻嗘い鎰剁悼缁犵偞顨ラ悙鎻掓殻闁诡喗鐟╁畷顐﹀礋椤愩倐鍋撻鐑嗘富闁靛牆妫楁慨澶娾攽椤旇偐锛嶉柤楦块哺缁绘繂顫濋娑欏闂備浇宕甸崰鎾存櫠濡ゅ懎绠氶柛顐ゅ枍缁诲棙銇勯幇鍓佺У婵炲牊娲滅槐鎺楀磼濮樻瘷褏鈧娲樼划蹇浰囩€靛摜妫柟顖嗕礁浠梺鍝勬湰閻╊垶鐛Ο浣曟棃鍩€椤掆偓铻炴繛鍡樻惄閺佷焦淇婇妶鍛櫤闁抽攱鍨块弻娑樷槈濮楀牆濮涢梺鐟板暱閸熸挳寮诲☉銏″亜闁告稑锕︾粙鍥⒑娴兼瑧鍒伴柛銏ｅ皺閸欏懎顪冮妶鍛閻庢凹鍣ｅ畷婵嬫晝閳ь剟鈥旈崘顔嘉ч柛鈩冾殘閻熸劙姊婚崒姘仼缂佸鏁哥划瀣吋閸滀胶鍙嗛梺鍓插亞閸犳捇宕㈤悽鍛娾拺缂備焦锚閻忥箓鏌ㄥ鑸电厽闊洤顑呴崝锕傛煛鐏炵晫啸妞ぱ傜窔閺屾盯骞橀弶鎴濇懙濡ょ姷鍋涢崯鏉戠暦閹烘埈娼╅弶鍫涘妽椤旀洟姊绘笟鈧褏鎹㈤崱娑樼疇闁搞儺鍓欑壕濠氭煙閸撗呭笡闁稿鍔戦弻锝夊閵忕姳鍖栭梺閫炲苯澧柨鏇ㄤ邯瀵鈽夊锝呬壕闁挎繂楠告禍婵嬫倶韫囷絽寮柡灞界Ф缁辨帒螣鐠囪尙锛撻柣搴ゎ潐濞叉牜绱炴繝鍥モ偓浣糕枎閹炬潙浠奸柣蹇曞仩閸嬫劙骞愭径鎰拻闁稿本鑹鹃埀顒勵棑缁牊绗熼埀顒勭嵁婢舵劕鐏抽柟棰佺劍缂嶅酣鎮峰鍛暭閻㈩垱甯″畷褰掑磼閻愬鍘遍悷婊冮叄閵嗗啴宕ㄩ幍顔绢啍濠电姷鏁搁崑鐘诲箵椤忓棗绶ら悹鎭掑妽閸忔粓鎮规潪鎵Э闁挎繂顦柋鍥煟閺傚灝顣崇紒鐘宠壘椤啴濡堕崱娆忊拡闂佺顑囬崑銈咁嚕椤愶絾缍囬柕濠忕导缁ㄨ顪冮妶鍡楀闁搞劏顕ч悺顓㈡⒒娴ｅ摜鏋冩い顐㈩樀瀹曞綊宕稿Δ鈧弰銉╂煏婢跺棙娅呮鐐灪娣囧﹪濡堕崨顓熸闂佸憡绻冮〃濠傤潖缂佹ɑ濯撮柛娑橈工閺嗗牓姊洪悡搴ｇШ缂佺姵鐗犻妴渚€寮介鐐茬獩闂佸搫顦伴崹鑸垫綇閸儲鈷戦悗鍦У閵嗗啴鎮规担鍦弨鐎殿喓鍔嶇粋鎺斺偓锝庡亞閸樿棄鈹戦埥鍡楃仴婵炲拑绲剧粋鎺戔槈閵忥紕鍘搁梺绯曗偓宕囩婵炲懎鎳橀弻宥囨喆閸曨偆浼屽銈冨灪閻熝囧箯閻樿绠甸柟鐑樻煟閸嬫牠姊虹拠鍙夊攭妞ゎ偄顦叅婵犻潧顑戠紞鏍ь熆鐠鸿櫣鐏辩紒鎲嬬畵閺岋綁鏁愰崨顖滀紘闂佹椿鍘介悷鈺呭蓟閻旇櫣鐭欓柛顭戝櫘閸斿鎮跺鍓хМ婵﹤顭峰畷鎺戔枎閹搭厽袦闂備礁婀遍埛鍫ュ磻閸℃瑥鍨濇繛鍡樺姉閻熷綊鏌嶈閸撴瑩鎮鹃悜钘夘潊闁挎稑瀚峰ù鍕煟鎼搭垳绉靛ù婊勭矒楠炲棝鎮欓悜妯衡偓鐢告煕韫囨搩妲稿ù婊堢畺濮婃椽宕ㄦ繝鍐槱闂佸憡鎸婚惄顖氱暦閵忋倖鐒肩€广儱妫岄幏娲⒑闂堚晛鐦滈柛妯哄悑缁傚秹鎮欓鍙ョ盎闂侀潧顭堥崕鏌ュ闯娴犲鐓冪憸婊堝礈濮樿埖鍤屽Δ锝呭暙鎼村﹪鏌＄仦璇插姉闁逞屽墾缁犳挸鐣烽崼鏇ㄦ晢濞达綁鏅茬花濠氭⒒娴ｄ警鐒剧紒缁樺姍閹啴鎮滈挊澶岊唵濠电偛妯婃禍婵嬪煕閹达附鐓曟繛鎴烇公閺€濠氭倶韫囨柨顥嬮柟鍙夋倐瀵爼宕归鑺ヮ唹缂傚倷绀侀崐鍝ョ矓閹绢喖鐓橀柟杈剧畱閻愬﹪鏌嶉崫鍕灓闁哥喎閰ｅ缁樻媴閸涘﹤鏆堥梺鑽ゅ枂閸庝絻妫熼柡澶婄墑閸斿秴鈻嶉悩缁樼厽闁靛繒濮甸崯鐐烘煟閹惧鎳勯柕鍥у瀵粙濡搁妶鍕劉闂佽瀛╅惌顕€宕￠幎钘夌闁割偅娲栭崘鈧銈嗘尵閸犳捇宕㈤崡鐐╂斀闁绘劖娼欓悘銉р偓瑙勬处閸撶喎顕ｉ幖浣肝у璺侯儑閸樺崬鈹戦濮愪粶闁稿鎸搁湁婵犲﹤鍟伴崺锝団偓娈垮枛椤兘寮幇鏉块唶闁靛繈鍨哄鎴︽⒒娴ｅ憡鎯堟繛灞傚姂瀹曟垵螣閻撳骸鐏婇梺鐓庢憸閺佸摜寮ч埀顒勬⒑閸愯尙娈遍柛瀣崌閺屾盯鍩勯崘锔跨凹闂佽鍎抽悡鍕償閵娿儳鍊為悷婊勭箞閻擃剟顢楅崒妤€浜鹃悷娆忓缁€鈧梺缁樼墪閵堟悂濡存担鑲濇梹鎷呴悷閭︹偓鎾绘⒑閸涘﹦绠撻悗姘煎墰缁鎮欓悜妯锋嫽婵炶揪绲块悺鏃堝吹濞嗘挻鐓曢柟瀵稿У濞呮洜绱掓潏鈺佷槐鐎规洖宕埥澶娢熺涵椋庡耿闂傚倷绀侀幉鈩冪瑹濡ゅ懎鍌ㄥΔ锝呭暙濮规煡鏌ㄩ弮鍫熸殰闁稿鎹囧畷妤佸緞婵犱礁顥氶梻鍌欑窔閳ь剛鍋涢懟顖涙櫠閹绢喗鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜閹烘绐楁慨姗嗗墻閻掍粙鏌熼柇锕€骞樼紒鐘荤畺閺屾稑鈻庤箛锝嗩€嗛梺鍏兼緲濞硷繝寮婚埄鍐╁缂佸瀵у▓缁樼節濞堝灝鏋撻柛瀣崌濮婃椽鎮欓挊澶婂Г闁诲繐绻戦悷褏鍒掔拠宸僵闁煎摜顣介幏娲偡濠婂懎顣奸悽顖涱殜閺佸秹鎮㈤崗鑲╁幗闂佺娅ｉ崑鐔兼偩閻㈢鍋撳▓鍨灍鐟滄澘鍟撮垾锕傚Ω閳轰礁绐涘銈嗙墬缁絿妲愰崘娴嬫斀闁绘劘鍩栬ぐ褏绱撳鍕槮妞ゎ厼娲╅ˇ褰掓煙椤旀枻鑰挎い銏℃瀹曞ジ鎮㈤崫鍕闂傚倷绶氬褔鎮ч崱姗嗘缂佸绨遍弸宥団偓骞垮劚濡瑩宕ｈ箛鎾斀闁绘ɑ褰冩禍鐐烘煟閹剧懓浜归柍褜鍓濋～澶娒哄Ο鍏兼殰闁圭儤顨呴悡婵嬪箹濞ｎ剙濡肩紒鐙呯稻缁绘繈妫冨☉娆欑礊闂佽瀛╅幐鍐差潖缂佹ɑ濯寸紒娑橆儏濞堫厼鈹戦悙宸殶闁稿繑锕㈤獮鍐倻閽樺顔呴梺鑺ッˇ顖滅玻濞戞﹩娓婚柕鍫濇婢ь剛绱掗濂稿弰鐎规洏鍨介、娑㈡倷缁瀚藉┑鐐舵彧缁插潡宕曢妶澶婂惞闁逞屽墮椤啴濡堕崱妯侯槱闂佸憡鐟ラ崯顐︽偩閻戣棄绠ｉ柨鏃囨娴滄粓姊虹粙璺ㄧ闁汇劎鍏橀獮鎰板礃椤旇В鎷洪梺鍛婄☉閿曘儲寰勯崟顖涚厱闁靛ň鏅欓幉楣冩煙椤斿厜鍋撻弬銉︻潔闂侀潧楠忕槐鏇㈠储闁秵鈷戦悷娆忓缁舵彃顭胯闁帮絽鐣峰璺虹骇婵☆偆鏁搁幊鎾烩€﹂妸鈺佺闁靛鍨虹€垫牜绱撻崒娆愮グ濡炲瓨鎮傞獮鎰節濮橆剛顔嗛梺鍛婄☉閻°劑骞嗛悙鐑樼厽闁绘梻顭堥ˉ瀣亜閹邦兙鍋㈡慨濠勭帛閹峰懘宕崟顐⑿曢梻浣告惈閹冲寮查悩鑼殾閻熸瑥瀚閬嶆倵濞戞顏呯婵傚憡鈷戠紓浣姑悘杈ㄤ繆椤愩垹顏柡灞筋儔瀹曞爼顢楁担鍝勫箰闂備焦鎮堕崕顖炲磿鏉堛劋绻嗗ù鐘差儐閻撴盯鏌涘☉鍗炰簻闁诲浚浜炵槐鎺旂磼濡皷濮囧┑鐐靛帶缁绘ê鐣峰鍡╂Ь閻炴熬绠撳缁樻媴閸涘﹥鍎撻梺纭呮珪閹哥偓绂嶇粙搴撴瀻闁瑰鍎愬?image 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛?
-                bodyBuilder.part("image", new ByteArrayResource(imageBytes) {
+                // 2026-08-13 FIX: LinkedMultiValueMap.add 返回 void,不能链式 .contentType()
+                // RestTemplate 也不需要显式 contentType(用 application/octet-stream 默认即可)
+                body.add("image", new ByteArrayResource(imageBytes) {
                     @Override
                     public String getFilename() {
                         return "reference_" + currentIdx + ext;
                     }
-                }).contentType(MediaType.parseMediaType(mimeType));
+                });
                 imgIndex++;
             } catch (Exception e) {
-                log.warn("闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞楅梻渚€娼х换鍫ュ春閸曨垱鍊块柛鎾楀懐锛滈梺褰掑亰閸欏骸鈻撳鍫熺厸鐎光偓閳ь剟宕伴弽顓犲祦鐎广儱顦介弫濠勭棯閹峰矂鍝烘慨锝咁樀濮婄粯鎷呮笟顖滃姼濡炪倖鍨堕崹褰掑箲閵忕姭鏀介柛鈾€鏅涘▓銊╂⒑閸撴彃浜濇繛鍙夌墵閺屽宕堕妸锕€寮垮┑顔筋殔濡鐛Δ鍛厽婵犻潧娲﹂埛鎺旂磼鏉堛劍灏伴柟宄版嚇閹墽浠﹂悾灞筋潽闂傚倷鑳堕…鍫ユ晝閵壯勫床闁割偅绻嶉崵鏇㈡偣閸ャ劎銈存俊鎻掔墛缁绘繃绻濋崒姘煎妷婵繂娲ら埞鎴︽晬閸曨偂鏉梺绋匡攻閸ㄥ灝鐣峰┑鍫滄勃閺夌偞瀵х粙鎴﹀煘閹达箑骞㈡繛鍡樺姈椤旀洟姊绘担鐑樺殌妞ゆ洦鍙冨畷鎴濃槈濮橆収鍋ㄩ梺缁樺姉閸庛倝宕愰悽鍛婄叆婵犻潧妫濋妤€顭胯閸楁娊寮婚敐澶嬫櫇闁逞屽墴閹勭節閸曨剙搴婂┑鐘绘涧椤戝棝宕戦妸鈺傗拻闁割偆鍠庨崹渚€鏌曡箛瀣偓鏍偂閺囩偐鏀介柣妯诲絻閺嗙偤鏌涙繝鍐ㄥ闁逞屽墯椤旀牠宕板Δ鍛畺闁稿本绋愮换鍡涙煠閹间焦娑х紒鍓佸仱閹鏁愭惔鈥愁潻濡ょ姷鍋涢悧鎾愁潖缂佹鐟归柍褜鍓欓…鍥樄闁诡啫鍥у耿婵＄偑鍨虹粙鎴﹀煝鎼淬劌绠ｉ柣妯兼暩閸斿爼姊虹拠鎻掑毐缂傚秴妫濆畷鏉课旈崨顔间簵濠电偞鍨堕崺鍐磻閹捐绀傚璺猴梗婢规洟姊虹拠鎻掑毐缂傚秴妫濆畷婊冣槈閵忊€冲墾闂佸壊鍋侀崕鏌ュ磹閻㈠憡鍋℃繛鍡楃箰椤忣亞绱掗埀顒勫焵椤掑嫭鈷戠紓浣诡焽婢ь亪鏌曢崼銏╃劸闁伙絽鍢茬叅妞ゅ繐瀚崝鎾⒑閸涘﹤濮€闁哄懏鐩、鎾诲箻缂佹ǚ鎷洪梺纭呭亹閸嬫盯宕濋敂濮愪簻闁靛闄勭亸鐢电磼椤旇姤顥堟い銏″哺閸┾偓妞ゆ帒瀚拑鐔兼煃閵夈儳锛嶉柡鍡楁閹鏁愭惔鈥愁潾闂佷紮绠戦悧鎾诲箖濡ゅ啯鍠嗛柛鏇ㄥ墰椤︺儵鎮楃憴鍕闁告挻绻堥幃姗€宕橀瑙ｆ嫼闂佸憡绋戦敃銈嗘叏閿曗偓闇夋繝濠傚暟閸╋絿鈧娲﹂崹鎶藉焵椤掑﹦绉甸柛鐘愁殜閸╂盯骞掗幊銊ョ秺閺佹劙宕ㄩ鍏兼畼闂備浇顕栭崹浼存偋閹捐钃熼柨鐔哄Т闁卞洦銇勯幇鈺佺仼闁冲嘲顑夊铏规嫚閳ュ磭浠╅柣搴㈢煯閸楁娊濡存担绯曟婵☆垶鏀遍～宥呪攽鎺抽崐鏇㈠疮娴煎瓨鍋╁Δ锝呭暞閳锋帒霉閿濆牊顏犻悽顖涚洴閺屾盯濡歌鐢爼鎽堕悙鐑樼厱闁哄洢鍔屾禍婵嬫煛閸℃鐭掓慨濠傤煼瀹曟帒鈻庨幋鐘靛床婵犵數鍋橀崠鐘诲炊娴ｅ憡鍠樻い銏★耿婵偓闁绘灏欓埀顒夊弮濮婃椽骞嗚缁犱即鏌涘Ο鑽ょ煉鐎规洘鍨块獮妯兼嫚閹绘帞鈧厼顪冮妶鍡楀闁稿﹥娲熼崺鍛般亹閹烘挴鎷?{} 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮诲☉妯锋婵鐗婇弫楣冩⒑閸涘﹦鎳冪紒缁樺姍濠€渚€姊虹粙璺ㄧ闁告艾顑囩槐鐐哄箣閿旂晫鍘遍梺闈涱焾閸庨亶鍩€椤掆偓濠€閬嶅箲閵忕姭妲堟慨妤€妫楅弲鐘差渻閵堝棙顥嗙€规洜鏁婚幆鍕償閿濆洨锛滈梺缁樺姦閸撴瑩宕濋妶鍡欑缁绢參顥撶弧鈧悗娈垮枛椤攱淇婇崼鏇炶Е闁靛牆鎳忕拹锟犳煃瑜滈崜銊х礊閸℃稑纾婚柛娑樼摠閸嬬喖鏌￠崘銊у闁抽攱鍨块弻鐔兼嚃閳轰椒绮舵繝纰夌磿閺咁偆妲愰幒鏃€瀚氶柤纰卞墮閳敻鎮楀▓鍨灕妞ゆ泦鍥х叀濠㈣埖鍔曢～鍛存煟濡椿鍟忛柛鐔奉儐缁绘繂顕ラ柨瀣凡闁逞屽墯閸旀瑥鐣烽幋锕€绠荤紓浣姑埀顒€鐏氶幈銊ノ熼悡搴′粯婵犫拃鍐惧殶闁? {}", imgIndex, e.getMessage());
+                log.warn("编辑第{}张图片失败: {}", imgIndex, e.getMessage());
                 imgIndex++;
             }
         }
@@ -583,30 +921,37 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "Failed to decode referenced image, cannot edit image");
         }
 
-        log.info("闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞堟俊鐐€ら崢浠嬪垂閸偆顩叉繝闈涱儐閻撴洘绻涢崱妤冪缂佺姴顭烽弻鈥崇暆閳ь剟宕伴幘鑸殿潟闁圭儤顨呴～鍛存煟濡櫣锛嶇憸閭﹀灦濮婄粯鎷呴懞銉ｂ偓鍐磼閳ь剚鎷呯悰鈥充壕婵﹩鍋勫畵鍡欌偓娈垮枦椤曆囧煡婢跺á鐔兼煥鐎ｅ灚缍屽┑鐘垫暩閸嬫稑螞濞嗘挸绀夋俊銈呭暟閻瑩鏌涢妷顔煎闁抽攱鍨堕幈銊╂偡閻楀牊鎮欓梺閫炲苯鍘甸柛濠冪箓閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸鹃崰鎾绘偩閹惰姤鈷掗柛灞剧懆閸忓本銇勯鐐靛ⅱ闁瑰箍鍨介獮鍥级閼愁垍鏇㈡煟鎼搭垳绉甸柛鎾寸〒缁牊绻濋崶銊у幍闁哄鐗撶粻鏍ь瀶椤曗偓閺?NewAPI /v1/images/edits: promptLen={}, refImageCount={}", prompt.length(), imgIndex);
+        log.info("NewAPI /v1/images/edits: promptLen={}, refImageCount={}", prompt.length(), imgIndex);
 
         try {
-            JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
-                .post()
-                .uri("/v1/images/edits")
-                .header("Authorization", "Bearer " + token)
-                .contentType(MediaType.MULTIPART_FORM_DATA)
-                .bodyValue(bodyBuilder.build())
-                .retrieve()
-                .bodyToMono(JsonNode.class)
-                .timeout(Duration.ofSeconds(600))  // 2026-08-09:4 图合成需 5+min,原 300s 不够
-                .onErrorMap(WebClientResponseException.class, e -> {
-                    log.error("NewAPI /v1/images/edits failed: {} {}",
-                        e.getStatusCode(), e.getResponseBodyAsString());
-                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                        "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸荤换鍕缁嬪簱鏋庨柟鎹愭珪閻庮剟姊洪崫鍕枆闁稿妫涙竟鏇㈡寠婢规繂缍婇弫鎰板炊閵娿儲鐣梻浣告啞閺岋綁宕愬Δ鍛疅闁归棿绀佺粻銉︺亜閺冨牊锛熼柟瀵稿厴濮婃椽宕ㄦ繝鍌滅懖闁汇埄鍨辩敮锟犲春閵忊剝鍎熼柕濞垮劤椤旀帡鏌ｆ惔鈩冭础濠殿喚鏁婚獮澶嬪鐎涙ǚ鎷绘繛杈剧到閹碱偅绂掑ú顏呯厱閹兼番鍨婚崣鈧悗瑙勬礃缁矂锝炲┑鍫熷磯濡わ箑鏅濋弴銏＄厽閹兼惌鍨崇粔鐢告煕閻樺磭澧辩紒顔碱煼瀹曠兘顢橀悩纰夌床婵＄偑鍊栧濠氬储瑜忛弫顕€濡搁埡鍌滃幈闁诲函缍嗛崑鍛暦鐏炵虎娈介柣鎰级婢跺嫰鏌熷畡鐗堝殌闁靛洦鍔欓獮鎺楀棘鐠侯煉绱甸梻鍌氬€搁崐鎼佸磹閹间礁纾归柣鎴ｅГ閸婂潡鏌ㄩ弴鐐测偓褰掑磿閹寸姵鍠愰柣妤€鐗嗙粭鎺楁煛閸曗晛鍔﹂柡灞剧洴瀵挳濡搁妷褌鍝楅梻浣规偠閸斿矂宕愰崸妤€钃熼柍鈺佸暙缁剁偤骞栭幖顓炴灈婵炲牊鍎抽埞鎴︽倷閺夋垹浠稿銈庡幖閸婂灝顕ｉ鈧畷鐓庘攽閸℃瑧宕哄┑锛勫亼閸婃洜鎹㈢€ｎ剛鐭嗗ù锝呮贡椤╂彃螖閿濆懎鏆為柣鎾卞劦閺岋繝宕堕埡浣风捕闂侀€炲苯澧柟顔煎€垮濠氬Ω閳轰絼褔鏌涢埄鍐╃缂佺姵宀稿娲濞戞艾顣洪梺绋匡工閹诧紕绮嬪澶婄鐟滃繒澹曢挊澹濆綊鏁愰崨顔藉創闁哄稄绻濋幃妤呭礂婢跺﹣澹曢梻浣哥秺濡法绮堟笟鈧幏鎴︽偄閸忚偐鍘介梺鍝勫€藉▔鏇炩枔闁秵鐓涢悗锝庡亝椤ュ牓鏌＄仦鍓ф创闁炽儻绠撻獮瀣攽閸モ晙鎲鹃梻鍌欐祰椤曆呮崲閹达箑绠伴柛鎾楀嫷娼熼梺瑙勫礃椤曆呭閸忓吋鍙忔俊顖氭惈閼稿綊鏌嶉鍕粵缂佺粯绋撻埀顒佺⊕椤洭鎯屾繝鍥ㄧ厽闁哄稁鍋勭敮鑸点亜? " + e.getStatusCode() + " " + e.getStatusText());
-                })
-                .onErrorMap(e -> {
-                    if (e instanceof BusinessException) return e;
-                    log.error("NewAPI editImage error: {}", e.getMessage());
-                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
-                })
-                .block();
+            // 2026-08-13 FIX: 用 RestTemplate 替换 WebClient,避免 Transfer-Encoding: chunked 400
+            RestTemplate editRestTemplate = new RestTemplate();
+            // 设置 10 分钟 timeout
+            editRestTemplate.getMessageConverters().stream()
+                .filter(c -> c instanceof org.springframework.http.converter.FormHttpMessageConverter)
+                .findFirst()
+                .ifPresent(c -> ((org.springframework.http.converter.FormHttpMessageConverter) c)
+                    .setCharset(java.nio.charset.StandardCharsets.UTF_8));
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            headers.set("Authorization", "Bearer " + token);
+
+            HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+
+            ResponseEntity<String> respEntity = editRestTemplate.exchange(
+                baseUrl + "/v1/images/edits",
+                HttpMethod.POST,
+                requestEntity,
+                String.class
+            );
+
+            String respBody = respEntity.getBody();
+            if (respBody == null || respBody.isEmpty()) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "Image edit returned empty body");
+            }
+
+            JsonNode response = new ObjectMapper().readTree(respBody);
 
             if (response == null) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "Image edit returned empty response (null)");
@@ -615,7 +960,7 @@ public class NewApiClient {
             // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌氬€烽懗鑸垫叏闁垮绠鹃柍褜鍓熼弻鈥崇暆閳ь剟宕伴弽褏鏆︽繝濠傛－濡查箖鏌ｉ姀鈺佺仭闁烩晩鍨跺璇测槈濞嗘垹鐦堥梺鍛婁緱閸橀箖宕㈤锔解拺闂侇偅绋撻埞鎺楁煕閺傝法鐒烽柣蹇斿浮濮婃椽宕烽褏鍔稿┑鐐差嚟閸忔ɑ淇婇幘顔肩疀妞ゆ柨澧介敍婵囩箾鏉堝墽鍒伴柟纰卞亝閻楀骸鈹戦悩顔肩伄闁硅櫕鎸歌灋婵炴垶顭傞敐澶婄疀闁哄娉曢濠囨⒑閸濆嫬鈧悂骞栭锝囶洸濡わ絽鍟悡銉︾節闂堟稒顥㈡い搴㈩殕椤ㄣ儵鎮欓幖顓熺暭闂佹眹鍎烘禍顏堛€佸鈧幃娆撴濞戞艾骞楅梻鍌欑閹碱偊鎯屾径灞惧床婵犻潧妫涢弳锕傛⒑椤掆偓缁夊绮诲☉娆嶄簻闁硅揪绲鹃ˉ澶娒瑰鍛壕缂佺粯绻堝Λ鍐ㄢ槈閸楃偛澹堥梻浣芥閸熶即宕伴幇顔藉床婵炴垯鍨圭粻锝嗙箾閸℃绠冲ù鐘哄亹缁辨挻鎷呴崫鍕戯綁鏌ｉ埡濠傜仩妞ゎ偄绻戠换婵嗩潩椤掑嫬鏁归梻浣虹帛濡線濡撮埀顒€鈹戦鍏煎枠婵﹨娅ｉ幏鐘绘嚑椤掑偆鍞堕梻浣虹帛椤ㄥ懘鏁冮敃鍌氱闁靛繒濮Σ鍫熸叏濮楀棗澧绘俊顐ｇ矒閺岋絾鎯旈婊呅ｆ繛瀛樼矋閻熴儲鏅ュ┑掳鍊撻懗鍓佸姬閳ь剙鈹戦悙鑼闁诲繑绻堝鎼佸Χ婢跺鍘遍棅顐㈡处濡垿鎳撶捄銊㈠亾鐟欏嫭绀冩俊鐐扮矙瀹曟椽鍩€椤掍降浜滈柟鍝勭Ч濡惧嘲霉濠婂嫮鐭掗柡宀€鍠栧畷顐﹀礋椤掑顥ｅ┑鐐茬摠缁本鏅堕悾灞绢潟闁规儳鐡ㄦ刊鎾煕濠靛棗鐝旈柕蹇嬪灮绾剧厧顭跨捄鐑樻拱闁搞倐鍋撻梻浣风串缁插潡宕楀Ο渚殨闁圭虎鍠栭～鍛存煥濞戞ê顏╁┑顔芥倐閺岋絾鎯旈敍鍕殯闂佺閰ｆ禍鍫曠嵁婵犲洤绠涢柣妤€鐗嗘禒楣冩⒑閹肩偛鍔撮柛鎾村哺閸╂盯骞嬮悩鍐叉瀾闂佺粯顨呴悧鍡欑箔閹烘嚚鐟邦煥閳ь剟宕￠幎钘夎摕婵炴垯鍨洪崑鎰版煕閹邦剙绾ч悹鍥╁仱閹鎲撮崟顒傤槰闂佹悶鍔屽锟犳偘椤斿槈鐔兼嚃閳哄喛绱叉繝纰樻閸ㄩ潧顩奸妸鈺傚仺濠电姵纰嶉埛鎺楁煕鐏炲墽鎳呴悹鎰嵆閺屾稑鈻庤箛鏇狀啋濠殿喖锕ｇ划娆忕暦閻旂⒈鏁嗗璺侯儛閸炶尙绱撻崒姘偓鎼佸磹閹间礁纾归柟闂寸绾惧湱鈧懓瀚崳纾嬨亹閹烘垹鍊為梺闈涱煭缁茶偐鍒掗幘缁樷拺鐟滅増甯楅敍鐔虹磼閳ь剚鎷呴搹閫涚瑝闂佸搫顦花閬嶅绩娴犲鐓熸俊顖濇閺嬪啫顭跨憴鍕电劷缂佽鲸甯￠幃顏堝焵椤掑嫬鍨傞柛顐ｆ礀閽冪喐绻涢幋鐐冩艾危閸儲鐓曟俊銈呭暙娴犙兠归悪鈧崣鍐潖濞差亜浼犻柕澶堝剾閵忊€茬箚妞ゆ劧绲跨粻鐐碘偓娈垮枦椤曆囧煡婢舵劕顫呴柣妯诲絻缁侇噣姊绘笟鈧褔鈥﹂崼銉ョ？濞村吋娼欑粣妤€鈹戦悩鍙夊闁抽攱鍨块幃褰掑炊閵娿儳绁峰銈嗗竾閸ㄧ儤绌辨繝鍥ㄥ€烽柤鍛婎問濡嫬顪冮妶搴′簻缂佺粯甯炲Σ鎰板箳閹冲磭鍠撻幏鐘差啅椤旂懓浜鹃柟鎯у绾捐棄霉閿濆懏璐￠柍钘夘槹閵囧嫰骞嬪┑鍥ф闂佸磭绮幑鍥€佸鈧慨鈧柨娑樺楠炴姊虹涵鍛棈闁规椿浜炲Σ鎰板即閻斾警娴勫┑鐐村灟閸ㄦ椽宕戦妸锔轰簻闁哄秲鍔婃禒婊堟煕鐎ｎ偅灏柣锝囧厴瀹曞爼濡搁敂璇叉櫗闂備浇宕甸崰鎰垝鎼淬垺娅犳俊銈呭暞閺嗘粓鏌熼悜姗嗘畷闁绘挷绶氶弻娑㈠Ψ椤旂厧顫梺缁樻尰閻╊垶寮诲☉銏犖ㄩ柕蹇婂墲閻濇梹绻涚€电顫掗柛銉ｅ妿閸樹粙姊洪幐搴ｇ畵婵炲眰鍊濆畷婵堚偓锝庡墰绾捐偐绱撴担璇＄劷闁靛棙甯￠弻宥堫檨闁告挻鐩顐﹀箹娴ｆ祴鍋撻敃鍌氶唶婵犻潧鐗婇幊鍐╃節绾板纾块柛瀣灴瀹曟劙寮介鐐茬€梺姹囧灮椤牏绮婚悩鑽ゅ彄闁搞儯鍔庨埥澶岀棯閻愵剙顕滈柕鍥у楠炲洭宕奸弴鐕佲偓宥夋⒑閹惰姤鏁遍悽顖涘浮婵℃挳骞掗幋顓熷兊闂佹寧绻傞幊宥嗙珶閺囩喓绡€闁汇垽娼ф禒鎺楁煕閺嶎偄鈻堢€规洖鐖兼俊鎼佸Ψ閵堝洨绉块梻鍌氬€烽懗鍓佹兜閸洖绀堟繝闈涚懁閸ヮ剙浼犻柛鏃囧Г濡炰粙銆侀弮鍫濈妞ゆ挾鍋涚粻浼存⒒閸屾瑨鍏屾い顓炵墦瀵敻顢楅崒姘亰闁瑰吋鐣崐鎴炵瑜版帗鐓欐い鏍ф閸嬫捇鏌￠埀顒勬嚍閵夛絼绨婚梺鍝勫€归娆忣焽閻旇褰掓偐瀹曞洨鐓夐梺鍝勬湰缁嬫捇鍩€椤掑﹦绉甸柛瀣噹閻ｅ嘲鐣濋崟顒傚幐闁诲繒鍋熺涵鍫曞磻閹惧磭鏆﹂柛銉ｅ妽閻ｇ兘姊虹拠鎻掑毐缂傚秴妫濆畷婊冣槈濠ф儳寰嶉梻鍌氬€搁崐宄懊归崶顒夋晪闁哄稁鍘肩粣妤呮煙閻戞﹩娈旈柣銈囧亾缁绘盯骞嬪▎蹇曞姶闂佽桨绀侀敃顏堟偂椤愶箑鐐婇柕濞垮€楃换渚€姊烘潪鎵槮闁挎洦浜濠氭晲婢跺﹦顔掗梺鐟板閻℃棃鍩€椤掍緡娈曢柕鍥у婵＄兘濡烽‖顔ㄥ嫭鍙忓┑鐘插亞閻撹偐鈧娲樼敮鎺楀煝鎼淬劌绠ｆい鎾跺晿濠婂牊鈷掑ù锝勮閺€鏉库攽椤斿搫鈧宕氶幒妤€绠荤€规洖娲﹀▓鐐箾閺夋垵鎮戞繛鍏肩懅缁鈽夊▎宥勭盎闂佽宕樺▔娑樻毄婵＄偑鍊栧鐟懊哄Ο鍏煎床婵犻潧顑嗛崑銊╂⒒閸喎鍨侀柕蹇ョ磿缁犻箖鎮橀悙鎻掆偓鎼佸焵椤掍緡娈橀柛?
             java.util.List<String> topFields = new java.util.ArrayList<>();
             response.fieldNames().forEachRemaining(topFields::add);
-            log.info("NewAPI editImage 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬倵楠炲灝鍔氭い锔诲灣缁牏鈧綆鍋佹禍婊堟煙閸濆嫭顥滃ù婊堢畺閺岀喖宕楅崗鑲╃▏闂佹寧娲︽禍婊堬綖韫囨稒鎯為柛锔诲幘閻撴捇姊洪崷顓х劸閻庢稈鏅犻獮蹇旀綇閳哄啰锛濇繛鎾磋壘濞层倝寮稿☉銏♀拺閻㈩垼鍠氱粔顔筋殽閻愬弶顥滈柣锝嗙箞瀹曠喖顢曢妶搴℃櫔缂傚倸鍊搁崐鐑芥倿閿曞倹鏅梻渚€鈧偛鑻晶浼存煛娴ｅ壊鐓肩€殿喛顕ч埥澶愬煑閳规儳浜鹃柨鏇炲€哥粻锝嗙節闂堟稒鍣介柡浣圭墵濮婄粯鎷呮笟顖涙暞濠碘槅鍋勭€氭澘鐣烽鐑嗘晝闁挎洍鍋撻柣鎾达耿閺岀喐娼忛幆褏妲ｉ梺杞扮閿曨亪寮婚敃鈧灒濞撴凹鍨卞瓭闂備礁鎼鍡涙偡閳轰緡娼栨繛宸簻娴肩娀鏌涢弴銊ュ闁圭柉浜槐鎾存媴閸撴彃鍓遍梺鎼炲妼濞尖€崇暦濞差亜顫呴柍鈺佸暙閸斿懘姊洪棃娑氬婵炲眰鍔戝鍫曞箹娴ｅ厜鎷洪梺鍦焾濞撮绮婚幘缁樼厸閻忕偞鏋婚煬顒€鈹戦垾宕囧煟鐎规洖宕埢搴ㄥ箣椤撶偞娅楅梻鍌欐祰椤曆呪偓娑掓櫇缁瑩骞掑鐑╁亾閿曞倸鐐婃い鎺嶇閸撳綊鏌ｆ惔顖滅У闁告挻绋撴竟鏇㈠礂缁楄桨绨婚梺鍝勫暙濞层倛顣块柣搴ゎ潐濞叉牠寮甸鍕┾偓鍐Ψ閳哄倸鈧兘鏌熺紒妯虹瑲婵炲牆鐖煎娲偡閺夎法楠囬梺鍦焾閸熷潡鎮鹃悜鑺ュ亜闁绘挸娴烽崢鍛婄箾鏉堝墽鍒伴柛銏＄叀瀵悂宕奸妷锔规嫽闂佺鏈悷褔藝閿旂晫绡€闁逞屽墴閺屽棗顓兼担鎻掍壕闁挎洖鍊搁柋鍥煃閸ㄦ稒娅呭ù婊堢畺閺屾盯鈥﹂幋婵呯盎缂備焦顨嗗銊ф閹烘纾兼繛鎴炆戠拠鐐烘⒑缁洘鏉归柛鎾寸箞楠炲繘宕ㄩ弶鎴犵厬婵犮垼娉涢鍡楊熆閹达附鈷掗柛灞剧懆閸忓瞼绱掗鍛仸闁轰礁鍟撮崺锟犲川椤撶媴绱遍梻浣告啞濞诧箓宕滃☉顫偓鍛村箵閹广劍妫冮弫鎰板川椤撶喐顔夐梻浣瑰▕閺€閬嶅垂閸ф钃熸繛鎴欏灪閺呮粓鎮归崶銊ョ祷缂備讲鏅涢埞鎴︽晬閸曨偂澹曢梺璇″枛閸婂灝顕ｇ拠娴嬫闁靛繆鈧厖姹楅梻浣哥秺椤ｏ箓鎮為敃鍌涘仾濞撴埃鍋撻柟顔筋殘閹叉挳宕熼鍌ゆО闂備礁鎲″褰掓偡閵夆晜鍋╅柣銈庡灛娴滃綊鏌熼悜妯肩畺闁哄懏绻堝娲濞戞艾顣哄┑鐐存綑閸婂灝鐣烽娑欏劅闁靛鑵归幏缁樼箾鏉堝墽鎮奸柛搴涘€濆畷鐢稿焵椤掆偓椤啴濡堕崱妯侯槱闂佸憡鐟ラ崯顐︽偩閻戣棄绠ｉ柨鏃囨娴滄粓姊虹紒妯诲碍婵炲鍏橀幃鍧楀炊椤掍讲鎷洪悷婊呭鐢帗绂嶆导瀛樼厱婵☆垰鎼埛鏃傜磼椤斿墽甯涢柕鍫秮瀹曟﹢鍩￠崘銊ョ疄濠碉紕鍋戦崐鏍礉閹达箑纾归柡鍥ュ灩閸戠娀鏌熺€电啸缁炬儳銈搁弻宥堫檨闁告挾鍠庨悾宄邦潨閳ь剟銆佸▎鎾村仼閻忕偠妫勬俊? {}", topFields);
+            log.info("NewAPI editImage 响应字段: {}", topFields);
 
             // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞楅梻渚€娼х换鍫ュ春閸曨垱鍊块柛鎾楀懐锛滈梺褰掑亰閸欏骸鈻撳鍫熺厸鐎光偓閳ь剟宕伴弽顓犲祦鐎广儱顦介弫濠勭棯閹峰矂鍝烘慨锝咁樀濮婄粯鎷呮笟顖滃姼濡炪倖鍨堕崹褰掑箲閵忕姭鏀介柛鈾€鏅涘▓銊╂⒑閸撴彃浜濇繛鍙夌墵閺屽宕堕妸锕€寮垮┑顔筋殔濡鐛Δ鍛厽婵犻潧娲﹂埛鎺旂磼鏉堛劍灏伴柟宄版嚇閹墽浠﹂悾灞筋潽闂傚倷鑳堕…鍫ユ晝閵夈儍鍝勨攽鐎ｎ偄鈧爼鏌涢幇闈涙灍闁抽攱鍨块弻鐔虹矙閹稿孩宕崇紓浣哄У閹瑰洭寮婚悢鐓庣闁哄被鍎卞浼存倵濞堝灝鏋熷┑鐐诧躬楠炲啫鈻庨幘鏉戔偓缁樹繆椤栨粌甯舵鐐茬墕閳规垿鎮╅崹顐ｆ瘎婵犳鍠楀娆戝弲闂佹寧娲嶉崑鎾绘煃閽樺妲兼い锕侇潐娣囧﹪顢曢敍鍕閻庡灚婢樼€氫即鐛崶顒夋晣闁绘ɑ褰冪粻鍝勨攽閻樻鏆俊鎻掓嚇瀹曞綊骞庨挊澶岋紵闂侀潧鐗嗛ˇ顖炴偂濠靛鐓涢柛銉ｅ劚閻忣亪鏌ｉ幘瀛樼妤犵偞鐗楀蹇涘礈瑜忛敍鐔虹磽娴ｅ搫小闁告鍟胯灋濞达絿鎳撶欢鐐烘煙闁箑骞橀柛妯诲劤閳规垿鎮欑€涙绋囧銈嗗灥濡鍩㈠澶婂窛闁哄鍨归弻鍫ユ⒑瑜版帗锛熼柣鎺炵畵閸╂盯骞嬮敂瑙ｆ嫼濡炪倖鍔戦崐鏇熺濠婂牊鐓犳繛鑼额嚙閻忥繝鏌￠崨顓犲煟妞ゃ垺鐟╁畷婊嗩槾闁挎稒绮撳铏圭磼濮楀棛鍔搁柣蹇撶箲閻燂箓寮查妷鈺傜厽閹兼番鍊ゅ鎰箾閸欏顏嗗弲闂佺粯姊婚崢褔鎷戦悢鍏肩厱闁斥晛鍠氬▓銏ゆ煕濮橆剦鍎旈柡灞剧☉閳藉宕￠悙鍏稿寲闂備礁鎼鍛村疮閺夋埈娼栫紓浣股戞刊鎾煕濠靛嫬鍔ゅΔ鏃堟⒒娴ｄ警鐒炬い鎴濇嚇閺佸啴顢旈崟顓熸婵炴潙鍚嬪娆戠不閾忣偂绻嗛柕鍫濆€告禍鍓х磼閻愵剙鍔ゆい顓犲厴瀵鎮㈤悡搴ｎ槶閻熸粌绻掗弫顔尖槈閵忥紕鍘遍柣搴到婢у海寮ч埀顒€鈹戦纭锋敾婵＄偘绮欓妴浣割潨閳ь剚淇婇幖浣哥厸闁稿被鍊愰崑鎾愁吋婢跺鎷洪柣搴℃贡婵參宕靛▎鎾寸厽婵°倓鐒︾亸顓熴亜椤愩垻绠伴悡銈嗐亜韫囨挸顏х紒鍗炵埣濮婃椽宕ㄦ繝鍐槱闂侀潻缍嗛崰鏍€﹂崶顒€閱囬柡鍥╁暱閹锋椽姊洪崨濠勨槈闁挎洏鍎甸幃锟犲Ψ閳哄倻鍘藉銈嗘尵閸嬫盯鍩€椤掆偓閻忔繈鎮惧畡鎳婃椽顢旈崟搴涘姂閺屻劑寮村Δ鈧禍鍓х磽娴ｇ顣抽柛瀣洴閸╃偤骞嬮敂钘夆偓閿嬨亜韫囨挸顏ù鐓庡濮婃椽宕妷銉愶綁鏌ｅΔ鍐ㄢ枅闁绘侗鍣ｅ畷姗€顢欓懖鈺佸Ф闂備礁鎲￠崝蹇涘疾濞戙垹绀夐柛娑卞弾濞撳鏌曢崼婵囶棡妞ゃ儱妫楅埞鎴︻敊閸濆嫧鍋撳┑瀣畾濞撴埃鍋撴鐐差儔閹晠鎮界喊澶岄棷?generateImage 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱闁靛牆鎳庨顓㈡煛鐏炲墽娲存い銏℃礋閺佹劙宕卞▎妯恍氱紓鍌欒兌閸嬫捇宕曢崘宸劷闁跨喓濮撮拑鐔兼煥濠靛棭妲告い顐㈡嚇閺屾洝绠涙繝鍐╃彇闂佸憡姊归幃鍌氼潖閸濆嫅褔宕惰閸嬫挸螖閸涱厾锛涢梺瑙勫礃閸╂牕鐣烽崣澶岀瘈闂傚牊渚楅崕鎰亜閵夈儳澧涚紒缁樼洴楠炲鈹戦崱姘厴闂備礁鎲￠幖鈺呭礈閻斿娼栨繛宸簼閻掑鏌ｉ幇顖氳敿閻庢碍婢橀…鑳槻濠⒀呮櫕濡叉劙骞掑Δ浣镐汗闂佹儳娴氶崑鍕枈瀹ュ鈷戝ù鍏肩懅缁夘噣鏌￠埀顒佹綇閳哄啰澶勯梺浼欑到閻ジ鎯屽▎鎾村仯闁搞儻绠戠€氬酣鏌涢弮鈧崹鍨嚕婵犳艾鍗抽柣鏃囨瑜版儳顪冮妶鍡欏缁炬澘绉瑰畷鎶芥倻濡寮块梺鎸庣箓閹冲繘宕板Ο缁樺弿濠电姴鍋嗛悡鑲┾偓瑙勬礃鐢帡鍩㈡惔銊ョ闁瑰瓨绻傞懙鎰版⒒閸屾瑨鍏屾い銏狅工閳诲秹寮撮姀鐘殿唶婵犵數濮甸懝楣冩偪妤ｅ啯鐓曟い鎰剁稻缁€鍐煕鐎Ｑ勬珚闁诡喗锕㈤幃娆撴嚋濞堟寧顥夐梻浣筋嚙缁绘劙鏁冮妶澶嗏偓鏃堝礃椤斿槈褔鏌涢埄鍐噧闁冲嘲鐗撳铏圭矙濞嗘儳鍓辩紓浣割儐閹歌崵绮╅悢鐓庡嵆闁绘ê鍟跨壕顖炴⒑闂堟侗鐒鹃柛銊潐缁傚秹鎮欓澶嬵啍闂佺粯鍔樼亸娆愮閵忋倖鐓曢柡鍐ｅ亾缁炬澘绉规俊鐢稿礋椤栨稒娅嗛梺鍓茬厛閸犳牜绮婇鈧铏规嫚閳ヨ櫕鐝紓浣虹帛缁诲倿顢氶敐澶婄妞ゆ梻鈷堝濠囨⒑閹稿海鈽夐悗姘煎墴閻涱噣骞囬悧鍫氭嫽婵炶揪缍€椤宕戦悩缁樼厱閹兼惌鍠栭悘锔锯偓瑙勬礃濞叉ê顭囪箛娑樜╅柕鍫濇川閻ｆ儳鈹戦悩缁樻锭闁稿﹥鎮傞獮澶愭晸閻樺啿浜楅梺缁樻閸嬫劙宕ｉ幘缁樼厱闁靛绲芥俊浠嬫煃闁垮娴柡宀€鍠栧畷姗€宕ｆ径濠冪亷闂備礁鎼惌澶屾閺囩喓顩烽柨鏇炲€哥粈鍫㈡喐鐎ｎ喖鐒垫い鎺嶇濞搭噣鏌＄仦鐣屝ユい褌绶氶弻娑㈠箻閸楃偛顬嬬紓浣戒含閸嬨倕鐣烽崡鐐╂婵☆垳銆嬬槐閬嶆⒒娴ｅ憡鍟炲〒姘殜瀹曘垺銈ｉ崘銊﹁緢闂佹寧妫冮弫顕€宕戦幘璇茬濠㈣泛锕ｆ竟鏇㈡⒒娓氣偓閳ь剛鍋涢懟顖涙櫠閹绢喗鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲嫭顐介柨鐔哄Т閻ゎ噣鐓崶銊р姇闁绘挻娲熼弻锝呂熺拠鎻掝潽濠电偛鐗婂ú鐔煎蓟濞戙垹绠抽柟鎼灥閸氼偊姊虹拠鈥虫灍闁稿孩濞婇幃鎯р攽鐎ｎ亞鍔﹀銈嗗笂閼冲爼鍩㈤弮鍌楀亾楠炲灝鍔氭俊顐ｇ〒缁粯銈ｉ崘鈺冨幍闁诲孩绋掗…鍥箠閸愵喗鐓熼煫鍥э攻濞呭﹪鏌＄仦鍓р槈閾绘牕霉閿濆洨銆婇柡瀣懇濮婃椽宕崟顓犲姽缂傚倸绉崇欢姘舵偘椤曗偓瀹曞爼顢楁径瀣珝闁荤喐绮岀粔鐟邦嚕閸欏缍囬柕濞у拋鍟庨梻浣告惈椤︿即宕归悽绋跨畺闁硅揪闄勯悡鐔镐繆閵堝懎鏆欑€涙繂顪?
             if (!response.has("data")) {
@@ -658,13 +1003,19 @@ public class NewApiClient {
             }
 
             String dataContent = first.toString().length() > 500 ? first.toString().substring(0, 500) : first.toString();
-            log.error("NewAPI editImage data[0] 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐎涙繄绱撻崒姘毙㈤柨鏇ㄤ簻椤曪絿鎷犲顔兼倯婵犮垼娉涢敃锝囨閸洘鈷戦柛娑橈攻婢跺嫰鏌涢幘瀵告噧闁宠绉归弫鎰緞鐎Ｑ勫缂傚倷绀侀鍫ュ磿婵犳熬缍栭柨鏇炲€归悡鏇㈡煛閸愶絽浜鹃梺鎼炲妼閻忔繈顢氶敐鍡欑瘈婵﹩鍘藉▍鍥⒑闁偛鑻晶鏌ユ煟韫囨柨绗氱紒缁樼洴楠炴﹢寮堕幋婵囩槗闂備焦鎮堕崝鎴炵閸洏鈧線骞樼拠鎻掕€垮┑鐐村灦閻熴垽骞忓ú顏呪拺闁稿繗鍋愰妶鎾煛閸涱喚娲撮柕鍡楀€圭缓浠嬪川婵犲倵鍋撻悽鐢电＜婵°倓鑳堕埥澶嬬箾鐏炲倸鈧牠銆佹繝鍥ㄢ拻濞达絽鎲￠崯鐐寸箾鐠囇呯暤鐎规洖缍婇獮宥夘敊閸欍儳鐟濆┑鐘垫暩婵數鍠婂澶嬪亗闁哄洨鍠嶇换鍡涙煏閸繃鍣归柡鍡樼懃闇夐柣妯荤懃閸樻崘銇愰幒鎾充汗闂佸憡绻傜€氼亜效濡ゅ啰纾藉ù锝勭矙閸濇椽鏌熺粙娆剧吋妤犵偛绻樺畷銊╁级閹存粎鐐婇梻浣告啞濞叉﹢宕硅ぐ鎺戠；闁靛牆顦拑鐔哥箾閹寸偟鎳勯柛搴ｅ枛閺屻劌鈹戦崱姗嗘！濠殿噯绲介悧鎾诲箖濡も偓閳绘捇宕归鐣屼邯婵＄偑鍊ら崢楣冨礂濮椻偓閻涱噣宕橀纰辨綂闂侀潧绻掓慨鐢告倵閹惰姤鐓涘璺猴功婢ф垿鏌涢弬璺ㄐ㈤柍璇茬Ч瀵粙顢橀悢鍙夊濠电偠鎻紞鈧繛鍜冪秮婵″瓨绻濋崶銊у幈闂佽鍎抽顓犵不閻愮儤鐓忛柛鈩冾殔閺嗭絿鈧娲忛崝鎴濐嚕閸洖绠ｉ柣鎰閸欐垿姊婚崒娆掑厡缂侇噮鍨跺濠氬Ω閳轰浇袝闁诲函缍嗛崰妤呭磻閸岀偞鐓涢柛銉㈡櫅閺嬪秶绱掔拠鍙夘棡闁靛洤瀚板浠嬪Ω瑜忛濂告⒑閹肩偛鈧牠鎮烽敂鐐床婵炴垯鍨圭粻瑙勩亜閹捐泛浠﹂柣蹇撶Ч濮婃椽鏌呭☉姘ｆ晙闂佸憡鏌ㄧ粔鍫曞箲閵忕姭鏀介悗锝庝簽椤︺劑姊哄畷鍥ㄥ殌闁靛洦锕㈤幖瑙勬償椤厾绠氶梺闈涚墕濞层倕鏆╅梻浣侯焾椤戝洭宕戦妶澶婄畺鐟滄棃骞冮埡鍐╁珰闁肩⒈鍓涢弳顐ｇ節閻㈤潧浠滄俊顐ｇ懇楠炴劙宕妷褌绗夐梺姹囧灩閹诧繝鎮″▎鎾寸厽闁瑰浼濋鍫熷€块柣鎰靛墰缁犻箖鏌涜箛姘汗闁愁垱娲滅槐鎺旂磼濡偐鐤勯梺璇″枙缁瑥螞閸愵煁褰掓嚋閻㈠灚鍒涢梺鍝勭灱閸犲酣鎮鹃敓鐘茬骇闁圭瀛╅鎺楁煟鎼淬値娼愭繛鍙夌墪閻ｇ兘顢楅崟銊㈠亾閺冨牆绀冩い鏂挎閵娾晜鐓ラ柡鍐ㄦ处椤ュ鐥悙顒€鈻曟慨濠冩そ瀹曨偊宕熼鐘插Ы缂傚倷鑳剁划顖滄崲閸岀偞鍋╅柣鎴ｆ鎯熼梺鍐叉惈閿曘儵寮查敐澶嬧拺缂備焦锕╅悞楣冩倶韫囨梻鎳囩€规洏鍨虹粋鎺斺偓锝庡亞閸樹粙鏌熼崗鑲╂殬闁糕晛瀚板畷顖濈疀濞戞瑧鍘遍梺缁橆焾濞呮洜绮堥崼銉︾厱闁圭儤鎸哥粭鎺楁煃鐠囨煡鍙勬鐐达耿楠炲秵鎷呴梹鎰棜濠电偠鎻徊鑺ョ珶婵犲偆鐒介柕濞炬櫆閻撳啰鎲稿鍫濈闁绘棁鍋愬畵渚€鏌涢幇鈺佸Ψ闁哄閰ｉ弻鐔衡偓娑櫳戦悡銉ッ瑰鍫㈢暫闁哄矉缍佹慨鈧柕蹇婂墲濮ｅ嫰姊洪棃娑欘棞闁挎洦浜璇测槈濮橈絽浜鹃柨婵嗛娴滄繄鈧娲栭張顒勫Φ閸曨垰顫呴柍钘夋閻や線鎮楃憴鍕闁哥姵鐗犻妴渚€寮介鐔锋疅闂侀潧顦崕鐑樺閺嶎偆纾介柛灞捐壘閳ь剚鎮傚畷鎰板箹娴ｅ摜锛欓梺缁樺灱婵倝宕愰崸妤佺叆闁哄洨鍋涢埀顒€缍婂鎻掆攽鐎ｎ偆鍘撻柡澶屽仦婵粙顢欐径鎰厸閻庯綆鍋呴ˉ鍫ユ煛瀹€瀣瘈鐎规洘锕㈡俊姝岊槻妞ゃ倐鍋撻梻鍌欒兌缁垶骞愭ィ鍐ㄧ獥闁归偊鍘鹃埞宥呪攽閻樺弶鎼愰崶鎾⒑缁嬫寧婀伴柣顓у枟缁旂喖寮撮悢铏圭槇缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簼閸ｇ晫绱掗鐣屾噰妤犵偞顭囬幏鐘绘嚑椤掑孝闂傚倷绀佸﹢閬嶅磿閵堝绠伴柛鎾楀啫袣闂侀€炲苯澧存慨濠冩そ楠炴牠鎮欓幓鎺戭潙闂備礁鎲￠弻銊х矓閹绢喖鐓濈€广儱顦悙濠冦亜閹哄秷顔夐柟鐤缁辨挻鎷呴崜鎻掑壉闁诲海鐟抽崘鑳偓鍧楁煙濞堝灝鏋ょ痪鎯с偢閹鏁愭惔鈥茬盎闂佽绻戦幐鎶藉蓟濞戙垹鐓橀柟顖嗗倸顥氭繝纰夌磿閸嬫垿宕愰弽褜鍟呭┑鐘宠壘绾惧鏌熼崜褏甯涢柣鎾跺枛閻擃偊宕堕妸锔规嫻闂佹眹鍔嶉崹鍧楀蓟閻旇偐宓侀柛顭戝枤娴犲ジ姊虹€圭姵顥夋い锕€鐏氶幈銊╁焵椤掑嫭鐓熸俊顖涙た閸熷繘鏌涘顒佸殗婵﹦绮幏鍛存惞閻熸壆顐奸梻浣告啞濮婄懓煤閻旂厧绠栨俊顖欒濞尖晠鎮归悜妯汇仢婵☆偆鍏樺娲嚍閵夊喚浜棟妞ゆ劧绠戠紒鈺伱归悩宸剱闁绘挾鍠栭弻鐔兼焽閿曗偓閻忕娀鏌ｉ妸銉︽儓妞ゎ叀鍎婚ˇ宕囩磼鐎ｎ偄绗ч柟骞垮灩閳藉濮€閻樼數鍘┑鐘灱閸╂牜绮欓弽顓炵劦妞ゆ巻鍋撻柣蹇旂箞閸╃偤骞嬮敂鑺ユ珫闂佸憡娲﹂崜姘掗崼銉﹀€甸悷娆忓缁€鍫ユ煕閻樺磭澧甸柕鍡曠閳藉顫滈崱妯哄厞婵＄偑鍊栭幐鍡涘礋閸偓绱欓梻鍌氬€搁崐宄懊归崶褏鏆﹂柛顭戝亝閸欏繘鏌涢…鎴濅簽妞も晜褰冮湁闁绘ê妯婇崕蹇曠磼閳ь剚寰勯幇顒傤啇濠电儑缍嗛崜娆愪繆閼测晝纾奸柍褜鍓氬鍕偓锝冨妺缁ㄥ姊洪崫鍕犻柛鏂块叄婵℃挳骞掗弮鍌滐紲闂佹娊鏁崑鎾绘煕鐎ｎ偅灏电紒杈ㄦ尰閹峰懐绮欐惔鎾村瘱濠电姭鎷冮崟鍨杹闂佽桨绀侀鍡欐崲濠靛鐓曢柍褜鍓熷畷鐔碱敇閻愯尙鍝楅梻鍌欑閹碱偊鎯夋總绋跨獥闁规崘娉涢崹婵囩箾閸℃ɑ灏柛銊ュ€归妵鍕籍閸ヮ灝鎾绘煟閿旇偐绉慨濠勭帛閹峰懏顦版惔婵婎洬缂傚倷鐒﹁ぐ鍐焽閳ュ磭鏆︽俊銈傚亾妞ゎ偅绮撻崺鈧い鎺戝閸嬫ɑ銇勯弴妤€浜惧Δ鐘靛仦鐢帟鐏冮梺閫炲苯澧扮紒顔碱煼閺佹劙宕遍幇顏嗙泿闂備浇顫夊畷妯衡枖濞戙垹鍑犻幖娣妽閻撴洟鐓崶銊︽儓闂婎剦鍓氶幈銊︾節閸愨斂浠㈤悗瑙勬处閸嬪﹤鐣烽悢鐓庡瀭妞ゆ劕绋勭粻鎾愁潖閾忓湱纾兼慨妤€妫欓悾鍫曟煟鎼淬垻顣叉繝銏★耿閹儳鐣￠幍铏杸闂佺硶妾ч弲娑㈠箖閹寸偟绡€闁靛骏绲剧涵楣冩煥閺囶亞鐣甸柟顔诲嵆婵＄兘鍩￠崒妤佸闂備礁鎲＄换鍌溾偓姘煎幖椤斿繐鈹戠€ｎ偆鍘遍梺缁橆焾濞呮洜浜搁悽纰樺亾濞堝灝鏆欓柛銉戝懎濮? {}, 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬悧鍫㈠幘缂佺偓婢樺畷顒佹櫠缂佹ü绻嗛柤纰卞墮閸樺瓨鎱ㄦ繝鍕笡闁瑰嘲鎳樺畷銊︾節閸愩劌澹嶅┑鐘垫暩閸嬫盯鎯囨导鏉戝瀭闁芥ê顦遍弳锔炬喐閻楀牆绗掗柟纭呭煐閵囧嫰骞樼捄鐩掞紕绱掑Δ鈧ˇ闈涱潖閾忓湱纾兼慨妤€妫涢崝绋款渻閵堝棙鑲犻柛娑卞灟缁楀鎮峰鍛暭閻㈩垱顨婇幃鈥斥枎閹寸姵锛忛梺鍝勵槸閻忔繈鎳滅憴鍕垫闁绘劘鎻懓鍧楁煛鐏炲墽鈽夐摶锝夋煠婵劕鈧牠宕氬☉銏♀拺? {}", firstFieldNames, dataContent);
+            log.error("NewAPI editImage data[0] 缺少字段, 字段={}, 内容={}", firstFieldNames, dataContent);
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸荤换鍕缁嬪簱鏋庨柟鎹愭珪閻庮剟姊洪崫鍕枆闁稿妫涙竟鏇㈡寠婢规繂缍婇弫鎰板炊閵娿儲鐣梻浣告啞閺岋綁宕愬Δ鍛疅闁归棿绀佺粻銉︺亜閺冨牊锛熼柟瀵稿厴濮婃椽宕ㄦ繝鍌滅懖闁汇埄鍨辩敮锟犲春閵忊剝鍎熼柕濞垮劤椤旀帡鏌ｆ惔鈩冭础濠殿喚鏁婚獮澶嬪鐎涙ǚ鎷绘繛杈剧到閹碱偅绂掑ú顏呯厱閹兼番鍨婚崣鈧悗瑙勬礃缁矂锝炲┑鍫熷磯濡わ箑鏅濋弴銏＄厽閹兼惌鍨崇粔鐢告煕閻樺磭澧辩紒顔碱煼瀹曠兘顢橀悩纰夌床婵＄偑鍊栧濠氬储瑜忛弫顕€濡搁埡鍌滃幈闁诲函缍嗛崑鍛暦鐏炵虎娈介柣鎰级婢跺嫰鏌熷畡鐗堝殌闁靛洦鍔欓獮鎺楀棘鐠侯煉绱甸梻鍌氬€搁崐鎼佸磹閹间礁纾归柣鎴ｅГ閸婂潡鏌ㄩ弴鐐测偓褰掑磿閹寸姵鍠愰柣妤€鐗嗙粭鎺楁煛閸曗晛鍔﹂柡灞剧洴瀵挳濡搁妷褌鍝楅梻浣规偠閸斿矂宕愰崸妤€钃熼柍鈺佸暙缁剁偤骞栭幖顓炴灈婵炲牊鍎抽埞鎴︽倷閺夋垹浠搁柤瑁ゅ€濋弻锟犲焵椤掍胶顩烽悗锝庡亜閳ь剛鏁婚弻銊モ攽閸℃瑥鍤┑鐐差嚟閸忔﹢寮婚悢鍏煎殟闁靛濡囬ˇ銉╂⒑鐎圭媭娼愰柛銊ユ健楠炲啫鈻庨幘宕囬獓闂佺懓顕慨鍐差浖閹剧粯鈷戦柤鐟板簻妤犲繘鏌涙繝鍐疄鐎殿喖顭烽弫鎾绘偐閼碱剙濮︽俊鐐€栫敮濠囨嚄閸洏鈧懘鎮滈懞銉モ偓鐢告煥濠靛棝顎楀ù婊呭仱閺屾稑顫滈埀顒佺鐠轰警娼栨繛宸簻濡﹢鏌曟径娑㈡闁绘繃妫冨娲传閵夈儛锝囩棯閺夎法肖闁逞屽墴濞佳囧Χ缁嬫鍤曟い鏇楀亾鐎规洖銈搁幃銏ゅ传閸曨偄顩梻鍌氬€搁…顒勫磻閸曨個娲Χ婢舵ɑ鏅為梺鍛婄☉閻°劑宕愰懜鐐逛簻闁哄倸鐏濋埛鏃€淇婇顐㈢仸闁哄瞼鍠栭、娑㈠幢閺囩媭妲繛瀵稿閸ｏ絽顫忓ú顏勪紶闁告洦鍓氶幏鍗炩攽閻愭彃绾фい顓炴喘楠炴垿濮€閻橆偅顫嶉梺闈涚箳婵挳鎮楅鐑嗘富闁靛牆妫欓埛鎺楁煕濡姴娴勭紞鏍煙閹冾暢缁惧彞绮欓弻娑氫沪閸撗勫櫙闂佺绻愰惌鍌炲箖濡も偓椤繈顢楅崒婊庡晪闁诲氦顫夊ú蹇涘礉閹达负鈧礁鈽夊鍡欏弳闂佸綊鍋婇崰鏍姳閵夆晜鈷掗柛灞剧懄缁佺増銇勯弴鍡楁搐缁€鍕煟閿濆懐鐏辩紒鈧繝鍥ㄧ厱闁斥晛鍠氶悞鑺ャ亜閳哄倻鍙€闁诡喛顫夊顏堝箥椤旀嫎顓㈡⒑缂佹ɑ鈷掗柛妯犲洦鍊块柛顭戝亖娴滄粓鏌熼崫鍕棞濞存粍鍎抽—鍐Χ鎼存繄鐩庨梺鍝ュ枎閻°劍绌辨繝鍥ч唶闁哄洨鍋熼ˇ銊╂⒑闂堟丹娑㈠磼濠婂嫸绱￠梻鍌氬€搁崐鐑芥倿閿旈敮鍋撶粭娑樺幘妤﹁法鐤€婵炴垶锚閻庮厽绻涚€电孝妞ゆ垵娲ら悾鍨瑹閳ь剟寮诲☉銏犵疀闂傚牊绋掗悘鍫濐渻閵堝骸浜滈柟铏耿瀵寮撮敍鍕澑闁诲函缍嗘禍鐐村閸曨垱鈷戠紓浣股戠亸浼存煙閻熺増鍠樼€殿喖顭烽弫鎰緞鐎ｎ亙姹楅梻浣侯焾缁绘劙骞婇幘璇叉槬闁告稑鐡ㄩ埛鎴︽煕濞戞﹫鏀婚柣鎾卞劦閺岋綁顢橀悙娴嬪亾閽樺）娑㈡偄閸忓皷鎷洪梺鍛婂姇瀵爼骞嗛崼銉︾厵闁告劘灏欑粻濠氭煕閳哄倻娲存鐐村笒铻栧ù锝呮惈楠炲牓姊虹拠鑼闁稿绋掗弲鑸电鐎ｎ亞鐤囬梺绯曞墲缁嬫帡鎮￠弴銏㈠彄闁搞儯鍔嶇亸鐢告煟閹烘挻鍊愰柡灞糕偓宕囨殕闁逞屽墴瀹曚即寮介鐐殿啇閻熸粎澧楃敮鈺呭极閸愵喗鐓ユ繝闈涙閸ｄ粙鏌ㄥ☉娆愬磳婵﹦绮幏鍛驳鐎ｎ亝鐣伴梻浣告憸婵敻銆冩繝鍥ф瀬閻庯綆浜跺〒濠氭煏閸繈顎楀ù婊勭箘缁辨帞鎷犻幓鎺濅純濡ょ姷鍋為崹鍨暦閻旂⒈鏁嶆繛鎴炵懃閸旀帡姊绘担鐣屾瘒闁告劏鏅滈崰鎰版⒑閸涘﹨澹樼紓宥咃工椤繑绻濆顒傦紲濠电偛妫欓崝妤呭Χ閺夋娓婚柕鍫濋娴滄粍銇勯敃鍌涙锭闁伙絿鍏樺鎾閳ュ厖绨垫俊銈囧Х閸庢劙宕滃鑸靛剮妞ゆ牗姘ㄩ弳锕傛煟閺冨倵鎷￠柡浣哥У閹便劌顫滈崱妤€顫╅梺瑙勬偠閸婃繂顫忕紒妯肩懝闁逞屽墮椤洩顦归柡浣哥Х缁犳稑鈽夊Ο鐓庡Е婵＄偑鍊栫敮鎺斺偓姘煎墰婢规洘绻濆顓犲幍闂佺顫夐崝锕傚吹濞嗘垹纾奸柍褜鍓熷畷鎺戭潩閼测晛鏁搁梺鑽ゅЬ濞咃絿浜搁妸銉綎婵°倐鍋撴い顓℃硶閹叉挳宕熼鍌ゆЧ婵犳鍠栭敃锔惧垝椤栫偛绠柛娑欐綑瀹告繂鈹戦悩鎻掆偓鐟扳枔濡崵绡€闁汇垽娼ф禒鈺傘亜閺囩喓鐭岀紒顔碱煼楠炴ê鐣烽崶銊︻啎闂備胶顢婇幓顏嗙不閹达妇宓侀柕蹇ョ磿缁犻箖鏌熺€电鍓遍柣鎺嶇矙閺屻劌鈽夊▎鎴炲櫚濠殿喖锕ㄥ▍锝囨閹烘嚦鐔煎传閸曞灚缍嶉梻鍌欒兌椤牏鑺卞ú顏勭９婵犻潧顑呴弰銉︾箾閹存瑥鐏╃紒鐙呯秮閺屻劑寮崒娑欑彧闂佸憡锚瀹曨剟鍩為幋锔藉€烽柡澶嬪灩娴犳悂姊洪幐搴㈠闁稿锕ら锝夊Ω閿斿墽鐦堝┑顔斤供閸樺ジ鍩€椤掑倹鏆柡灞剧洴閳ワ箓骞嬪┑鍛晼闂備胶鎳撻崯鍨洪銏犺摕闁挎稑瀚▽顏堟煕閹炬瀚崹杈ㄤ繆閵堝洤啸闁稿绋戠叅妞ゆ搩娼块埀顑跨閳诲酣骞樼划瑙勫闂備礁鎼ˇ浼村春閸惊娑橆煥閸愶絾鏂€闂佺粯蓱閸撴岸宕箛娑欑厱闁挎繂楠搁悘锝団偓鍨緲閿曘儳绮嬮幒鏂哄亾閿濆骸浜滃ù婊堜憾濮婃椽宕烽鐐板闂佸憡鎸婚懝楣冣€﹂崶顒€鍐€妞ゆ劑鍊楅敍婵囩箾鏉堝墽绉柛瀣€块獮瀣倷閹绘帞浜栭梻浣告贡閾忓酣宕板Δ鍛亗闁绘绮悡娆愩亜閹捐泛鏋庣紒妤佸浮閺屾盯寮埀顒勬晝閵忋倕钃熺€广儱鐗滃銊╂⒑閸涘﹥灏伴柣鐔叉櫅閻ｇ兘顢涢悙鑼啋濡炪倖妫佹竟鍫ュ箺閺囥垺鈷戦梻鍫熺〒婢ф洘绻涢懠顒€鈻堢€规洘鍨块獮妯兼嫚閸欏绁舵俊鐐€栭幐楣冨磹椤愶箑顫呴柕鍫濇閸樹粙姊洪崷顓炰壕婵炲吋鐟﹂幈銊ヮ吋婢跺鍘搁悗鍏夊亾閻庯綆鍓涢惁鍫ユ倵鐟欏嫭纾搁柛鏃€鍨块獮鍐樄鐎规洖銈搁敐鐐侯敄閽樺澹曢梺瑙勫婢ф鎮￠敐鍥╃＝濞达綀顕栭悞钘夘熆瑜忛弫濠氬蓟閿涘嫪娌柣锝呯潡閵夛负浜滅憸宀€娆㈠璺鸿摕婵炴垯鍨圭粻濠氭偣閾忕懓鍔嬮柣蹇撶墕铻栭柣姗€娼ф禒婊堟煕閻曚礁鐏﹀┑鈥崇埣閺佹劖寰勬繝鍕垫О闂備線娼ч…鍫ュ磿閹惰棄鐒垫い鎺戭槸楠炴牗銇勯鍕殻濠碘€崇埣瀹曞崬螖閳ь剝銆栫紓鍌氬€峰ù鍥ь嚕閹捐泛鍨濇繛鍡樻尪閳ь兛绶氶獮妯兼嫚閼碱剦鍟嬬紓鍌氬€烽悞锕傗€﹂崶顒€鍌ㄥù鐘差儐閳锋垹绱撴担濮戭亝鎱ㄩ崶銊ｄ簻闁哄洢鍔屽顕€鏌涢埞鍨伈妤犵偞顭囩槐鎺懳熼悡搴＄瑲闂佽崵鍠愮划宥囧垝閹惧磭鏆︽繝濠傚暊閺嬪酣鏌熼幆褍鏆遍柛瀣Ч濮婃椽宕崟顓夌娀鏌涢弬鍧楀弰闁诡喚鏁诲畷濂稿即閻斿搫骞愰梻浣规偠閸庮噣寮插☉娆戭洸鐟滅増甯楅悡娑㈡煃瑜滈崜姘辩矉閹烘柡鍋撻敐搴′簽闁告ü绮欏楦裤亹閹烘垳鍠婇梺鍛婎焽閺咁偆妲愰悙鍝勭闁挎梻鏅崢浠嬫椤愩垺鍌ㄩ柛搴㈠▕閹箖鎮介崨濠勫幐閻庡厜鍋撻悗锝庡墰琚﹂梻浣筋嚃閸犳捇宕愰弽顓炵闁告稒娼欐导鐘绘煏婢跺牆鈧洟骞楃€ｎ喗鈷掗柛灞剧懅椤︼妇鐥紒銏犲箻闁告帗甯￠、娑㈡倷閼碱剦鍞归梻浣规偠閸庢粎浠﹂懞銉悪闂傚倷绀佸﹢閬嶆惞鎼淬劌绐楁俊銈呮噹绾惧鏌涢弴銊ュ箻缁惧彞绮欓弻娑㈩敃閻樿尙浠奸柛鐔告倐濮婃椽鎮滈埡鍌涚彅闂備礁搴滅徊浠嬶綖韫囨洜纾兼俊顖濐嚙椤庢捇姊洪崨濠勨槈闁挎洏鍎靛畷鏇㈠箻缂佹ǚ鎷虹紓浣割儏鐏忓懏螞濮橆厺绻嗘い鎰╁灩椤忣參鏌涢埞鍨伈鐎殿噮鍣ｅ畷鐓庘攽閸℃銈梻鍌欑窔濞佳呮崲閸℃稑鐒垫い鎺嶇劍閻忛亶鏌涚€ｎ偅宕岀€规洜顭堣灃濞达絽鎼獮宥夋⒒閸屾艾鈧悂宕愰幖渚囨晪妞ゆ挶鍨圭粈澶屸偓骞垮劚椤︿即鎮￠悢鍏肩厵闁诡垎灞芥闂佸疇妫勯ˇ闈浳涙担鐟扮窞闁归偊鍘鹃崣鍡椻攽閻樼粯娑ф俊顐ｇ懇瀹曞啿煤椤忓懐鍘甸梺鍛婄懃椤︿即宕愰幇鐗堢厵闁惧浚鍋嗘晶鐢碘偓娈垮枙缁瑩銆佸鈧幃銏ゅ矗婢跺浼栭梻鍌氬€搁崐椋庢閿熺姴纾婚柛鈩冪☉绾剧粯绻涢幋娆忕仾闁搞倖鍔栭妵鍕冀閵娧€濮囧┑鐐叉噽婵炩偓闁哄本绋戦埢搴ょ疀閿濆柊銈嗙箾鐎涙鐭嬬紒顔肩Ч婵＄敻宕熼姘辩杸闂佸疇妗ㄩ懗鍫曞礉閺夋垟鏀介梽鍥╀焊濞嗘挸绠犻柟鍓ф嚀缁插綊姊绘担瑙勫仩闁稿孩绮岄濂稿川椤撗勬祮闂傚倸鍊烽懗鍫曞储瑜旈獮鏍敃閵忋垺娈惧銈嗗笒鐎氼參宕戦埡鍛厓闁靛绠戞晶顖涚箾?] 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬悧鍫㈠幈闂佸綊鍋婇崹鎵閿斿墽纾介柛鎰ㄦ櫆缁€瀣叏婵犲嫮甯涢柟宄版嚇瀹曘劍绻濋崘銊ュ濠电姷鏁搁崑娑㈡儑娴兼潙鍨傞柦妯侯槺閺嗭妇鎲搁悧鍫濈瑨闁圭鍩栭妵鍕箻鐠虹洅锛勭磼濡も偓椤﹂潧顫忛搹鍦＜婵妫涢崝绋款渻閵堝棙鑲犻柛娑卞灟缁楀鏌ｉ悢鍝ユ噧閻庢凹鍠氱划缁樸偅閸愨晝鍙嗗┑鐘绘涧濡繈顢撳Δ鈧…鑳檨闁哥姵鐗犻崺鐐哄箣閿旂瓔鈧劙姊虹粙娆惧剱闁告梹顨呭嵄闁圭増婢樼粻铏繆閵堝嫮顦﹀ù婊冪秺濮婃椽宕ㄦ繝鍌氼潔閻熸粍婢橀崯鎾嵁濡ゅ懏鍋ㄩ柛娑樑堥幏娲⒑閸涘﹦绠撻悗姘煎幖閿曘垺瀵肩€涙鍘介梺鍐叉惈閿曘倝鎮橀敃鍌涚厪闁糕剝娲滅粣鏃傗偓娈垮枟閹歌櫕鎱ㄩ埀顒勬煃閵夈儱甯犵紒銊ㄥ吹缁辨捇宕掑▎鎴М濡炪倖鍨靛Λ娑㈠焵椤掑倻鎳楅柛銉ｅ妼娴犙勭箾鐎电甯堕柣掳鍔戦崺娑㈠箳閹炽劌缍婇弫鎰板礋椤曞懎濡抽梻浣虹帛鐢偤宕戦幘璇参﹂柛鏇ㄥ灠缁狅絾绻濋棃娑欑ォ婵☆偓绠戣灃闁绘﹢娼ф禒锕傛煕閺冣偓閻熲晠鎮伴鈧浠嬪Ω閿曗偓椤庢捇姊洪崨濠勭細闁稿骸宕锝夊Ω閵夈垺鏂€闂佺粯锕╅崰鏍倶鏉堛劎绠惧璺侯儑椤厧顭胯缁诲牆顫忓ú顏勪紶闁告洟娼ч崜浼存煟鎼淬垻鈻撻柡鍛矌缁碍娼忛妸褏鐦堥梺鎼炲劥閸╂牠寮查鈧埞鎴︽偐缂佹ɑ閿┑鈽嗗亝椤ㄥ﹪鐛崱娑欏€烽柣鎴炃氶幏娲⒑閸涘﹦绠撻悗姘煎弮閺佸秹寮崼鐔叉嫽闂佸憡娲﹂崑鍕敂椤忓棛纾? " + firstFieldNames);
+                "NewAPI data[0] 缺少字段:" + firstFieldNames);
         } catch (Exception e) {
-            if (e instanceof BusinessException) throw e;
+            // 2026-08-13 FIX: 用 instanceof pattern matching,避免 throw e 编译错误 (Java 21 严格)
+            if (e instanceof BusinessException be) throw be;
+            if (e instanceof org.springframework.web.client.HttpClientErrorException he) {
+                log.error("NewAPI /v1/images/edits failed: {} {}", he.getStatusCode(), he.getResponseBodyAsString());
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI 调用失败:" + he.getStatusCode() + " " + he.getStatusText());
+            }
             log.error("NewAPI editImage failed: {}", e.getMessage());
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨浠嬫煟閹般劍娅呭ù婊堢畺濮婄粯鎷呴崨濠冨創闁荤偞鍑归崑濠傜暦閹邦兘鏀介悗锝庡墮缁侊附绻涢幘鏉戠劰闁稿鎸婚〃銉╂倷閺夋垶璇炲Δ鐘靛仜椤戝懘鍩為幋锕€骞㈤柍鍝勫€圭粭搴♀攽閻樺灚鏆╁┑顔惧厴瀵偊骞栨担鍝ワ紱濠电偞鍨崹鍦不閻樼粯鐓欓梺顓ㄧ畱楠炴绱掗悩鑽ょ暫闁哄苯绉烽¨渚€鏌涢幘璺烘灈鐎殿喖顭烽弫宥夊礋椤忓懎濯扮紓鍌欑贰閸ㄥ崬煤閺嶃劎顩插Δ锝呭暞閻撴瑥螞妫颁浇鍏屾い锔肩畵閺岀喖顢欓挊澶屼紝闂佸搫鐬奸崰鏍箠閺嶎厼鐓涢柛鏇烇工椤︾敻寮诲鍫闂佸憡鎸荤换鍕缁嬪簱鏋庨柟鎹愭珪閻庮剟姊洪崫鍕枆闁稿妫涙竟鏇㈡寠婢规繂缍婇弫鎰板炊閵娿儲鐣梻浣告啞閺岋綁宕愬Δ鍛疅闁归棿绀佺粻銉︺亜閺冨牊锛熼柟瀵稿厴濮婃椽宕ㄦ繝鍌滅懖闁汇埄鍨辩敮锟犲春閵忊剝鍎熼柕濞垮劤椤旀帡鏌ｆ惔鈩冭础濠殿喚鏁婚獮澶嬪鐎涙ǚ鎷绘繛杈剧到閹碱偅绂掑ú顏呯厱閹兼番鍨婚崣鈧悗瑙勬礃缁矂锝炲┑鍫熷磯濡わ箑鏅濋弴銏＄厽閹兼惌鍨崇粔鐢告煕閻樺磭澧辩紒顔碱煼瀹曠兘顢橀悩纰夌床婵＄偑鍊栧濠氬储瑜忛弫顕€濡搁埡鍌滃幈闁诲函缍嗛崑鍛暦鐏炵虎娈介柣鎰级婢跺嫰鏌熷畡鐗堝殌闁靛洦鍔欓獮鎺楀棘鐠侯煉绱甸梻鍌氬€搁崐鎼佸磹閹间礁纾归柣鎴ｅГ閸婂潡鏌ㄩ弴鐐测偓褰掑磿閹寸姵鍠愰柣妤€鐗嗙粭鎺楁煛閸曗晛鍔﹂柡灞剧洴瀵挳濡搁妷褌鍝楅梻浣规偠閸斿矂宕愰崸妤€钃熼柍鈺佸暙缁剁偤骞栭幖顓炴灈婵炲牊鍎抽埞鎴︽倷閺夋垹浠稿銈庡幖閸婂灝顕ｉ鈧畷鐓庘攽閸℃瑧宕哄┑锛勫亼閸婃洜鎹㈢€ｎ剛鐭嗗ù锝呮贡椤╂彃螖閿濆懎鏆為柣鎾卞劦閺岋繝宕堕埡浣风捕闂侀€炲苯澧柟顔煎€垮濠氬Ω閳轰絼褔鏌涢埄鍐╃缂佺姵宀稿娲濞戞艾顣洪梺绋匡工閹诧紕绮嬪澶婄鐟滃繒澹曢挊澹濆綊鏁愰崨顔藉創闁哄稄绻濋幃妤呭礂婢跺﹣澹曢梻浣哥秺濡法绮堟笟鈧幏鎴︽偄閸忚偐鍘介梺鍝勫€藉▔鏇炩枔闁秵鐓涢悗锝庡亝椤ュ牓鏌＄仦鍓ф创闁炽儻绠撻獮瀣攽閸モ晙鎲鹃梻鍌欐祰椤曆呮崲閹达箑绠伴柛鎾楀嫷娼熼梺瑙勫礃椤曆呭閸忓吋鍙忔俊顖氭惈閼稿綊鏌嶉鍕粵缂佺粯绋撻埀顒佺⊕椤洭鎯屾繝鍥ㄧ厽闁哄稁鍋勭敮鑸点亜? " + e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 调用失败:" + e.getMessage());
         }
     }
 
@@ -1046,13 +1397,336 @@ public class NewApiClient {
 
     /**
      * 2026-08-09 新增:图生视频(asset URL 版)
-     * 与 submitVideo 类似,但 image 参数是 aicoming proxy 上的 asset URL(已上传)
-     * 跳过 multipart 上传步骤
+     * 2026-08-10 v2 修复:之前 placeholder 兜底会让 NewAPI 收到空字节 → FAILED
+     * 现在直接复用 submitVideo 路径,把 imageBytes 当 input_reference 多部分上传。
+     *
+     * @param prompt       视频生成 prompt
+     * @param assetUrl aicoming proxy assetUrl(仅用于日志/debug,实际不传给 NewAPI)
+     * @param imageBytes   原图字节(由调用方持有;NewAPI 不接受 asset:// URL,必须以 multipart 重新提交)
+     * @param imageFilename 上传时的文件名(用于 Content-Disposition)
+     * @param imageMime    图片 MIME
+     * @param duration     时长(秒)
+     * @param resolution   分辨率
      */
-    public String submitVideoWithAsset(String prompt, String assetUrl, String unused, int duration, String resolution) {
-        // 简化实现:复用 submitVideo 但不传图(让 aicoming-video-proxy 自己用 input_reference)
-        // 实际生产环境应该用 NewAPI /v1/videos 的 asset_url 参数
-        log.warn("[NewAPI] submitVideoWithAsset: 暂用 submitVideo 兜底(assetUrl={})", assetUrl);
-        return submitVideo(prompt, new byte[0], "placeholder.jpg", "image/jpeg", duration, resolution);
+    public SubmitResult submitVideoWithAsset(String prompt, String assetUrl, byte[] imageBytes,
+                                       String imageFilename, String imageMime,
+                                       int duration, String resolution) {
+        log.info("[NewAPI] submitVideoWithAsset: 复用 submitVideoFull multipart 路径(原图 {} bytes, assetUrl={})",
+            imageBytes == null ? 0 : imageBytes.length, assetUrl);
+        if (imageBytes == null || imageBytes.length == 0) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "submitVideoWithAsset: imageBytes 为空,无法提交 NewAPI 视频任务");
+        }
+        return submitVideoFull(prompt, imageBytes, imageFilename, imageMime, duration, resolution, null);
+    }
+
+    /**
+     * 2026-08-11:新增 JSON body + asset_url 引用方式提交。
+     *
+     * 原理:上游(如火山引擎 doubao-seedance-2.0)对新鲜图片会做敏感检测拒真人,
+     *    但 aicoming-proxy 已将资产状态置为 active 表示已通过初步审核。
+     *    用 image_urls=["asset://aic_xxx"] 引用 aicoming-proxy 素材时,
+     *    NewAPI/上游 跳过敏感检测(走白名单路径)。
+     *
+     * 上游反馈:"用素材库中的模型可以规避人脸风险"——就是这个机制。
+     *
+     * @param prompt   视频生成 prompt
+     * @param assetUrl aicoming-proxy 的 asset_url(如 asset://aic_srhnfSwDNwSKkqzBc7FiXO)
+     * @param duration 时长(秒)
+     * @param resolution 分辨率(480p/720p/1080p/4k)
+     * @return NewAPI 任务 ID
+     */
+    public SubmitResult submitVideoByAssetRef(String prompt, String assetUrl,
+                                        int duration, String resolution) {
+        if (assetUrl == null || assetUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "submitVideoByAssetRef: assetUrl 为空,无法提交");
+        }
+        // 调用下面多图版本(向后兼容,additionalUrls=null)
+        return submitVideoByAssetRefList(prompt, java.util.List.of(assetUrl), duration, resolution);
+    }
+
+    /**
+     * 2026-08-13 新增:带 fallback 兜底的 asset_url 提交
+     *
+     * <p>场景:NewAPI 中转站(3000 / 8080)某些 model 配置的 channels 都不支持 asset_url 方式
+     * (返回 asset_line_unavailable: "该模型暂不支持虚拟人物素材")。
+     * 此时必须改用公网 URL 提交(走普通 image_url=公网URL 路径)。
+     * 素材库 thumbnail_url 是 aicoming 审核过的公网 CDN URL,本身已经过审核,
+     * 不会触发 PrivacyInformation 二次拦截。</p>
+     *
+     * <p>实现:
+     * 1. 先调 submitVideoByAssetRef 用 asset_url
+     * 2. 如果抛 BusinessException 且 message 含 asset_line_unavailable → 自动用 fallbackPublicUrl 重试
+     * 3. fallbackPublicUrl 是 aicoming 素材库的 thumbnail_url(公网 CDN,已在素材审核中)</p>
+     *
+     * @param fallbackPublicUrl 公网可访问的图片 URL(通常 aicoming thumbnail_url),为 null 时不做 fallback
+     */
+    public SubmitResult submitVideoByAssetRefWithFallback(String prompt, String assetUrl,
+                                                          int duration, String resolution,
+                                                          String fallbackPublicUrl) {
+        try {
+            return submitVideoByAssetRef(prompt, assetUrl, duration, resolution);
+        } catch (BusinessException e) {
+            String msg = e.getMessage() == null ? "" : e.getMessage();
+            boolean isAssetLineError = msg.contains("asset_line_unavailable")
+                || msg.contains("暂不支持虚拟人物素材");
+            if (!isAssetLineError) {
+                throw e;  // 其他错误不 fallback,直接抛
+            }
+            if (fallbackPublicUrl == null || fallbackPublicUrl.isBlank()) {
+                log.warn("[NewAPI-FALLBACK] 检测到 asset_line_unavailable 但无 fallbackPublicUrl,直接抛错");
+                throw e;
+            }
+            log.warn("[NewAPI-FALLBACK] NewAPI 不支持 asset_url 方式,自动 fallback 到公网 URL 重试: "
+                + "assetUrl={} → fallbackUrl={}", assetUrl, fallbackPublicUrl);
+            return submitVideoByPublicUrl(prompt, fallbackPublicUrl, duration, resolution);
+        }
+    }
+
+    /**
+     * 2026-08-13 新增:用公网 URL 提交(非 asset_url 方式)
+     *
+     * <p>用于 asset_url 被 NewAPI 拒绝(asset_line_unavailable)时的 fallback。
+     * 公网 URL 走普通 image_url= 路径,可能触发 PrivacyInformation(但 aicoming 素材库 thumbnail_url
+     * 已经过审核,通常不会再被拦)。</p>
+     */
+    public SubmitResult submitVideoByPublicUrl(String prompt, String publicImageUrl,
+                                                int duration, String resolution) {
+        if (publicImageUrl == null || publicImageUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "submitVideoByPublicUrl: publicImageUrl 为空");
+        }
+        if (!publicImageUrl.startsWith("http://") && !publicImageUrl.startsWith("https://")
+            && !publicImageUrl.startsWith("asset://")) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "submitVideoByPublicUrl: URL 格式不正确,必须 http/https/asset://, got=" + publicImageUrl);
+        }
+        log.info("[NewAPI-FALLBACK] → submitVideoByPublicUrl: url={}", publicImageUrl);
+        return submitVideoByAssetRefList(prompt, java.util.List.of(publicImageUrl), duration, resolution);
+    }
+
+    /**
+     * 2026-08-11 新增:多图版 submitVideo。
+     * 同时传 image_bytes(主图,multipart)和 image_urls(附加 URL 列表,JSON 字段)。
+     *
+     * <p>场景:视频节点上游连多个 image 节点(三视图 + 换装帧图 + 其他),主图用 multipart,
+     * 其余附加 URL 走 image_urls 字段,NewAPI /v1/videos 原生支持多个参考图。</p>
+     */
+    public SubmitResult submitVideoByAssetRefList(String prompt, java.util.List<String> imageUrls,
+                                                  int duration, String resolution) {
+        if (imageUrls == null || imageUrls.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "submitVideoByAssetRefList: imageUrls 为空,无法提交");
+        }
+        Map<String, Object> body = new HashMap<>();
+        // 2026-08-13 严格对齐聚融中转 API 接口手册 v2.1 §7(图生视频 I2V):
+        //   - image_url 单数(取第一张)
+        //   - duration 字符串("4",不是 int — new-api schema 严格校验)
+        //   - resolution 顶层(不在 metadata 里),强制小写 p
+        if (imageUrls.size() > 1) {
+            log.warn("[NewAPI] submitVideoByAssetRefList: 收到 {} 张图,文档只支持 image_url 单数,仅取第一张;后续如需多图请改用 video_urls[] 字段",
+                imageUrls.size());
+        }
+        body.put("model", "doubao-seedance-2.0");
+        body.put("prompt", prompt == null ? "" : prompt);
+        body.put("image_url", imageUrls.get(0));
+        // v2.1 文档明确写 duration/resolution 在顶层(JSON 字段,不是 metadata 嵌套)
+        body.put("duration", String.valueOf(duration));
+        body.put("resolution", resolution == null ? "480p" : resolution.toLowerCase());
+
+        // 2026-08-13 DEBUG:详细打印 NewAPI 请求前后的所有信息,方便定位卡在哪一步
+        long submitStart = System.currentTimeMillis();
+        log.info("┌─ [NewAPI-DEBUG] submitVideoByAssetRefList START");
+        log.info("│  videoBaseUrl = {}", videoBaseUrl);
+        log.info("│  full URL = {}/v1/videos", videoBaseUrl);
+        log.info("│  request body = {}", body);
+        log.info("│  imageUrls = {}", imageUrls);
+        log.info("│  prompt length = {}", prompt == null ? 0 : prompt.length());
+        log.info("│  duration = {}s, resolution = {}", duration, resolution);
+        log.info("│  token prefix = {}...", token == null ? "null" : token.substring(0, Math.min(10, token.length())));
+
+        JsonNode response = null;
+        Exception submitException = null;
+        try {
+            // 2026-08-13 17:20 根治:aicoming-proxy 8080 收到请求后会立即返回 HTTP 400 + body={status:queued, id:null}
+            //   的"占位响应",表示任务已入队但还没拿到真 id。这其实不算真错误,只是异步任务的前置。
+            //   修复:用 exchangeToMono,所有 HTTP 状态码都把 body 解析为 JsonNode 返回,
+            //         不再让 WebClient 4xx 抛 WebClientResponseException。
+            response = webClientBuilder.baseUrl(videoBaseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .exchangeToMono(clientResponse -> {
+                    int status = clientResponse.statusCode().value();
+                    if (status >= 200 && status < 300) {
+                        return clientResponse.bodyToMono(JsonNode.class);
+                    }
+                    if (status >= 400) {
+                        // 4xx/5xx 也读 body,看 body 是不是 "queued 占位响应" (有 status=queued 但 id=null)
+                        return clientResponse.bodyToMono(String.class)
+                            .defaultIfEmpty("")
+                            .map(bodyStr -> {
+                                log.warn("│  ⚠️ [NewAPI-DEBUG] /v1/videos 收到 HTTP {} 但仍解析 body: {}",
+                                    status, bodyStr.length() < 500 ? bodyStr : bodyStr.substring(0, 500) + "...");
+                                try {
+                                    if (bodyStr != null && !bodyStr.isBlank()) {
+                                        return new ObjectMapper().readTree(bodyStr);
+                                    }
+                                } catch (Exception parseEx) {
+                                    log.warn("│  [NewAPI-DEBUG] body 不是 JSON: {}", parseEx.getMessage());
+                                }
+                                // 解析失败:构造一个 Node 表示这次失败
+                                return null;
+                            });
+                    }
+                    return clientResponse.bodyToMono(JsonNode.class);
+                })
+                .timeout(Duration.ofSeconds(600))
+                .block();
+        } catch (Exception e) {
+            submitException = e;
+            log.error("│  ❌ [NewAPI-DEBUG] /v1/videos 抛异常: {} ({}ms)", e.getMessage(),
+                System.currentTimeMillis() - submitStart);
+        }
+
+        long submitElapsed = System.currentTimeMillis() - submitStart;
+        log.info("│  [NewAPI-DEBUG] /v1/videos 提交完成,耗时 {}ms", submitElapsed);
+
+        if (submitException != null) {
+            log.info("└─ [NewAPI-DEBUG] submitVideoByAssetRefList FAILED (exception)");
+            if (submitException instanceof BusinessException) throw (BusinessException) submitException;
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, submitException.getMessage());
+        }
+        if (response == null) {
+            log.info("└─ [NewAPI-DEBUG] submitVideoByAssetRefList FAILED (response null)");
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (asset_url) 返回空响应");
+        }
+        // 2026-08-13 17:20 检测"queued 占位响应"(id/task_id 是 null 但 status=queued)
+        //   这种情况虽然 HTTP 是 4xx,但实际上 aicoming 上游接受了任务,只是 id 还没生成
+        //   不应该 markFailed。直接抛"aicoming 还没返回 id"提示调用方走兜底(轮询)
+        String respStatus = response.path("status").asText("");
+        String respId = response.path("id").asText("");
+        String respTaskId = response.path("task_id").asText("");
+        if ((respId.isEmpty() && respTaskId.isEmpty())
+            && ("queued".equalsIgnoreCase(respStatus) || "pending".equalsIgnoreCase(respStatus))) {
+            log.warn("│  ⚠️ [NewAPI-DEBUG] aicoming-proxy 返回 queued 占位响应 (id/task_id=null),"
+                + " 表示任务已入队但 id 尚未生成。建议调用方等待并轮询。");
+            throw new BusinessException(ErrorCode.NEWAPI_REQUEST_INVALID,
+                "aicoming 上游已入队但 id 尚未生成 (status=" + respStatus + "),请稍后重试或查询");
+        }
+        log.info("│  [NewAPI-DEBUG] 响应: fields=[{}]", collectFieldNames(response));
+        log.info("│  [NewAPI-DEBUG] 响应 body(前 1000 字符): {}", response.toString().length() < 1000 ? response.toString() : response.toString().substring(0, 1000) + "...");
+        String taskId = response.path("task_id").asText(response.path("id").asText(""));
+        // 2026-08-13 18:30 修复:NewAPI 3000 中转站对部分模型(如 doubao-seedance-2.0)返回
+        //   {"id":"none", "task_status":"submitted", ...} 占位响应。
+        //   "none" 字符串非空,会被误当成真 taskId 存到 job,后续 poll 404。
+        //   修复:把 "none" / "null" / 空字符串都视为无效 id。
+        if ("none".equalsIgnoreCase(taskId) || "null".equalsIgnoreCase(taskId)) {
+            log.warn("│  ⚠️ [NewAPI-DEBUG] 3000 中转站返回占位 taskId='{}',视为无效,"
+                + " 可能是模型不被中转站支持(或中转站没真提交到 aicoming)。", taskId);
+            taskId = "";
+        }
+        if (taskId.isEmpty()) {
+            log.info("└─ [NewAPI-DEBUG] submitVideoByAssetRefList FAILED (no task_id)");
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (asset_url) 响应缺 id/task_id: " + response);
+        }
+        // 2026-08-11:顺便提取 url(响应里可能有,避免后续 30 秒 poll 拿不到)
+        String directUrl = null;
+        JsonNode topUrlNode = response.get("url");
+        if (topUrlNode != null && topUrlNode.isTextual() && !topUrlNode.asText().isBlank()) {
+            directUrl = topUrlNode.asText();
+        } else if (response.path("metadata").path("url").isTextual()) {
+            directUrl = response.path("metadata").path("url").asText();
+        }
+        if (directUrl != null) {
+            log.info("│  [NewAPI-DEBUG] 响应已含 video url: {}", directUrl);
+        } else {
+            log.info("│  [NewAPI-DEBUG] 响应未含 video url,只能等后续 poll");
+        }
+        log.info("│  [NewAPI-DEBUG] taskId={}, imageUrls={}, duration={}s, resolution={}",
+            taskId, imageUrls, duration, resolution);
+        log.info("└─ [NewAPI-DEBUG] submitVideoByAssetRefList OK, taskId={}", taskId);
+        return new SubmitResult(taskId, directUrl);
+    }
+
+
+    
+
+    /**
+     * 2026-08-11:把 NewAPI 上游错误 body 翻译成中文友好提示。
+     * 上游(豆包 Seedance / Sora 等)的错误通常嵌在嵌套 JSON 里:
+     *   {"code":"fail_to_fetch_task","message":"{\"ErrorCode\":\"...\",\"ErrorMessage\":\"...\"}"}
+     * 识别已知错误并翻译,无法识别时回退到 raw message(截断到 500 字防爆)。
+     *
+     * @param body NewAPI 错误响应原文
+     * @return 中文友好提示
+     */
+    public static String translateNewApiError(String body) {
+        if (body == null || body.isBlank()) return "NewAPI 返回空错误响应";
+        try {
+            // 解析外层
+            JsonNode outer = new ObjectMapper().readTree(body);
+            // 上游错误信息通常在 outer.message 里(嵌套 JSON 字符串)
+            String inner = outer.path("message").asText("");
+            String innerErrorCode = "";
+            String innerErrorMessage = "";
+            if (!inner.isBlank() && inner.startsWith("{")) {
+                try {
+                    JsonNode innerNode = new ObjectMapper().readTree(inner);
+                    innerErrorCode = innerNode.path("ErrorCode").asText("");
+                    innerErrorMessage = innerNode.path("ErrorMessage").asText("");
+                } catch (Exception ignore) {
+                    // inner 不是 JSON,就用原文
+                }
+            }
+            // 兜底:外层的 code
+            String outerCode = outer.path("code").asText("");
+
+            // 已知错误映射
+            if (innerErrorCode.contains("InputImageSensitiveContentDetected.PrivacyInformation")
+                || innerErrorMessage.contains("real person")
+                || innerErrorMessage.contains("may contain real person")) {
+                return "图片含真人,被 NewAPI 上游(豆包 Seedance 等)拒绝生成。请换用不含真人的换装总图(纯服装/模特身体轮廓图),或在 NewAPI 控制台切换到支持真人换装的模型";
+            }
+            if (innerErrorCode.contains("InputImageSensitiveContentDetected")
+                || innerErrorMessage.contains("sensitive content")
+                || innerErrorMessage.contains("sensitive")) {
+                return "图片含敏感内容,被 NewAPI 上游拒绝生成。请换用普通商品/服装图,或联系管理员在 NewAPI 控制台配置敏感词白名单";
+            }
+            if (innerErrorCode.contains("InvalidParameter")
+                || outerCode.contains("invalid_parameter")) {
+                return "NewAPI 上游参数无效:" + (innerErrorMessage.isBlank() ? "图片或 prompt 不符合要求" : innerErrorMessage);
+            }
+            if (innerErrorCode.contains("QuotaExceeded") || innerErrorCode.contains("InsufficientQuota")) {
+                return "NewAPI 账户额度不足,请联系管理员充值";
+            }
+            // 2026-08-11 新增:检测 upstream 402 + "insufficient balance" / "402" 等关键字
+            // (NewAPI 余额耗尽时返回的格式跟 QuotaExceeded 不同,fallback 抓不到)
+            if (body.contains("insufficient balance")
+                || body.contains("insufficient_quota")
+                || body.contains("PAYMENT_REQUIRED")
+                || body.contains("\"code\":402")
+                || body.contains("upstream 402")) {
+                return "NewAPI 账户余额不足,视频生成被拒(HTTP 402)。请到 NewAPI 后台充值,或联系管理员";
+            }
+            if (innerErrorCode.contains("RateLimit")) {
+                return "NewAPI 请求频率过高,请稍后重试";
+            }
+
+            // 兜底:用 innerErrorMessage 或 outer.message,截断到 500 字符
+            String fallback = !innerErrorMessage.isBlank() ? innerErrorMessage :
+                              !inner.isBlank() ? inner : body;
+            if (fallback.length() > 500) fallback = fallback.substring(0, 500) + "...";
+            return "NewAPI 上游拒绝:" + fallback;
+        } catch (Exception e) {
+            // 解析失败,截断 raw body 返回
+            String s = body.length() > 500 ? body.substring(0, 500) + "..." : body;
+            return "NewAPI 调用失败:" + s;
+        }
     }
 }

@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.dto.canvas.NodeConnection;
-import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.entity.CanvasNode;
 import com.jurong.aicenter.entity.CanvasTask;
 import com.jurong.aicenter.exception.BusinessException;
@@ -14,7 +13,6 @@ import com.jurong.aicenter.service.StorageService;
 import com.jurong.aicenter.service.VideoFrameExtractor;
 import com.jurong.aicenter.service.VideoFrameExtractor.FrameMeta;
 import lombok.RequiredArgsConstructor;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Async;
@@ -91,7 +89,6 @@ public class VideoFrameCaptionService {
     private final CanvasNodeRepository nodeRepository;
     @Qualifier("captionExecutor")
     private final Executor captionExecutor;
-    private final com.jurong.aicenter.service.VideoFrameExtractor videoFrameExtractor;
 
     // 限流:同时最多 3 个 caption 请求打 NewAPI(避免打爆中转模型)
     private final Semaphore captionSemaphore = new Semaphore(3);
@@ -99,24 +96,6 @@ public class VideoFrameCaptionService {
     // 错峰:每帧请求前加递增延迟,让 NewAPI 喘口气
     private static final long CAPTION_STAGGER_MS = 50;
     private final ObjectMapper objectMapper;
-
-    public VideoFrameCaptionService(VideoFrameExtractor extractor,
-                                    NewApiClient newApiClient,
-                                    StorageService storageService,
-                                    CanvasTaskRepository taskRepository,
-                                    CanvasNodeRepository nodeRepository,
-                                    @Qualifier("captionExecutor") Executor captionExecutor,
-                                    VideoFrameExtractor videoFrameExtractor,
-                                    ObjectMapper objectMapper) {
-        this.extractor = extractor;
-        this.newApiClient = newApiClient;
-        this.storageService = storageService;
-        this.taskRepository = taskRepository;
-        this.nodeRepository = nodeRepository;
-        this.captionExecutor = captionExecutor;
-        this.videoFrameExtractor = videoFrameExtractor;
-        this.objectMapper = objectMapper;
-    }
 
     /**
      * 异步入口。被 CanvasServiceImpl.extractAndCaption() 调用。
@@ -142,7 +121,7 @@ public class VideoFrameCaptionService {
         try {
             // ① 抽帧
             List<FrameMeta> frames = extractor.extractFrames(videoUrl, tmpDir, fps);
-            log.info("[video-caption] 抽帧完成: {} 帧, fps={}, mode={}", frames.size(), fps, mode);
+            log.debug("[video-caption] 抽帧完成: {} 帧, fps={}, mode={}", frames.size(), fps, mode);
 
             // ② 并行上传到 MinIO(无论 mode 都要上传,frames mode 要在 canvas 上展示)
             List<CompletableFuture<String>> uploadJobs = frames.stream()
@@ -158,7 +137,7 @@ public class VideoFrameCaptionService {
                 .toList();
             List<String> frameUrls = uploadJobs.stream().map(CompletableFuture::join).toList();
             long uploadOk = frameUrls.stream().filter(u -> u != null).count();
-            log.info("[video-caption] 帧上传完成: {}/{} 成功", uploadOk, frameUrls.size());
+            log.debug("[video-caption] 帧上传完成: {}/{} 成功", uploadOk, frameUrls.size());
 
             boolean needCaption = "script".equals(mode) || "both".equals(mode);
             String content = "";
@@ -169,7 +148,7 @@ public class VideoFrameCaptionService {
             try {
                 Path tempVideoDir = frames.get(0).path().getParent();
                 Path audioFile = tempVideoDir.resolve("audio.wav");
-                Path extracted = videoFrameExtractor.extractAudio(node.getResultUrl(), audioFile);
+                Path extracted = extractor.extractAudio(node.getResultUrl(), audioFile);
                 if (extracted != null) {
                     byte[] audioBytes = java.nio.file.Files.readAllBytes(extracted);
                     List<Map<String, Object>> segments = newApiClient.audioTranscribe(audioBytes, "audio/wav");
@@ -283,7 +262,7 @@ public class VideoFrameCaptionService {
                 }
 
                 // 拼口播文案模板
-                content = assembleScript(frames, captions);
+                content = assembleScript(frames, captions, dubMap);
                 node.setContent(content);
                 task.setTextResult(content);
             } else {
@@ -310,7 +289,7 @@ public class VideoFrameCaptionService {
             // 前端轮询成功后只拉这些节点追加，不 reload 整张画布
             java.util.List<String> createdIds = new java.util.ArrayList<>();
             try {
-                createSidecarByMode(node, frameUrls, content, mode, combinedUrl, createdIds);
+                createSidecarByMode(node, frameUrls, content, mode, combinedUrl, frames.size(), createdIds);
             } catch (Exception sidecarErr) {
                 log.warn("[video-caption] sidecar creation failed (non-fatal): {}",
                     sidecarErr.getMessage(), sidecarErr);
@@ -367,7 +346,7 @@ public class VideoFrameCaptionService {
      */
     private void createSidecarByMode(CanvasNode videoNode, List<String> frameUrls,
                                        String scriptText, String mode, String combinedUrl,
-                                       java.util.List<String> createdIds) {
+                                       int frameCount, java.util.List<String> createdIds) {
         boolean needText = "script".equals(mode) || "both".equals(mode);
         boolean needFrames = "frames".equals(mode) || "both".equals(mode);
 
@@ -378,7 +357,7 @@ public class VideoFrameCaptionService {
 
         CanvasNode frameGridNode = null;
         if (needFrames) {
-            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, frameCount, createdIds);
             if (frameGridNode != null) {
                 connectNodes(videoNode, "frames", frameGridNode, "video");
             }
@@ -397,11 +376,11 @@ public class VideoFrameCaptionService {
      * combinedUrl 是 combineAndUploadFrames 拼图后上传到 MinIO 的公网 URL。
      * 帧内容、文字标注、网格布局都在那张大图里里。画布上只看到 1 个 image 节点。
      */
-    private void createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
-                                          java.util.List<String> createdIds) {
+    private CanvasNode createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
+                                                int frameCount, java.util.List<String> createdIds) {
         if (combinedUrl == null || combinedUrl.isBlank()) {
             log.warn("[video-sidecar-frames] combinedUrl 为空，跳过帧拼图节点创建");
-            return;
+            return null;
         }
         final int SIDE_OFFSET = 360;
         int baseX = (videoNode.getPositionX() == null ? 0 : videoNode.getPositionX()) + SIDE_OFFSET;
@@ -416,14 +395,20 @@ public class VideoFrameCaptionService {
         node.setPositionX(baseX);
         node.setPositionY(baseY);
         node.setStatus("success");
+        // 2026-08-10 fix:把帧数写进 settings JSON,前端可读取(替代之前在 content "已抽帧 N 张..." 的正则匹配)
+        try {
+            node.setSettings("{\"frameCount\":" + frameCount + ",\"source\":\"video-extract\"}");
+        } catch (Exception e) {
+            log.warn("[video-sidecar-frames] settings JSON failed (non-fatal): {}", e.getMessage());
+        }
         LocalDateTime now = LocalDateTime.now();
         node.setCreatedAt(now);
         node.setUpdatedAt(now);
         nodeRepository.insert(node);
         createdIds.add(node.getId());
 
-        log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}",
-            videoNode.getId(), node.getId());
+        log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}, frameCount={}",
+            videoNode.getId(), node.getId(), frameCount);
         return node;
     }
 
@@ -746,11 +731,6 @@ public class VideoFrameCaptionService {
                 sb.append("⏭️ ").append(action);
             } else {
                 sb.append("运镜:").append(camera).append(" 动作:").append(action);
-            }
-            // 添加口播(ASR 提取的原文)
-            String dubText = dubMap == null ? null : dubMap.get(i);
-            if (dubText != null && !dubText.isBlank()) {
-                sb.append(" 口播:\"").append(dubText).append("\"");
             }
             if (!"__FAILED__".equals(camera) && !"__SKIPPED__".equals(camera)) {
                 successCount++;

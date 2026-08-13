@@ -26,6 +26,11 @@ public enum ErrorCode {
     NEWAPI_TASK_FAILED(3008, "newapi task failed"),
     NEWAPI_TASK_TIMEOUT(3009, "newapi task timeout"),
     NEWAPI_VIDEO_URL_MISSING(3010, "newapi video url missing"),
+    NEWAPI_REQUEST_INVALID(3011, "newapi request invalid (4xx, business rejected)"),
+    // 2026-08-12 added: 区分 task not found (400) 与其他 4xx 错误
+    // 400 task not found 不一定是任务失败 —— 可能是 NewAPI 元数据被清理但视频文件还在 CDN 上
+    // 调用方应根据 syncUrl / assetUrl 等兜底,而不是立即 FAILED
+    NEWAPI_TASK_NOT_FOUND(3012, "newapi task not found (TTL expired or cleaned, but video may still exist on CDN)"),
 
     WORKFLOW_NOT_FOUND(4001, "workflow not found"),
     WORKFLOW_ACCESS_DENIED(4002, "workflow access denied"),
@@ -54,11 +59,7 @@ public enum ErrorCode {
     ASSET_NOT_ACTIVE(7022, "素材未激活(aicoming proxy 返回 status=processing,请轮询等到 active)"),
     ASSET_DELETE_FAILED(7023, "素材删除失败(aicoming proxy)"),
     MEDIA_FILE_TOO_LARGE(7021, "文件超过大小限制"),
-    MEDIA_FILE_EMPTY(7022, "文件为空"),
-    // Aicoming 外部资产服务
-    ASSET_UPLOAD_FAILED(7030, "外部资产上传失败"),
-    ASSET_NOT_ACTIVE(7031, "外部资产未就绪"),
-    ASSET_DELETE_FAILED(7032, "外部资产删除失败");
+    MEDIA_FILE_EMPTY(7022, "文件为空");
 
     private final int code;
     private final String message;

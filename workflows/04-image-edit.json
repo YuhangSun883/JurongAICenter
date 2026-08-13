@@ -1,0 +1,25 @@
+{
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{image_filename}}"
+    }
+  },
+  "2": {
+    "class_type": "JurongImageToImage",
+    "inputs": {
+      "image": ["1", 0],
+      "prompt": "{{prompt}}",
+      "size": "1024x1024",
+      "model": "gpt-image-2-1k",
+      "quality": "low"
+    }
+  },
+  "3": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["2", 0],
+      "filename_prefix": "jurong_image_edit"
+    }
+  }
+}

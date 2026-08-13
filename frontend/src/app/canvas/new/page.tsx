@@ -17,6 +17,7 @@ import {
   Image as ImageIcon,
   LayoutTemplate,
   List,
+  Loader2,
   Map,
   Maximize2,
   MessageCircle,
@@ -35,7 +36,8 @@ import {
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent, type PointerEvent } from 'react';
-import { canvasApi, type CanvasNodeType } from '@/api/canvas';
+import { flushSync } from 'react-dom';
+import { canvasApi, type CanvasNodeType, type CanvasNode } from '@/api/canvas';
 import { getAccessToken } from '@/lib/auth-store';
 import { cn } from '@/lib/utils';
 import { LoginGate } from '@/components/common/LoginGate';
@@ -52,6 +54,8 @@ interface CanvasViewNode {
   resultUrl?: string;
   /** 每个节点独立的 prompt 输入（不跨节点共享） */
   prompt?: string;
+  /** 节点设置 JSON(视频节点的 duration/resolution/model 等) */
+  settings?: string;
 }
 
 /** API 返回的 CanvasNode → 本地视图节点（加 x/y，补默认值） */
@@ -65,6 +69,7 @@ function toViewNode(n: CanvasNode): CanvasViewNode {
     x: n.positionX ?? 0,
     y: n.positionY ?? 0,
     prompt: '',
+    settings: n.settings,
   };
 }
 
@@ -119,6 +124,49 @@ function normalizeCanvasEdges(rawEdges: Array<{
 
 function isUserCanvas(item: import('@/api/canvas').CanvasListItem) {
   return item.id !== 'mock_canvas_default' && item.name !== '\u9ed8\u8ba4\u753b\u5e03' && item.name !== '\u699b\u6a3f\ue17b\u9422\u8bf2\u7af7';
+}
+
+// =====================================================================
+// 2026-08-10 提示框素材(localStorage 持久化 + 过滤素材节点)
+// 背景:
+//   - PromptComposer 的「上传素材」按钮会把图片上传到后端建一个 canvas 节点;
+//   - 刷新页面时,getCanvasDetail 会把这个节点和其他节点一起返回,衣服图就
+//     出现在画布上了;
+//   - 用户期望:衣服图节点只在输入框里展示,不显示在画布上。
+// 方案:
+//   - 上传衣服图后,把这个节点 id 记到 localStorage `materialNodeIds_${canvasId}`
+//   - 加载画布时,过滤掉这些 id
+//   - promptMaterials 也持久化到 localStorage,刷新后输入框仍能展示
+// =====================================================================
+const LS_MATERIAL_NODES_KEY = (canvasId: string) => `materialNodeIds_${canvasId}`;
+const LS_PROMPT_MATERIALS_KEY = (canvasId: string) => `promptMaterials_${canvasId}`;
+
+function loadMaterialNodeIds(canvasId: string): string[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(LS_MATERIAL_NODES_KEY(canvasId));
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch { return []; }
+}
+function saveMaterialNodeIds(canvasId: string, ids: string[]): void {
+  if (typeof window === 'undefined') return;
+  try { localStorage.setItem(LS_MATERIAL_NODES_KEY(canvasId), JSON.stringify(ids)); } catch {}
+}
+function loadPromptMaterials(
+  canvasId: string,
+): Record<string, Array<{ id: string; url: string; name?: string }>> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(LS_PROMPT_MATERIALS_KEY(canvasId));
+    return raw ? (JSON.parse(raw) as Record<string, Array<{ id: string; url: string; name?: string }>>) : {};
+  } catch { return {}; }
+}
+function savePromptMaterials(
+  canvasId: string,
+  dict: Record<string, Array<{ id: string; url: string; name?: string }>>,
+): void {
+  if (typeof window === 'undefined') return;
+  try { localStorage.setItem(LS_PROMPT_MATERIALS_KEY(canvasId), JSON.stringify(dict)); } catch {}
 }
 
 interface AddMenuState {
@@ -191,7 +239,12 @@ export default function NewCanvasPage() {
     setCanvasLoadState('loading');
     void canvasApi.getCanvasDetail(urlCanvasId)
       .then((detail) => {
-        setNodes(normalizeCanvasNodes(detail?.nodes));
+        // 2026-08-10:从 localStorage 读素材节点 id 列表 + promptMaterials,刷新后保留
+        const matIds = loadMaterialNodeIds(urlCanvasId);
+        setMaterialNodeIds(matIds);
+        const savedMaterials = loadPromptMaterials(urlCanvasId);
+        setPromptMaterials(savedMaterials);
+        setNodes(normalizeCanvasNodes(detail?.nodes).filter((n) => !matIds.includes(n.id)));
         setEdges(normalizeCanvasEdges(detail?.edges));
         setCanvasLoadState('loaded');
       })
@@ -223,8 +276,31 @@ export default function NewCanvasPage() {
   const [copiedNode, setCopiedNode] = useState<CanvasViewNode | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string>('');
+  // 2026-08-10 优化:生成进度条相关状态
+  // generationStage 描述当前阶段(提交中 / 抽帧中 / 图片生成中 / 视频生成中 / 脚本拆解中 / 完成 / 失败)
+  // generationStart 记录开始时间,用于显示耗时倒计时
+  // generationKind 用于区分任务类型(图生图 / 图生视频 / 抽帧 / 脚本拆解)
+  const [generationStage, setGenerationStage] = useState<string>('');
+  // 临时测试用: setGenerationStage('测试进度条') 即可看效果
+  // useEffect(() => { setGenerationStage('测试进度条已触发'); }, []);
+  const [, setGenerationStart] = useState<number>(0); // 已读未引用,用 _ 强制忽略 ESLint
+  const [generationKind, setGenerationKind] = useState<'image' | 'video' | 'extract' | ''>('');
+  // 强制 1s 刷新一次用于进度条 UI(避免每秒调用 setState 引发整个组件树 re-render)
+  const [, forceTick] = useState({});
+  useEffect(() => {
+    if (!generating) return;
+    const id = setInterval(() => forceTick({}), 1000);
+    return () => clearInterval(id);
+  }, [generating]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
+  // ===== 提示词素材(每节点一份,点 PromptComposer 的上传素材按钮填充) =====
+  const [promptMaterials, setPromptMaterials] = useState<
+    Record<string, Array<{ id: string; url: string; name?: string }>>
+  >({});
+
+  // 2026-08-10:画布里所有"上传的素材"节点 id(用于刷新后过滤画布上的衣服图节点)
+  const [materialNodeIds, setMaterialNodeIds] = useState<string[]>([]);
 
   // ===== 我的创作 · 历史侧边面板 =====
   const [showHistoryPanel, setShowHistoryPanel] = useState(false);
@@ -254,7 +330,10 @@ export default function NewCanvasPage() {
       const detail = await canvasApi.getCanvasDetail(canvasId);
       // 切换到该画布:设 canvasId + 用 detail.nodes/edges 覆盖本地 state
       setCanvasId(canvasId);
-      setNodes(normalizeCanvasNodes(detail?.nodes));
+      const matIds = loadMaterialNodeIds(canvasId);
+      setMaterialNodeIds(matIds);
+      setPromptMaterials(loadPromptMaterials(canvasId));
+      setNodes(normalizeCanvasNodes(detail?.nodes).filter((n) => !matIds.includes(n.id)));
       setEdges(normalizeCanvasEdges(detail?.edges));
     } catch (err) {
       console.warn('[canvas] getCanvasDetail failed:', err);
@@ -263,6 +342,24 @@ export default function NewCanvasPage() {
 
   /** 隐藏的 <input type="file"> ref，供菜单/画布触发本地选择 */
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // 2026-08-10 fix:用于在卸载 / 画布切换时 abort 所有未完成的轮询 fetch + 清理 setTimeout,避免内存泄漏 + zombie 请求
+  const pollAbortRef = useRef<AbortController | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollGuardRef = useRef<boolean>(false); // 简易 debounce:同一时间只允许一个轮询链
+
+  // 卸载 / canvasId 变化时清理
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      if (pollAbortRef.current) {
+        pollAbortRef.current.abort();
+        pollAbortRef.current = null;
+      }
+    };
+  }, [canvasId]);
 
   // 加载本地缓存的画布节点(刷新不丢，弥补后端没有 getCanvasDetail 入口时的本地持久化)
   useEffect(() => {
@@ -290,6 +387,12 @@ export default function NewCanvasPage() {
     localStorage.setItem(`canvas_edges_${canvasId}`, JSON.stringify(edges));
   }, [edges, canvasId, canvasLoadState]);
 
+  // 2026-08-10:持久化 promptMaterials 到 localStorage,刷新后输入框仍能展示衣服图
+  useEffect(() => {
+    if (typeof window === 'undefined' || !canvasId || canvasLoadState === 'loading') return;
+    savePromptMaterials(canvasId, promptMaterials);
+  }, [promptMaterials, canvasId, canvasLoadState]);
+
   /**
    * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
    * 后端接口是 GET /api/canvas/canvases/{id}，canvasApi.getCanvasDetail 是封装。
@@ -307,41 +410,17 @@ export default function NewCanvasPage() {
       // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
       const detail = await canvasApi.getCanvasDetail(canvasId);
       setCanvasId(canvasId);
-      setNodes(normalizeCanvasNodes(detail?.nodes));
+      const matIds = loadMaterialNodeIds(canvasId);
+      setMaterialNodeIds(matIds);
+      setPromptMaterials(loadPromptMaterials(canvasId));
+      setNodes(normalizeCanvasNodes(detail?.nodes).filter((n) => !matIds.includes(n.id)));
       setEdges(normalizeCanvasEdges(detail?.edges));
     } catch (err) {
       console.warn('[canvas] reloadCanvasFromBackend failed:', err);
     }
   };
 
-  /**
-   * 抽帧 / 脚本拆解成功后：从后端拉一份最新画布快照，覆盖本地 nodes / edges。
-   * 后端接口是 GET /api/canvas/canvases/{id}，canvasApi.getCanvasDetail 是封装。
-   * 如果当前没有 canvasId（极端情况），则仅刷新当前节点的 content。
-   */
-  const reloadCanvasFromBackend = async (anchorNodeId: string) => {
-    try {
-      // 1) 先拿 anchor 节点的 canvasId（local state 的 CanvasViewNode 没带 canvasId，必须后端查）
-      const nodeResp = await canvasApi.getNode(anchorNodeId);
-      const canvasId = nodeResp?.canvasId;
-      if (!canvasId) {
-        console.warn('[canvas] reloadCanvasFromBackend: node has no canvasId, skip');
-        return;
-      }
-      // 2) 拉整张画布（画布元信息 + 所有节点 + 所有连线）
-      const detail = await canvasApi.getCanvasDetail(canvasId);
-      if (detail?.nodes) {
-        setNodes(detail.nodes.map(toViewNode));
-      }
-      if (detail?.edges) {
-        setEdges(detail.edges);
-      }
-    } catch (err) {
-      console.warn('[canvas] reloadCanvasFromBackend failed:', err);
-    }
-  };
-
-  const activeNode = nodes.find((node) => node.id === activeNodeId) ?? null;
+    const activeNode = nodes.find((node) => node.id === activeNodeId) ?? null;
 
   useEffect(() => {
     if (!dragPending && !dragging) return;
@@ -396,6 +475,22 @@ export default function NewCanvasPage() {
     };
 
     const onPointerUp = () => {
+      // 2026-08-10 修复:拖动结束同步坐标到后端,否则刷新后位置丢
+      if (dragging) {
+        setNodes((current) => {
+          const draggedNode = current.find((n) => n.id === dragging.id);
+          if (draggedNode) {
+            void canvasApi.updateNode({
+              nodeId: draggedNode.id,
+              positionX: Math.round(draggedNode.x),
+              positionY: Math.round(draggedNode.y),
+            }).catch((err) => {
+              console.warn('[canvas] drag sync position failed:', err);
+            });
+          }
+          return current; // 引用不变,React 不会重渲染
+        });
+      }
       setDragPending(null);
       setDragging(null);
     };
@@ -424,12 +519,47 @@ export default function NewCanvasPage() {
     };
 
     const onPointerUp = (event: globalThis.PointerEvent) => {
-      setAddMenu({
-        x: event.clientX + 12,
-        y: event.clientY + 10,
-        sourceId: linkDrag.sourceId,
-        title: '引用节点',
-      });
+      // Hit-test: 检查是否拖拽到了已有节点上
+      // 右侧拖出 → source 是上游，drop 目标是下游
+      // 左侧拖出 → source 是下游，drop 目标是上游
+      const targetNode = nodes.find(
+        (n) =>
+          n.id !== linkDrag.sourceId &&
+          event.clientX >= n.x &&
+          event.clientX <= n.x + NODE_WIDTH &&
+          event.clientY >= n.y &&
+          event.clientY <= n.y + NODE_HEIGHT
+      );
+
+      if (targetNode) {
+        // 连接两个已有节点
+        const fromId = linkDrag.side === 'right' ? linkDrag.sourceId : targetNode.id;
+        const toId = linkDrag.side === 'right' ? targetNode.id : linkDrag.sourceId;
+        const edgeId = `edge_${fromId}_${toId}`;
+        setEdges((current) => {
+          // 避免重复连接
+          if (current.some((e) => e.from === fromId && e.to === toId)) {
+            return current;
+          }
+          return [...current, { id: edgeId, from: fromId, to: toId }];
+        });
+        // 同步下游节点的 upstreamIds 到后端
+        const newUpstreamIds = [
+          ...edges.filter((e) => e.to === toId).map((e) => ({ port: 'default', nodeId: e.from })),
+          { port: 'default', nodeId: fromId },
+        ];
+        void canvasApi.updateNode({ nodeId: toId, upstreamIds: newUpstreamIds }).catch((err) => {
+          console.warn('[canvas] connect nodes: updateNode failed:', err);
+        });
+      } else {
+        // 没有命中已有节点：打开添加菜单(原行为)
+        setAddMenu({
+          x: event.clientX + 12,
+          y: event.clientY + 10,
+          sourceId: linkDrag.sourceId,
+          title: '引用节点',
+        });
+      }
       setLinkDrag(null);
     };
 
@@ -439,7 +569,7 @@ export default function NewCanvasPage() {
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
     };
-  }, [linkDrag]);
+  }, [linkDrag, nodes, edges]);
 
   const changeZoom = (amount: number) => {
     setZoom((current) => Math.min(200, Math.max(50, current + amount)));
@@ -482,18 +612,21 @@ export default function NewCanvasPage() {
 
   const addNode = async (type: CanvasNodeType) => {
     const source = addMenu?.sourceId ? nodes.find((node) => node.id === addMenu.sourceId) : null;
-    const created = await canvasApi.createNode({
-      canvasId: canvasId ?? undefined,
-      type,
-      title: nodeTitle(type),
-      upstreamIds: source ? [source.id] : undefined,
-    });
     const position = source
       ? {
           x: source.x + 430,
           y: source.y + Math.min(54, Math.max(-54, nodes.length % 2 === 0 ? -34 : 34)),
         }
       : centeredNodePosition();
+    const created = await canvasApi.createNode({
+      canvasId: canvasId ?? undefined,
+      type,
+      title: nodeTitle(type),
+      upstreamIds: source ? [source.id] : undefined,
+      // 2026-08-10 修复:创建时同步传坐标,后端不存的话刷新会默认 0,0
+      positionX: Math.round(position.x),
+      positionY: Math.round(position.y),
+    });
     const nextNode: CanvasViewNode = {
       id: created.id,
       type,
@@ -527,6 +660,65 @@ export default function NewCanvasPage() {
     setNodes((current) => current.map((node) => (node.id === id ? { ...node, prompt: value } : node)));
   };
 
+  /** 视频节点:更新 duration/resolution 等设置,同步到后端 DB(刷新后保留) */
+  const updateNodeSettings = (id: string, patch: Record<string, unknown>) => {
+    setNodes((current) =>
+      current.map((node) => {
+        if (node.id !== id) return node;
+        let currentSettings: Record<string, unknown> = {};
+        if (node.settings) {
+          try {
+            currentSettings = JSON.parse(node.settings);
+          } catch {
+            /* ignore */
+          }
+        }
+        const merged = { ...currentSettings, ...patch };
+        const json = JSON.stringify(merged);
+        // 同步到后端
+        void canvasApi.updateNode({ nodeId: id, settings: json }).catch(() => {});
+        return { ...node, settings: json };
+      })
+    );
+  };
+
+  /** 从节点 settings JSON 中读取视频参数 */
+  const parseVideoSettings = (node: CanvasViewNode): { duration: number; resolution: string } => {
+    // 2026-08-10 v6:默认值从上游抽帧节点推断(1 秒 1 帧),兜底 9 秒
+    const inferDefault = (): number => {
+      const upstreams = edges
+        .filter((e) => e.to === node.id)
+        .map((e) => nodes.find((n) => n.id === e.from))
+        .filter((n): n is CanvasViewNode => Boolean(n));
+      for (const up of upstreams) {
+        // 优先级 1:抽帧节点的 settings.frameCount(后端持久化,可靠)
+        try {
+          const upSettings = up.settings ? JSON.parse(up.settings) : {};
+          if (typeof upSettings.frameCount === 'number' && upSettings.frameCount > 0) {
+            return upSettings.frameCount;
+          }
+        } catch { /* ignore */ }
+        // 优先级 2:抽帧节点的 content "已抽帧 N 张..."(老数据兜底)
+        const m = (up.content || '').match(/已抽帧\s*(\d+)\s*张/);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (n > 0) return n;
+        }
+      }
+      return 9;
+    };
+    const defaultDuration = inferDefault();
+    try {
+      const s = node.settings ? JSON.parse(node.settings) : {};
+      return {
+        duration: typeof s.duration === 'number' ? s.duration : defaultDuration,
+        resolution: typeof s.resolution === 'string' ? s.resolution : '720P',
+      };
+    } catch {
+      return { duration: defaultDuration, resolution: '720P' };
+    }
+  };
+
   const duplicateNode = (node: CanvasViewNode) => {
     const nextNode: CanvasViewNode = {
       ...node,
@@ -539,6 +731,11 @@ export default function NewCanvasPage() {
   };
 
   const deleteNode = (nodeId: string) => {
+    // 2026-08-10 修复:先走后端,失败不阻塞前端(本地仍然过滤,避免 UI 卡住)
+    // 否则只删本地 state,刷新 getCanvasDetail 会把"删除"过的节点重新拉回来
+    void canvasApi.deleteNode(nodeId).catch((err) => {
+      console.warn('[canvas] deleteNode backend failed:', err);
+    });
     setNodes((current) => current.filter((node) => node.id !== nodeId));
     setEdges((current) => current.filter((edge) => edge.from !== nodeId && edge.to !== nodeId));
     setActiveNodeId((current) => (current === nodeId ? null : current));
@@ -623,6 +820,59 @@ export default function NewCanvasPage() {
     event.target.value = '';
   };
 
+  /**
+   * PromptComposer 的「上传素材」按钮回调:
+   *   1) 程序化创建一个 <input type="file"> 弹文件选择器
+   *   2) 选中后复用 canvasApi.uploadToCanvas 上传到后端
+   *   3) 把返回的 {id, resultUrl, ...} 转成 {id, url, name} 塞进
+         promptMaterials[nodeId] 数组末尾
+   *
+   * 关键:点按钮瞬间就把 activeNode.id 捕获到局部变量 nodeId,
+         即使用户在文件选择器开着的时候切换了 activeNode,素材也只进原节点。
+   */
+  const handleUploadMaterial = () => {
+    const nodeId = activeNode?.id;
+    if (!nodeId) return;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.onchange = async (event) => {
+      const target = event.target as HTMLInputElement;
+      const file = target.files?.[0];
+      if (!file) return;
+      setUploading(true);
+      try {
+        const created = await canvasApi.uploadToCanvas(
+          file,
+          canvasId ? { canvasId } : {},
+        );
+        const newMaterial = {
+          id: created.id,
+          url: created.resultUrl ?? created.content ?? '',
+          name: file.name,
+        };
+        setPromptMaterials((current) => {
+          const existing = current[nodeId] ?? [];
+          return { ...current, [nodeId]: [...existing, newMaterial] };
+        });
+        // 2026-08-10:标记这个节点是素材节点,刷新后从画布上过滤掉(只在输入框里展示)
+        setMaterialNodeIds((current) => {
+          if (current.includes(created.id)) return current;
+          const next = [...current, created.id];
+          if (canvasId) saveMaterialNodeIds(canvasId, next);
+          return next;
+        });
+      } catch (err) {
+        console.error('[canvas] upload material error:', err);
+        const msg = err instanceof Error ? err.message : '素材上传失败，请重试';
+        setGenerateError(msg);
+      } finally {
+        setUploading(false);
+      }
+    };
+    input.click();
+  };
+
   const handleDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.stopPropagation();
@@ -646,29 +896,75 @@ export default function NewCanvasPage() {
   // ===== 生成 =====
 
   const requestGeneration = async () => {
-    if (!activeNode || generating) return;
-    const nodePrompt = (activeNode.prompt ?? '').trim();
+    if (!activeNode) return;
+    // 2026-08-10 fix:同时只允许一个轮询链(避免连点生成按钮导致多个 task 并发)
+    if (generating || pollGuardRef.current) return;
+    pollGuardRef.current = true;
+    // 合并后：video 节点且有上游连接(脚本拆解+换装总图)时，走 generate-video 端点
     const upstreamCount = edges.filter((edge) => edge.to === activeNode.id).length;
-    // 有上游节点:允许空 prompt(后端 mergePrompts 会用上游内容 fallback)
-    // 无上游节点:必须输入 prompt(否则 AI 端没东西可加工)
-    if (!nodePrompt && upstreamCount === 0) {
-      setGenerateError('请先输入提示词，或从节点左侧/右侧 + 拖一个上游节点来引用');
-      return;
+    const isVideoGen = activeNode.type === 'video' && upstreamCount > 0;
+    const nodePrompt = (activeNode.prompt ?? '').trim();
+
+    if (isVideoGen) {
+      // 视频生成(图生视频)：必须有上游(脚本拆解文本 + 换装总图)
+      // 上游不足时会在后端报错提示
+    } else {
+      // 其他节点：有上游允许空 prompt，无上游必须输入 prompt
+      if (!nodePrompt && upstreamCount === 0) {
+        setGenerateError('请先输入提示词，或从节点左侧/右侧 + 拖一个上游节点来引用');
+        pollGuardRef.current = false;
+        return;
+      }
     }
     setGenerating(true);
     setGenerateError('');
+    // 2026-08-10 优化:启动进度条
+    const genKind = isVideoGen ? 'video' : (activeNode.type === 'image' ? 'image' : 'image');
+    const genStage = isVideoGen ? '视频生成中…(排队中)' :
+                     activeNode.type === 'text' ? '文案生成中…(排队中)' :
+                     activeNode.type === 'image' ? '图片生成中…(排队中)' :
+                     '生成中…(排队中)';
+    startGeneration(genKind, genStage);
+    // 2026-08-10 fix:本次轮询 abort controller,卸载/画布切换时自动取消
+    if (pollAbortRef.current) pollAbortRef.current.abort();
+    const abortController = new AbortController();
+    pollAbortRef.current = abortController;
 
     try {
       // 1. 提交生成任务（后端立刻返回 pending 状态）
-      const initial = await canvasApi.generateNode({
-        nodeId: activeNode.id,
-        type: activeNode.type,
-        prompt: nodePrompt,
-        content: activeNode.content,
-        assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
-        // 2026-08-09:提示框中上传的素材 id(换装场景用)
-        materialNodeIds: promptMaterials[activeNode.id]?.map((m) => m.id) ?? [],
-      });
+      let initial: import('@/api/canvas').GenerateCanvasNodeResponse;
+
+      if (isVideoGen) {
+        // 视频生成：先把用户输入(content)和上游连接(upstreamIds)持久化到后端节点，
+        // 再调专用 generate-video 端点(后端 CanvasVideoGenService 读 node.upstreamIds + node.content)
+        const upstreamIds = edges
+          .filter((edge) => edge.to === activeNode.id)
+          .map((edge) => ({ port: 'default', nodeId: edge.from }));
+        // 2026-08-10 v5:从节点 settings 读取用户选择的 duration/resolution
+        const vs = parseVideoSettings(activeNode);
+        await canvasApi.updateNode({
+          nodeId: activeNode.id,
+          content: activeNode.content ?? '',
+          upstreamIds,
+          // 同步 settings(确保刷新后仍保留用户选择)
+          settings: activeNode.settings ?? JSON.stringify({ duration: vs.duration, resolution: vs.resolution }),
+        });
+        initial = await canvasApi.generateVideo({
+          nodeId: activeNode.id,
+          duration: vs.duration,
+          resolution: vs.resolution,
+        });
+      } else {
+        initial = await canvasApi.generateNode({
+          nodeId: activeNode.id,
+          type: activeNode.type,
+          prompt: nodePrompt,
+          content: activeNode.content,
+          assetIds: edges.filter((edge) => edge.to === activeNode.id).map((edge) => edge.from),
+          // 2026-08-09:提示框中上传的素材 id(换装场景用)
+          materialNodeIds: promptMaterials[activeNode.id]?.map((m) => m.id) ?? [],
+        });
+      }
 
       // 2. 轮询任务状态（按节点类型分档超时）
       const POLL_INTERVAL = 2000;
@@ -679,12 +975,18 @@ export default function NewCanvasPage() {
       const MAX_DURATION =
         activeNode.type === 'text'  ? 200_000 :
         activeNode.type === 'image' ? 600_000 :  // 2026-08-09:换装需 5min+,原 300s 不够
-        /* video */                  600_000;
+        /* video / video-generation 合并后统一 */ 600_000;
       const start = Date.now();
       let lastResult = initial;
 
       while (Date.now() - start < MAX_DURATION) {
-        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+        // 2026-08-10 fix:每轮检测 abort,卸载/画布切换时立即退出
+        if (abortController.signal.aborted) return;
+        await new Promise((resolve) => {
+          // 2026-08-10 fix:把 timer id 存进 ref,卸载时可清理
+          pollTimerRef.current = setTimeout(resolve, POLL_INTERVAL);
+        });
+        pollTimerRef.current = null;
         try {
           lastResult = await canvasApi.getTask(initial.taskId);
         } catch (pollErr) {
@@ -692,24 +994,88 @@ export default function NewCanvasPage() {
           console.warn('[canvas] poll failed, retrying:', pollErr);
           continue;
         }
+        // 2026-08-10 优化:更新进度条文案 + 已耗时
+        const elapsedSec = Math.round((Date.now() - start) / 1000);
+        const runningStage = lastResult.status === 'pending'
+          ? (isVideoGen ? `视频生成中…(排队中,已用 ${elapsedSec}s)` : `生成中…(排队中,已用 ${elapsedSec}s)`)
+          : (isVideoGen ? `视频生成中…(处理中,已用 ${elapsedSec}s)` : `生成中…(处理中,已用 ${elapsedSec}s)`);
+        updateGenerationStage(runningStage);
 
         if (lastResult.status === 'success') {
           // 3. 成功：根据节点类型更新 UI
+          // 3a) 文本节点:text 直接更新
           if (activeNode.type === 'text' && lastResult.text) {
             updateNodeContent(activeNode.id, lastResult.text);
           } else if ((activeNode.type === 'image' || activeNode.type === 'video')
                      && lastResult.resultUrl) {
-            setNodes((current) =>
-              current.map((n) =>
-                n.id === activeNode.id ? { ...n, resultUrl: lastResult.resultUrl } : n
-              )
-            );
+            // 换装/图片生成/视频生成:统一把 resultUrl 写到 activeNode(用户点击的目标节点)
+            // 后端 ClothingTransferService 已把原图存到 source,这里直接覆盖目标节点即可
+            // 使用 flushSync 强制立即渲染,确保无需刷新页面也能看到结果
+            flushSync(() => {
+              setNodes((current) =>
+                current.map((n) =>
+                  n.id === activeNode.id ? { ...n, resultUrl: lastResult.resultUrl } : n
+                )
+              );
+            });
           }
+          // 3b) createdNodeIds(如有) merge 进画布
+          // 注意:换装场景不会返回 createdNodeIds,这里只处理脚本拆解/视频抽帧等场景
+          const newIds = lastResult.createdNodeIds ?? [];
+          if (newIds.length > 0) {
+            // 计算源→目标的偏移量,apply 到每个新节点上,让新节点出现在目标右边而不是源右边。
+            const sourceEdge = edges.find((e) => e.to === activeNode.id);
+            const sourceNode = sourceEdge
+              ? nodes.find((n) => n.id === sourceEdge.from)
+              : null;
+            const anchorDx = sourceNode && activeNode
+              ? (activeNode.x ?? 0) - (sourceNode.x ?? 0)
+              : 0;
+            const anchorDy = sourceNode && activeNode
+              ? (activeNode.y ?? 0) - (sourceNode.y ?? 0)
+              : 0;
+
+            void (async () => {
+              try {
+                const newNodes = await Promise.all(
+                  newIds.map(async (id) => {
+                    const apiNode = await canvasApi.getNode(id);
+                    return {
+                      ...apiNode,
+                      x: (apiNode.positionX ?? 0) + anchorDx,
+                      y: (apiNode.positionY ?? 0) + anchorDy,
+                      prompt: '',
+                    } as CanvasViewNode;
+                  })
+                );
+                setNodes((current) => [...current, ...newNodes]);
+                // 2026-08-10 fix:同步补全当前激活节点→新节点的连线(防御性,目前换装不会返回 createdNodeIds)
+                setEdges((current) => {
+                  const additions: CanvasEdge[] = [];
+                  for (const nn of newNodes) {
+                    const eid = `edge_${activeNode.id}_${nn.id}`;
+                    if (current.some((e) => e.id === eid || (e.from === activeNode.id && e.to === nn.id))) continue;
+                    additions.push({ id: eid, from: activeNode.id, to: nn.id });
+                  }
+                  return additions.length > 0 ? [...current, ...additions] : current;
+                });
+              } catch (mergeErr) {
+                console.warn('[canvas] merge new nodes failed:', mergeErr);
+              }
+            })();
+          }
+          // 2026-08-10 优化:成功 -> 显示"完成"文案,1 秒后清理进度条
+          updateGenerationStage(`完成,用时 ${Math.round((Date.now() - start) / 1000)}s`);
+          setTimeout(() => endGeneration(), 1000);
           return;
         }
 
         if (lastResult.status === 'failed') {
-          setGenerateError(`生成失败：${lastResult.status}`);
+          // 2026-08-10 优化:显示后端透传的具体失败原因(不再只是"failed"字面量)
+          const failMsg = lastResult.failMessage || (lastResult as any).message || lastResult.status;
+          setGenerateError(`生成失败: ${failMsg}`);
+          updateGenerationStage(`失败: ${failMsg}`);
+          setTimeout(() => endGeneration(), 2500);
           return;
         }
         // pending / running 继续轮询
@@ -735,12 +1101,38 @@ export default function NewCanvasPage() {
     } catch (err: any) {
       console.error('[canvas] generate error:', err);
       setGenerateError(err?.message || '生成出错，请重试');
+      updateGenerationStage(`异常: ${err?.message || '生成出错'}`);
+      setTimeout(() => endGeneration(), 2500);
     } finally {
       setGenerating(false);
+      // 2026-08-10 fix:重置 debounce guard,允许下次点击
+      pollGuardRef.current = false;
+      if (pollAbortRef.current === abortController) {
+        pollAbortRef.current = null;
+      }
     }
   };
 
   // ===== 视频抽帧描述 / 脚本拆解 =====
+
+  // 2026-08-10 优化:统一管理生成进度条状态
+  // 调用方只需 startGeneration('image' | 'video' | 'extract', '阶段文案') 即可,避免散落 setState
+  const startGeneration = (kind: 'image' | 'video' | 'extract', stage: string) => {
+    setGenerationKind(kind);
+    setGenerationStage(stage);
+    setGenerationStart(Date.now());
+  };
+  const updateGenerationStage = (stage: string) => setGenerationStage(stage);
+  const endGeneration = () => {
+    setGenerating(false);
+    setGenerationStage('');
+    setGenerationStart(0);
+    setGenerationKind('');
+    // 200ms 后清掉,让用户看清 "完成" 状态一瞬间
+    setTimeout(() => {
+      // 这里不需要做其他操作,useEffect 已经停止 ticking
+    }, 0);
+  };
 
   // 顶部工具栏目标节点：只有激活节点是视频时才显示，否则隐藏
   const videoToolbarTarget =
@@ -750,6 +1142,8 @@ export default function NewCanvasPage() {
 
   type ExtractMode = 'script' | 'frames' | 'both';
   const handleExtractCaption = async (node: CanvasViewNode | null, mode: ExtractMode) => {
+    // 2026-08-10 fix:同时只允许一个轮询链
+    if (generating || pollGuardRef.current) return;
     if (!node) {
       setGenerateError('画布里没有视频节点，请先上传一个视频');
       setGenerating(false);
@@ -760,18 +1154,38 @@ export default function NewCanvasPage() {
       setGenerating(false);
       return;
     }
+    pollGuardRef.current = true;
     setGenerating(true);
     setGenerateError('');
+    // 2026-08-10 优化:启动进度条,模式不同文案不同
+    const extractStage =
+      mode === 'frames' ? '视频抽帧中…(上传/排队)' :
+      mode === 'script' ? '脚本拆解中…(上传/排队)' :
+      '抽帧 + 脚本拆解中…(上传/排队)';
+    const extractStart = Date.now();
+    startGeneration('extract', extractStage);
+    // 2026-08-10 fix:抽帧任务也用同一个 abort + timer ref,卸载时统一清理
+    if (pollAbortRef.current) pollAbortRef.current.abort();
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    const abortController = new AbortController();
+    pollAbortRef.current = abortController;
 
     const pollTask = async (taskId: string) => {
+      // 2026-08-10 fix:每轮检测 abort
+      if (abortController.signal.aborted) return;
       try {
         const data: {
           status?: string;
           text?: string;
           message?: string;
+          failMessage?: string;
           createdNodeIds?: string[];
         } = await fetch(`/api/canvas/tasks/${taskId}`, {
           credentials: 'include',
+          signal: abortController.signal,
           headers: (() => {
             const t = getAccessToken();
             const headers: Record<string, string> = {};
@@ -781,6 +1195,9 @@ export default function NewCanvasPage() {
         }).then((r) => r.json());
 
         if (data.status === 'success') {
+          // 2026-08-10 优化:轮询过程中更新进度
+          const elapsedSec = Math.round((Date.now() - extractStart) / 1000);
+          updateGenerationStage(`合并结果中…(已用 ${elapsedSec}s)`);
           // 写入视频节点 content（可能是口播文案，也可能是 "已抽帧 N 张" 状态标记）
           if (data.text) {
             setNodes((current) =>
@@ -806,24 +1223,86 @@ export default function NewCanvasPage() {
                 })
               );
               setNodes((current) => [...current, ...newNodes]);
+              // 2026-08-10 fix:同步补全父节点(视频节点)→新节点的连线,无需刷新页面
+              // 后端 VideoFrameCaptionService 已通过 connectNodes 写入 node.upstreamIds/downstreamIds,
+              // 但 CanvasNodeResponse 不返回这些字段(防止泄露其他用户节点 ID),
+              // 所以前端必须手动基于"抽帧任务的源节点 = node.id"补一条 edge。
+              setEdges((current) => {
+                const additions: CanvasEdge[] = [];
+                for (const nn of newNodes) {
+                  const edgeId = `edge_${node.id}_${nn.id}`;
+                  // 避免重复添加(极端情况下后端可能已同步回来)
+                  if (current.some((e) => e.id === edgeId || (e.from === node.id && e.to === nn.id))) continue;
+                  additions.push({ id: edgeId, from: node.id, to: nn.id });
+                }
+                return additions.length > 0 ? [...current, ...additions] : current;
+              });
+              // 持久化到后端:让 reload 时也能正确恢复。
+              // updateNode 是覆盖式写入,所以先合并已有 downstreamIds + 新边,再写回。
+              try {
+                const existingDowns: { port: string; nodeId: string }[] = (() => {
+                  try {
+                    const raw = (node as any).downstreamIds;
+                    if (typeof raw === 'string') return JSON.parse(raw);
+                    if (Array.isArray(raw)) return raw;
+                  } catch { /* ignore */ }
+                  return [];
+                })();
+                const newDowns = newNodes.map((nn) => ({ port: 'video', nodeId: nn.id }));
+                // 去重合并:按 nodeId + port 去重
+                const merged = [...existingDowns];
+                for (const nd of newDowns) {
+                  const dup = merged.some((m) => m.nodeId === nd.nodeId && m.port === nd.port);
+                  if (!dup) merged.push(nd);
+                }
+                if (merged.length > existingDowns.length) {
+                  await canvasApi.updateNode({
+                    nodeId: node.id,
+                    downstreamIds: merged,
+                  });
+                }
+              } catch (syncErr) {
+                console.warn('[canvas] sync downstreamIds failed (non-fatal):', syncErr);
+              }
             } catch (mergeErr) {
               console.warn('[canvas] merge new nodes failed:', mergeErr);
             }
           }
           setGenerating(false);
+          pollGuardRef.current = false;
+          // 2026-08-10 优化:抽帧成功 -> 显示"完成"文案
+          updateGenerationStage(`完成,用时 ${Math.round((Date.now() - extractStart) / 1000)}s`);
+          setTimeout(() => endGeneration(), 1000);
           return;
         }
         if (data.status === 'failed') {
-          setGenerateError(`${mode === 'frames' ? '抽帧' : '脚本拆解'}失败: ${data.message || '未知错误'}`);
+          setGenerateError(`${mode === 'frames' ? '抽帧' : '脚本拆解'}失败: ${data.failMessage || data.message || '未知错误'}`);
           setGenerating(false);
+          pollGuardRef.current = false;
+          updateGenerationStage(`失败: ${data.failMessage || data.message || '未知错误'}`);
+          setTimeout(() => endGeneration(), 2500);
           return;
         }
         // pending / running —— 2 秒后再问
-        setTimeout(() => pollTask(taskId), 2000);
+        // 2026-08-10 fix:timer id 存进 ref,卸载时可清理
+        pollTimerRef.current = setTimeout(() => {
+          pollTimerRef.current = null;
+          pollTask(taskId);
+        }, 2000);
+        // 2026-08-10 优化:抽帧 pending / running 期间持续更新进度文案
+        const eSec = Math.round((Date.now() - extractStart) / 1000);
+        const extractRunningStage =
+          data.status === 'pending'
+            ? (mode === 'frames' ? `视频抽帧中…(排队中,已用 ${eSec}s)` : `脚本拆解中…(排队中,已用 ${eSec}s)`)
+            : (mode === 'frames' ? `视频抽帧中…(处理中,已用 ${eSec}s)` : `脚本拆解中…(处理中,已用 ${eSec}s)`);
+        updateGenerationStage(extractRunningStage);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : '轮询失败';
         setGenerateError(`失败: ${msg}`);
         setGenerating(false);
+        pollGuardRef.current = false;
+        updateGenerationStage(`异常: ${msg}`);
+        setTimeout(() => endGeneration(), 2500);
       }
     };
 
@@ -867,6 +1346,79 @@ export default function NewCanvasPage() {
         }
       }}
     >
+      {/* 2026-08-10 优化:生成进度条 - 横跨浏览器顶部的细线 + 右上角浮动卡片 */}
+      {true && (
+        <>
+          {/* 1. 顶部细线进度条(indeterminate 动画) */}
+          <div
+            data-progress-bar="true"
+            className="pointer-events-none fixed left-0 right-0 top-0 z-[100] h-[3px] overflow-hidden bg-transparent"
+          >
+            <div
+              className={cn(
+                'h-full animate-progressbar',
+                generationStage.startsWith('失败') || generationStage.startsWith('异常')
+                  ? 'bg-gradient-to-r from-red-400 via-red-500 to-red-400'
+                  : generationStage.startsWith('完成')
+                  ? 'bg-gradient-to-r from-emerald-400 via-emerald-500 to-emerald-400'
+                  : 'bg-gradient-to-r from-[#2f78ff] via-[#4c8dff] to-[#2f78ff]'
+              )}
+              style={{
+                boxShadow: generationStage.startsWith('失败') || generationStage.startsWith('异常')
+                  ? '0 0 8px rgba(248,113,113,0.6)'
+                  : '0 0 8px rgba(47,120,255,0.6)',
+              }}
+            />
+          </div>
+          {/* 2. 右上角浮动进度卡片 */}
+          <div
+            data-progress-card="true"
+            className="pointer-events-none fixed right-4 top-4 z-[100] flex items-start gap-3 rounded-xl border border-[#dfe3e8] bg-white/95 px-4 py-3 shadow-[0_12px_28px_rgba(41,48,61,0.18)] backdrop-blur"
+            style={{ minWidth: 280, maxWidth: 360 }}
+          >
+            {/* 旋转图标 */}
+            <div
+              className={cn(
+                'mt-0.5 h-5 w-5 shrink-0 rounded-full border-2 border-transparent animate-spin',
+                generationStage.startsWith('失败') || generationStage.startsWith('异常')
+                  ? 'border-t-red-500 border-r-red-500'
+                  : generationStage.startsWith('完成')
+                  ? 'border-t-emerald-500 border-r-emerald-500'
+                  : 'border-t-[#2f78ff] border-r-[#2f78ff] border-b-[#2f78ff]/20 border-l-[#2f78ff]/20'
+              )}
+            />
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <span
+                  className={cn(
+                    'text-sm font-semibold',
+                    generationStage.startsWith('失败') || generationStage.startsWith('异常')
+                      ? 'text-red-600'
+                      : generationStage.startsWith('完成')
+                      ? 'text-emerald-600'
+                      : 'text-[#2f78ff]'
+                  )}
+                >
+                  {generationKind === 'extract'
+                    ? '视频抽帧 / 脚本拆解'
+                    : generationKind === 'video'
+                    ? '视频生成'
+                    : '图片生成'}
+                </span>
+                {generationStage.startsWith('完成') && (
+                  <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium text-emerald-700">
+                    完成
+                  </span>
+                )}
+              </div>
+              <div className="mt-0.5 text-xs leading-relaxed text-[#5e6878]">
+                {generationStage || '【测试模式】进度条已强制显示,请确认浏览器顶部蓝色细线和右上角卡片可见'}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
       {/* 隐藏的 file input — 菜单/拖拽都通过它选择文件 */}
       <input
         ref={fileInputRef}
@@ -1127,6 +1679,11 @@ export default function NewCanvasPage() {
               });
             }}
             onExpandImage={(image) => setExpandedImage(image)}
+            onUpdateSettings={updateNodeSettings}
+            upstreamNodes={edges
+              .filter((e) => e.to === node.id)
+              .map((e) => nodes.find((n) => n.id === e.from))
+              .filter((n): n is CanvasViewNode => Boolean(n))}
           />
         ))
       )}
@@ -1134,14 +1691,28 @@ export default function NewCanvasPage() {
       {activeNode && (
         <PromptComposer
           node={activeNode}
-          value={activeNode.prompt ?? ''}
+          // 视频节点且有上游(图生视频场景):用户输入存到 content(后端 CanvasVideoGenService 读 node.content)
+          // 其他情况:用户输入存到 prompt(通过 generateNode 请求传给后端)
+          value={activeNode.type === 'video'
+            && edges.some((edge) => edge.to === activeNode.id)
+            ? (activeNode.content ?? '')
+            : (activeNode.prompt ?? '')}
           referenceCount={edges.filter((edge) => edge.to === activeNode.id).length}
-          onChange={(value) => updateNodePrompt(activeNode.id, value)}
+          onChange={activeNode.type === 'video'
+            && edges.some((edge) => edge.to === activeNode.id)
+            ? (value) => updateNodeContent(activeNode.id, value)
+            : (value) => updateNodePrompt(activeNode.id, value)}
           onSubmit={requestGeneration}
           generating={generating}
           onUploadMaterial={handleUploadMaterial}
           uploading={uploading}
           materials={promptMaterials[activeNode.id] ?? []}
+          onActivate={() => setActiveNodeId(activeNode.id)}
+          onUpdateSettings={updateNodeSettings}
+          upstreamNodes={edges
+            .filter((e) => e.to === activeNode.id)
+            .map((e) => nodes.find((n) => n.id === e.from))
+            .filter((n): n is CanvasViewNode => Boolean(n))}
         />
       )}
 
@@ -1361,6 +1932,105 @@ function FlowPath({ path, preview }: { path: string; preview?: boolean }) {
   );
 }
 
+/** 2026-08-10 v5:视频节点底部设置条(模型/时长/分辨率) */
+function VideoNodeSettingsBar({
+  node,
+  active,
+  onActivate,
+  onUpdateSettings,
+  upstreamNodes = [],
+}: {
+  node: CanvasViewNode;
+  active: boolean;
+  onActivate: () => void;
+  onUpdateSettings?: (id: string, patch: Record<string, unknown>) => void;
+  /** 上游节点列表(用于推断默认时长:抽帧节点 1 秒 1 帧,帧数 = 秒数) */
+  upstreamNodes?: CanvasViewNode[];
+}) {
+  // 2026-08-10 v6:从上游抽帧节点推断默认时长(1 秒 1 帧,帧数 = 秒数)
+  const inferDefaultDuration = (): number => {
+    for (const up of upstreamNodes) {
+      // 优先级 1:settings.frameCount(后端持久化)
+      try {
+        const s = up.settings ? JSON.parse(up.settings) : {};
+        if (typeof s.frameCount === 'number' && s.frameCount > 0) return s.frameCount;
+      } catch { /* ignore */ }
+      // 优先级 2:content "已抽帧 N 张..."(老数据兜底)
+      const m = (up.content || '').match(/已抽帧\s*(\d+)\s*张/);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (n > 0) return n;
+      }
+    }
+    return 9;
+  };
+  const defaultDuration = inferDefaultDuration();
+
+  let duration = defaultDuration;
+  let resolution = '720P';
+  try {
+    const s = node.settings ? JSON.parse(node.settings) : {};
+    if (typeof s.duration === 'number') duration = s.duration;
+    if (typeof s.resolution === 'string') resolution = s.resolution;
+  } catch {
+    /* ignore */
+  }
+
+  // 时长候选项:基础 4/6/8/10,加上抽帧推断的帧数(去重)
+  const durationOptions = Array.from(new Set([4, 6, 8, 10, defaultDuration])).sort((a, b) => a - b);
+  // 分辨率候选项:480P / 720P / 1080P
+  const resolutionOptions = ['480P', '720P', '1080P'];
+
+  return (
+    <div className="absolute bottom-5 left-4 flex items-center gap-2 text-xs font-medium text-[#516074]">
+      <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
+        <Sparkles className="h-3 w-3" />
+        <span>doubao-seedance</span>
+      </button>
+      <span className="text-[#b4bdc9]">⌄</span>
+      {/* 时长下拉 */}
+      <select
+        value={duration}
+        onClick={onActivate}
+        onChange={(e) => {
+          onActivate();
+          const v = parseInt(e.target.value, 10);
+          if (!isNaN(v)) onUpdateSettings?.(node.id, { duration: v });
+        }}
+        className={`cursor-pointer rounded bg-transparent px-1 outline-none transition-colors ${
+          active ? 'text-[#2f78ff]' : 'hover:text-[#2f78ff]'
+        }`}
+      >
+        {durationOptions.map((d) => (
+          <option key={d} value={d}>
+            {d} 秒
+          </option>
+        ))}
+      </select>
+      <span className="text-[#b4bdc9]">⌄</span>
+      {/* 分辨率下拉 */}
+      <select
+        value={resolution}
+        onClick={onActivate}
+        onChange={(e) => {
+          onActivate();
+          onUpdateSettings?.(node.id, { resolution: e.target.value });
+        }}
+        className={`cursor-pointer rounded bg-transparent px-1 outline-none transition-colors ${
+          active ? 'text-[#2f78ff]' : 'hover:text-[#2f78ff]'
+        }`}
+      >
+        {resolutionOptions.map((r) => (
+          <option key={r} value={r}>
+            {r}
+          </option>
+        ))}
+      </select>
+      <span className="text-[#b4bdc9]">⌄</span>
+    </div>
+  );
+}
+
 function CanvasNodeCard({
   node,
   active,
@@ -1373,6 +2043,8 @@ function CanvasNodeCard({
   onContextMenu,
   onDragStart,
   onExpandImage,
+  onUpdateSettings,
+  upstreamNodes = [],
 }: {
   node: CanvasViewNode;
   active: boolean;
@@ -1386,8 +2058,13 @@ function CanvasNodeCard({
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
   /** 双击图片节点放大查看 */
   onExpandImage: (image: { url: string; title: string }) => void;
+  /** 视频节点:更新 duration/resolution 设置 */
+  onUpdateSettings?: (id: string, patch: Record<string, unknown>) => void;
+  /** 上游节点列表(用于推断默认时长) */
+  upstreamNodes?: CanvasViewNode[];
 }) {
   const isText = node.type === 'text';
+  const isVideoLike = node.type === 'video';
 
   return (
     <div
@@ -1454,10 +2131,10 @@ function CanvasNodeCard({
               active ? 'border border-[#48566a]' : 'border border-[#e0e4ea]'
             )}
           />
-        ) : node.resultUrl ? (
+        ) : (node.resultUrl && node.resultUrl.length > 0) ? (
           // 生成成功：按类型渲染 <video> 或 <img>
           // 注意:img/video 不能加 data-no-node-drag="true",否则点击图片区域无法拖动节点
-          node.type === 'video' ? (
+          isVideoLike ? (
             <div className="relative">
               <button
                 type="button"
@@ -1525,9 +2202,9 @@ function CanvasNodeCard({
               'grid h-[220px] w-[320px] cursor-grab place-items-center rounded-lg bg-white/35 text-[#718197] outline-none transition hover:bg-white/50 hover:text-[#2f78ff] active:cursor-grabbing',
               active ? 'border border-[#596476]' : 'border border-[#e0e4ea]'
             )}
-            title="上传图片"
+            title={isVideoLike ? '视频生成节点' : '上传图片'}
           >
-            <ImageIcon className="h-8 w-8" />
+            {isVideoLike ? <Film className="h-8 w-8" /> : <ImageIcon className="h-8 w-8" />}
           </button>
         )}
       </div>
@@ -1551,6 +2228,9 @@ function PromptComposer({
   onUploadMaterial,
   uploading,
   materials,
+  onActivate,
+  onUpdateSettings,
+  upstreamNodes = [],
 }: {
   node: CanvasViewNode;
   value: string;
@@ -1564,6 +2244,12 @@ function PromptComposer({
   uploading?: boolean;
   /** 当前节点已上传的素材列表(包含缩略图 url) */
   materials?: Array<{ id: string; url: string; name?: string }>;
+  /** 视频节点:激活回调(点击设置时) */
+  onActivate?: () => void;
+  /** 视频节点:更新 duration/resolution */
+  onUpdateSettings?: (id: string, patch: Record<string, unknown>) => void;
+  /** 视频节点:上游节点列表(用于推断默认时长) */
+  upstreamNodes?: CanvasViewNode[];
 }) {
   const isText = node.type === 'text';
   const isImage = node.type === 'image';
@@ -1691,22 +2377,14 @@ function PromptComposer({
           <span className="text-[#b4bdc9]">⌄</span>
         </div>
       ) : (
-        // 视频节点：模型 / 时长 / 分辨率
-        <div className="absolute bottom-5 left-4 flex items-center gap-2 text-xs font-medium text-[#516074]">
-          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
-            <Sparkles className="h-3 w-3" />
-            <span>doubao-seedance</span>
-          </button>
-          <span className="text-[#b4bdc9]">⌄</span>
-          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
-            <span>4 秒</span>
-          </button>
-          <span className="text-[#b4bdc9]">⌄</span>
-          <button type="button" className="inline-flex items-center gap-1 hover:text-[#2f78ff]">
-            <span>480P</span>
-          </button>
-          <span className="text-[#b4bdc9]">⌄</span>
-        </div>
+        // 视频节点：模型 / 时长 / 分辨率 — 2026-08-10 v5:改为可交互选择,选择存到 node.settings
+        <VideoNodeSettingsBar
+          node={node}
+          active={true}
+          onActivate={() => onActivate?.()}
+          onUpdateSettings={onUpdateSettings}
+          upstreamNodes={upstreamNodes}
+        />
       )}
       <div className="absolute bottom-4 right-4 flex items-center gap-2">
         <span className="text-xs font-medium text-[#536072]">

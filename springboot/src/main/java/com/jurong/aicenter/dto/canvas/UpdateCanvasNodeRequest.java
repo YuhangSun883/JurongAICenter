@@ -20,4 +20,7 @@ public class UpdateCanvasNodeRequest {
 
     /** 下游连接列表（多端口格式） */
     private List<NodeConnection> downstreamIds;
+
+    /** 节点设置 JSON(如视频节点的 duration/resolution/model 等) */
+    private String settings;
 }

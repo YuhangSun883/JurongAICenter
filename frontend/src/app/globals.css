@@ -88,3 +88,14 @@
 .scrollbar-hidden::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* 2026-08-10 生成进度条动画 */
+@keyframes progressbar-slide {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(150%); }
+  100% { transform: translateX(400%); }
+}
+.animate-progressbar {
+  animation: progressbar-slide 1.6s ease-in-out infinite;
+  width: 40%;
+}

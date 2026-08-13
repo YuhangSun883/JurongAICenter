@@ -2,6 +2,8 @@ package com.jurong.aicenter.service;
 
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 
+import java.util.List;
+
 /**
  * 视频生成服务（图生视频）— 走 NewAPI 中转站，绕过 ComfyUI。
  *
@@ -46,6 +48,48 @@ public interface VideoGenerationService {
     GenerateResponse submitImageToVideo(Long userId,
                                         byte[] fileBytes, String filename, String contentType,
                                         String prompt, int duration, String resolution);
+
+    /**
+     * 2026-08-11 新增：使用预上传到 NewAPI 素材库的 asset_url 提交图生视频任务。
+     * 适用场景：换装总图已先上传到 NewAPI 素材库 (asset://xxx)，此处直接引用，
+     * 期望绕过 NewAPI 上游的 InputImageSensitiveContentDetected 人脸检测。
+     *
+     * @param userId               用户 ID
+     * @param preUploadedAssetUrl  已上传到 NewAPI 素材库的 asset_url (asset://aic_xxx)
+     * @param prompt               用户提示词
+     * @param duration             时长（秒），默认 4
+     * @param resolution           分辨率，如 480P
+     * @return GenerateResponse
+     */
+    GenerateResponse submitImageToVideoByAssetUrl(Long userId,
+                                                   String preUploadedAssetUrl,
+                                                   String prompt, int duration, String resolution);
+
+    /**
+     * 2026-08-13 新增:视频生成视频(多图参考换物)
+     *
+     * <p>画布场景:左视频节点(已生成的原视频) + 右视频节点(用户上传 N 张参考图:衣服/商品等)
+     * 后端把参考图横拼成一张大图,上传到 aicoming 素材库(asset_url 路径)避免人脸检测,
+     * 用 NewAPI 生成保持原视频动作 + 替换服装/商品的新视频。</p>
+     *
+     * @param userId              用户 ID
+     * @param referenceImageBytes N 张参考图字节流(1-6 张)
+     * @param referenceFilenames  对应文件名(可空)
+     * @param referenceMimeTypes  对应 mime(可空)
+     * @param prompt              提示词(描述"保持原视频动作,换上参考图的XX")
+     * @param duration            秒数,默认 4
+     * @param resolution          "480p"/"720p",默认 480p
+     * @param sourceVideoUrl      原视频 URL(参考用,注入到 prompt 让模型知道是哪个原视频)
+     * @return GenerateResponse
+     */
+    GenerateResponse submitVideoFromVideoWithReferences(Long userId,
+                                                         List<byte[]> referenceImageBytes,
+                                                         List<String> referenceFilenames,
+                                                         List<String> referenceMimeTypes,
+                                                         String prompt,
+                                                         int duration,
+                                                         String resolution,
+                                                         String sourceVideoUrl);
 
     /**
      * 内部：定时轮询运行中的图生视频任务（每 2 秒一次）。

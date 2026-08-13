@@ -8,6 +8,7 @@ import type {
   CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
+  GenerateVideoRequest,
   UpdateCanvasRequest,
   UpdateCanvasNodeRequest,
   UploadToCanvasOptions,
@@ -30,6 +31,14 @@ export function generateNode(req: GenerateCanvasNodeRequest): Promise<GenerateCa
   return request<GenerateCanvasNodeResponse>(`${API}/nodes/${req.nodeId}/generate`, {
     method: 'POST',
     body: req,
+  });
+}
+
+/** 视频生成专用端点(图生视频):POST /nodes/{id}/generate-video */
+export function generateVideo(req: GenerateVideoRequest): Promise<GenerateCanvasNodeResponse> {
+  return request<GenerateCanvasNodeResponse>(`${API}/nodes/${req.nodeId}/generate-video`, {
+    method: 'POST',
+    body: { duration: req.duration ?? 9, resolution: req.resolution ?? '720P' },
   });
 }
 
@@ -64,6 +73,16 @@ export function getCanvasDetail(canvasId: string): Promise<CanvasDetail> {
 /** 拿单个节点 */
 export function getNode(nodeId: string): Promise<CanvasNode> {
   return request<CanvasNode>(`${API}/nodes/${nodeId}`);
+}
+
+/**
+ * 删除单个画布节点(后端会同时清理与之相关的 edge)。
+ * 用于前端"删除节点"操作,确保下次刷新节点不会回来。
+ */
+export async function deleteNode(nodeId: string): Promise<void> {
+  await request<{ nodeId: string; status: string }>(`${API}/nodes/${nodeId}`, {
+    method: 'DELETE',
+  });
 }
 
 /**

@@ -65,7 +65,7 @@ management:
 logging:
   level:
     root: INFO
-    com.jurong.aicenter: DEBUG
+    com.jurong.aicenter: INFO
     com.baomidou.mybatisplus: WARN
 
 # ============================================================
