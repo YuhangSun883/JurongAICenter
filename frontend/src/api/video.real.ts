@@ -1,6 +1,7 @@
 // 视频生成 - 真实后端实现
 import { request, ApiError } from '@/lib/http';
 import { getAccessToken } from '@/lib/auth-store';
+import { uploadAicomingAsset } from './media.real';
 import type {
   CreateVideoRequest,
   CreateVideoResponse,
@@ -103,6 +104,9 @@ function mapJobToTask(job: any): VideoTask {
   // 注意：job.id 是任务 id，跟 media_asset.id 不一样；必须用 mediaAssetId 才能 stream
   const streamId = job.mediaAssetId ?? job.id;
   const resultUrl = streamId != null ? toBackendStreamUrl(streamId, rawResultUrl) : rawResultUrl;
+  // 原始 TOS / MinIO 签名 URL（按 API 文档 §7，24h 有效）—— 给下载/分享/调试用，
+  // 不能直接喂 <video>（会被 ORB 拦截）。
+  const videoUrl = rawResultUrl;
 
   // 进度：COMPLETED → 100, FAILED → 0, RUNNING → 10-90%, PENDING → 0-10%
   let progress: number;
@@ -124,6 +128,7 @@ function mapJobToTask(job: any): VideoTask {
     progress,
     request: {} as CreateVideoRequest,
     resultUrl,
+    videoUrl,
     error: job.errorMessage,
     estimatedCredits: job.creditsCost || 0,
     createdAt: job.createdAt ? new Date(job.createdAt).getTime() : Date.now(),
@@ -145,14 +150,30 @@ export async function generateScript(
 
 export async function create(req: CreateVideoRequest): Promise<CreateVideoResponse> {
   // 后端：POST /api/videos/text-to-video（VideoGenerationController#textToVideo）
-  // 前端将 CreateVideoRequest 映射到该接口的请求体字段
-  const backendBody = {
+  // 请求体按《聚融中转 API 接口文档》§3 文生视频 + §6 视频字段说明对齐：
+  //   - 顶层 model / prompt
+  //   - metadata.duration / metadata.resolution / metadata.ratio / metadata.watermark
+  //     / metadata.generate_audio / metadata.return_last_frame（文档约定）
+  // 同时保留后端 controller 识别的顶层字段（script/aspectRatio/audioMode）做向后兼容。
+  const backendBody: Record<string, unknown> = {
+    // 后端 controller 期望的字段（当前实现读这些）
     script: req.script,
     model: req.model,
     aspectRatio: req.aspectRatio,
     resolution: req.resolution,
     duration: req.duration,
     audioMode: req.audioMode ?? 'mute',
+    // 文档 §3/§6：把 prompt / model 顶层冗余声明，方便后端后续按文档实现
+    prompt: req.script,
+    // 文档 §6：metadata 嵌套（后端 controller 当前不读，但传了不影响运行；后续若按文档改造直接用）
+    metadata: {
+      duration: req.duration,
+      resolution: req.resolution,
+      ratio: req.aspectRatio,
+      watermark: false,
+      generate_audio: req.audioMode !== 'mute',
+      return_last_frame: true,
+    },
   };
   const resp = await request<any>(`${API}/text-to-video`, { method: 'POST', body: backendBody });
   // 后端返回 GenerateResponse { jobId, status, ... } 或被包装 {code, data}
@@ -165,7 +186,15 @@ export async function create(req: CreateVideoRequest): Promise<CreateVideoRespon
 
 /**
  * 图生视频 — 调用后端 POST /api/videos/image-to-video (multipart)
- * 下载图片 URL → 构建 FormData → 发送到后端
+ *
+ * 请求字段（按《聚融中转站接口手册 v2.1》§7 + 后端 controller）：
+ *   - imageUrl（表单字段）：http(s):// 或 asset://aic_xxx
+ *     这是文档推荐的"URL 转发"模式，绕过 ORB/CORS + 支持 asset:// 引用。
+ *   - file（multipart，可选）：兼容旧版 multipart 直传
+ *   - prompt / duration / resolution / metadata
+ *
+ * 前置：blob: URL 会被自动上传到聚融素材库（v2.1 文档 §9）拿 asset_url，
+ *        解决"前端 blob URL 没真正进 NewAPI 请求"的问题。
  */
 export async function createImageToVideo(
   imageUrl: string,
@@ -173,16 +202,69 @@ export async function createImageToVideo(
   duration: number,
   resolution: string
 ): Promise<CreateVideoResponse> {
-  // 下载图片为 Blob
-  const blob = await (await fetch(imageUrl)).blob();
-  const file = new File([blob], 'reference.jpg', { type: blob.type || 'image/jpeg' });
+  // 1. 预处理：blob: URL → 上传到 aicoming 拿 asset://aic_xxx
+  let finalImageUrl = imageUrl;
+  if (imageUrl && imageUrl.startsWith('blob:')) {
+    try {
+      const blob = await (await fetch(imageUrl)).blob();
+      const ext = blob.type.includes('jpeg') || blob.type.includes('jpg')
+        ? 'jpg' : 'png';
+      const file = new File([blob], `ref_${Date.now()}.${ext}`, { type: blob.type || 'image/png' });
+      console.log('[createImageToVideo] 上传 blob 到 aicoming 素材库...');
+      const asset = await uploadAicomingAsset(file);
+      if (asset && asset.asset_url) {
+        console.log('[createImageToVideo] 拿到 asset_url:', asset.asset_url);
+        finalImageUrl = asset.asset_url;
+      } else {
+        throw new Error('素材上传响应缺少 asset_url');
+      }
+    } catch (e) {
+      throw new ApiError(0,
+        `引用图片上传到素材库失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
 
-  // 构建 multipart FormData
   const formData = new FormData();
-  formData.append('file', file);
+  // 优先用 URL 转发模式（按文档 §7）
+  // 判断：URL 必须是 http(s):// 或 asset:// 开头
+  const useUrlMode =
+    finalImageUrl &&
+    (finalImageUrl.startsWith('http://') ||
+      finalImageUrl.startsWith('https://') ||
+      finalImageUrl.startsWith('asset://'));
+
+  if (useUrlMode) {
+    // 模式 A：URL 转发（推荐）
+    formData.append('imageUrl', finalImageUrl);
+    console.debug('[createImageToVideo] 使用 URL 转发模式:', finalImageUrl);
+  } else {
+    // 模式 B：下载图片为 Blob 后 multipart 上传（兼容旧路径）
+    // 注意：跨域 MinIO URL 可能被 ORB 拦截 → blob 为空 → 后端会报"file 不能为空"
+    console.warn('[createImageToVideo] URL 非 http(s)/asset，回退为 multipart 上传:', finalImageUrl);
+    try {
+      const blob = await (await fetch(finalImageUrl)).blob();
+      const file = new File([blob], 'reference.jpg', { type: blob.type || 'image/jpeg' });
+      formData.append('file', file);
+    } catch (e) {
+      throw new ApiError(0,
+        `无法加载参考图片（URL=${finalImageUrl}）：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   formData.append('prompt', prompt);
   formData.append('duration', String(duration));
   formData.append('resolution', resolution);
+  // 文档 §6 metadata 嵌套：后端 controller 当前不读，传了不破坏现有逻辑
+  formData.append(
+    'metadata',
+    JSON.stringify({
+      duration,
+      resolution,
+      watermark: false,
+      generate_audio: false,
+      return_last_frame: true,
+    })
+  );
 
   // 发送到后端（走相对路径，由 Next.js rewrites 代理到 :8080）
   const token = getAccessToken();

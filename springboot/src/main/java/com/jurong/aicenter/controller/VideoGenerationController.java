@@ -102,44 +102,73 @@ public class VideoGenerationController {
     }
 
     /**
-     * 图生视频：上传图片 + 提示词 → NewAPI 中转站 → 异步生成视频。
+     * 图生视频：支持两种模式（按《聚融中转站接口手册 v2.1》§7）
+     *
+     * <p>模式 A（推荐，对齐文档）：传 {@code imageUrl} 字符串（http(s):// 或 asset://aic_xxx），
+     *    后端直接把 URL 转发给 NewAPI 的 {@code image_urls} 字段。
+     * <p>模式 B（兼容旧版）：传 {@code file} multipart 文件，后端用 multipart 直传 NewAPI。
+     *
+     * <p>字段优先级：imageUrl > file。当传了 imageUrl 时，file 字段可不传。
      */
     @PostMapping("/image-to-video")
     public GenerateResponse imageToVideo(
             @AuthenticationPrincipal AuthenticatedUser principal,
-            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "file", required = false) MultipartFile file,
+            @RequestParam(value = "imageUrl", required = false) String imageUrl,
             @RequestParam("prompt") String prompt,
             @RequestParam(value = "duration", defaultValue = "4") int duration,
             @RequestParam(value = "resolution", defaultValue = "480p") String resolution) {
-        log.info("[I2V-REQ] 收到图生视频请求: userId={}, filename={}, contentType={}, size={}B, promptLen={}, duration={}, resolution={}",
+        log.info("[I2V-REQ] 收到图生视频请求: userId={}, hasImageUrl={}, hasFile={}, "
+                + "imageUrl={}, filename={}, size={}B, promptLen={}, duration={}, resolution={}",
             principal == null ? null : principal.id(),
+            imageUrl != null && !imageUrl.isBlank(),
+            file != null && !file.isEmpty(),
+            imageUrl,
             file == null ? null : file.getOriginalFilename(),
-            file == null ? null : file.getContentType(),
             file == null ? 0 : file.getSize(),
             prompt == null ? 0 : prompt.length(),
             duration, resolution);
 
         if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
-        if (file == null || file.isEmpty()) {
-            log.warn("[I2V-REQ] 文件为空: userId={}", principal.id());
-            throw new BusinessException(ErrorCode.INVALID_PARAM, "file 不能为空");
-        }
         if (prompt == null || prompt.isBlank()) {
-            log.warn("[I2V-REQ] prompt 为空: userId={}", principal.id());
             throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
         }
 
-        byte[] fileBytes;
-        try {
-            fileBytes = file.getBytes();
-        } catch (IOException e) {
-            log.error("[I2V-REQ] 读取文件失败: userId={}, filename={}, err={}",
-                principal.id(), file.getOriginalFilename(), e.getMessage(), e);
-            throw new BusinessException(ErrorCode.INVALID_PARAM, "读取文件失败: " + e.getMessage());
+        boolean hasUrl = imageUrl != null && !imageUrl.isBlank();
+        boolean hasFile = file != null && !file.isEmpty();
+        if (!hasUrl && !hasFile) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "imageUrl 和 file 至少需要传一个（推荐传 imageUrl）");
         }
-        GenerateResponse resp = videoGenerationService.submitImageToVideo(
-            principal.id(), fileBytes, file.getOriginalFilename(), file.getContentType(),
-            prompt, duration, resolution);
+
+        GenerateResponse resp;
+        if (hasUrl) {
+            // 模式 A：用 URL 转发（推荐，绕过 ORB/CORS + 支持 asset://）
+            String url = imageUrl.trim();
+            // 校验 URL 形式
+            if (!(url.startsWith("http://") || url.startsWith("https://") || url.startsWith("asset://"))) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM,
+                    "imageUrl 必须以 http:// / https:// / asset:// 开头");
+            }
+            log.info("[I2V-REQ] 模式 A（URL 转发）: imageUrl={}", url);
+            resp = videoGenerationService.submitImageToVideoByUrl(
+                principal.id(), url, prompt, duration, resolution);
+        } else {
+            // 模式 B：multipart 直传（兼容旧版）
+            byte[] fileBytes;
+            try {
+                fileBytes = file.getBytes();
+            } catch (IOException e) {
+                log.error("[I2V-REQ] 读取文件失败: userId={}, filename={}, err={}",
+                    principal.id(), file.getOriginalFilename(), e.getMessage(), e);
+                throw new BusinessException(ErrorCode.INVALID_PARAM, "读取文件失败: " + e.getMessage());
+            }
+            log.info("[I2V-REQ] 模式 B（multipart 上传）: filename={}", file.getOriginalFilename());
+            resp = videoGenerationService.submitImageToVideo(
+                principal.id(), fileBytes, file.getOriginalFilename(), file.getContentType(),
+                prompt, duration, resolution);
+        }
+
         log.info("[I2V-REQ] 图生视频任务已提交: userId={}, jobId={}, status={}, taskId={}",
             principal.id(), resp.getJobId(), resp.getStatus(), resp.getComfyuiPromptId());
         return resp;
@@ -279,8 +308,23 @@ public class VideoGenerationController {
             throw new BusinessException(ErrorCode.FORBIDDEN, "无权操作此任务");
         }
 
-        log.info("[VIDEO-RETRY-MANUAL] userId={}, jobId={}, currentStatus={}",
-            principal.id(), jobId, job.getStatus());
+        // 区分两种调用方：
+        //   - 手动补刀（前端用户点击按钮）：调用时 incrementRetryCounter，超过 5 次只打 warn
+        //   - 自动补刀（前端 useTaskPolling 每 2 秒轮询调用）：静默，只在每次"自动调用时 NewAPI 状态有变化"才打 info
+        boolean isAutoRetry = isAutoRetryRequest();
+        int retryCount = incrementRetryCounter(jobId, isAutoRetry);
+
+        if (isAutoRetry) {
+            // 自动补刀：只在 retryCount 每累计 10 次（或状态变化）时打一条 info，避免日志刷屏
+            String prevStatus = lastSeenStatuses.put(jobId, job.getStatus());
+            if (retryCount == 1 || retryCount % 10 == 0 || !job.getStatus().equals(prevStatus)) {
+                log.info("[VIDEO-RETRY-AUTO] userId={}, jobId={}, attempt={}, currentStatus={}",
+                    principal.id(), jobId, retryCount, job.getStatus());
+            }
+        } else {
+            log.info("[VIDEO-RETRY-MANUAL] userId={}, jobId={}, currentStatus={}",
+                principal.id(), jobId, job.getStatus());
+        }
 
         boolean recovered = videoGenerationService.retryJobById(jobId);
 
@@ -294,6 +338,58 @@ public class VideoGenerationController {
             result.put("reason", "NewAPI 上任务尚未完成或无法获取 URL");
         }
         return result;
+    }
+
+    // ============================================================
+    // 自动/手动补刀区分 + 节流日志
+    // ============================================================
+
+    /**
+     * 每个 jobId 的自动补刀调用次数（用于节流日志和未来限流）
+     * key=jobId, value=调用次数
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Long, java.util.concurrent.atomic.AtomicInteger>
+        autoRetryCounters = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 每个 jobId 上一次自动补刀时看到的 currentStatus（用于检测状态变化）
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Long, String>
+        lastSeenStatuses = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 自动补刀请求的标识 header（前端 useTaskPolling 自动设置） */
+    private static final String HDR_AUTO_RETRY = "X-Auto-Retry";
+
+    /** 检测当前请求是否来自前端自动补刀机制（每 2 秒一次的那个） */
+    private boolean isAutoRetryRequest() {
+        try {
+            jakarta.servlet.http.HttpServletRequest req =
+                ((org.springframework.web.context.request.ServletRequestAttributes)
+                    org.springframework.web.context.request.RequestContextHolder.currentRequestAttributes())
+                    .getRequest();
+            return "true".equalsIgnoreCase(req.getHeader(HDR_AUTO_RETRY));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 增加调用计数；返回新的累计次数 */
+    private int incrementRetryCounter(Long jobId, boolean isAuto) {
+        if (!isAuto) {
+            // 手动补刀不计数，避免污染
+            return 0;
+        }
+        return autoRetryCounters
+            .computeIfAbsent(jobId, k -> new java.util.concurrent.atomic.AtomicInteger(0))
+            .incrementAndGet();
+    }
+
+    /**
+     * 上游主动失败时调用：清理该 jobId 的节流缓存，停止后续自动重试
+     */
+    private void markAbandoned(Long jobId) {
+        autoRetryCounters.remove(jobId);
+        lastSeenStatuses.remove(jobId);
     }
 
     // ========== 辅助方法 ==========

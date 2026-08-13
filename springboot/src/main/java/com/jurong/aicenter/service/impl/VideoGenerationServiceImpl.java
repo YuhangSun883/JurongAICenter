@@ -69,6 +69,9 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
     /** 记录 job 连续返回 "任务不存在" 的次数，超过阈值后清理（防御 NewAPI 偶发 400） */
     private final ConcurrentHashMap<Long, AtomicInteger> notFoundCountMap = new ConcurrentHashMap<>();
 
+    /** 上次"无 RUNNING job"心跳日志时间戳（用于诊断调度器是否在跑） */
+    private volatile long lastEmptyPollLog = 0;
+
     /** 支持的 video templateId 集合（轮询时用 in 条件） */
     private static final List<String> VIDEO_TEMPLATE_IDS = List.of(
         TEMPLATE_TEXT_TO_VIDEO, TEMPLATE_IMAGE_TO_VIDEO, TEMPLATE_MULTI_IMAGE_TO_VIDEO
@@ -89,6 +92,22 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
             .build();
         return submitInternal(userId, TEMPLATE_IMAGE_TO_VIDEO, prompt, options,
             fileBytes == null ? null : List.of(fileBytes), filename);
+    }
+
+    @Override
+    public GenerateResponse submitImageToVideoByUrl(Long userId,
+                                                    String imageUrl,
+                                                    String prompt, int duration, String resolution) {
+        // 按文档 §7：用 image_urls 数组引用 URL（推荐，绕过 ORB/CORS + 支持 asset://）
+        // 走标准 submitInternal 流程：建 job → 调 NewAPI（submitVideoWithAsset）→ 标 RUNNING → 后续轮询
+        if (imageUrl == null || imageUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "imageUrl 不能为空");
+        }
+        VideoOptions options = VideoOptions.builder()
+            .duration(duration)
+            .resolution(resolution)
+            .build();
+        return submitInternalByImageUrl(userId, imageUrl, prompt, options);
     }
 
     @Override
@@ -243,6 +262,137 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         return new GenerateResponse(job.getId(), job.getStatus(), taskId);
     }
 
+    /**
+     * 用 image_url 提交图生视频任务（按文档 §7，URL 形式）
+     *
+     * <p>和 submitInternal 的区别：
+     *   - 不上传图片到 aicoming，而是把 URL 作为 image_urls 字段直接传给 NewAPI
+     *   - URL 形式：http(s):// 或 asset://aic_xxx
+     *
+     * <p>走相同的 job 建/轮询流程，仅 NewAPI 调用方式不同。
+     */
+    private GenerateResponse submitInternalByImageUrl(Long userId, String imageUrl, String prompt,
+                                                     VideoOptions options) {
+        log.info("[VIDEO-SUBMIT-URL] userId={}, imageUrl={}, promptLen={}, options={}",
+            userId, imageUrl,
+            prompt == null ? 0 : prompt.length(),
+            options);
+
+        if (userId == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "用户未登录");
+        }
+        if (prompt == null || prompt.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
+        }
+        if (options == null) {
+            options = VideoOptions.builder().build();
+        }
+        if (!imageUrl.startsWith("http://") && !imageUrl.startsWith("https://")
+                && !imageUrl.startsWith("asset://")) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "imageUrl 必须以 http:// / https:// / asset:// 开头");
+        }
+
+        // 1. 建 job
+        Map<String, Object> inputs = new HashMap<>();
+        inputs.put("prompt", prompt);
+        inputs.put("duration", options.getDuration());
+        inputs.put("resolution", options.getResolution());
+        inputs.put("ratio", options.getRatio());
+        inputs.put("generateAudio", options.isGenerateAudio());
+        inputs.put("watermark", options.isWatermark());
+        inputs.put("seed", options.getSeed());
+        inputs.put("imageUrl", imageUrl);
+        inputs.put("submitMode", "url");
+
+        Job job = new Job();
+        job.setUserId(userId);
+        job.setTemplateId(TEMPLATE_IMAGE_TO_VIDEO);
+        job.setStatus("PENDING");
+        job.setInputsSnapshot(toJsonString(inputs));
+        job.setCreditsCost(0);
+        job.setCreatedAt(LocalDateTime.now());
+        jobRepository.insert(job);
+        log.info("[VIDEO-SUBMIT-URL] job 创建: jobId={}, userId={}, imageUrl={}",
+            job.getId(), userId, imageUrl);
+
+        // 2. 调 NewAPI（用 image_urls 字段，按文档 §7）
+        String taskId = null;
+        Exception lastException = null;
+        int maxAttempts = 3;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                taskId = newApiClient.submitVideoWithAsset(
+                    prompt,
+                    imageUrl,
+                    options.getModel() != null ? options.getModel() : "doubao-seedance-2.0",
+                    options.getDuration(),
+                    options.getResolution()
+                );
+                log.info("[VIDEO-SUBMIT-URL] jobId={} → NewAPI taskId={} (attempt {}/{})",
+                    job.getId(), taskId, attempt, maxAttempts);
+                break;
+            } catch (BusinessException e) {
+                String msg = e.getMessage() == null ? "" : e.getMessage();
+                if (e.getCode() == ErrorCode.INVALID_PARAM.getCode()) throw e;
+                boolean retryable = msg.contains("do_request_failed")
+                    || msg.contains("upstream")
+                    || msg.contains("500")
+                    || msg.contains("502")
+                    || msg.contains("503")
+                    || msg.contains("504")
+                    || msg.contains("Bad Gateway")
+                    || msg.contains("timeout");
+                lastException = e;
+                if (attempt < maxAttempts && retryable) {
+                    log.warn("[VIDEO-SUBMIT-URL] jobId={} 提交失败 (attempt {}/{}, 可重试), 5s 后重试: {}",
+                        job.getId(), attempt, maxAttempts, msg);
+                    try { Thread.sleep(5000); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    continue;
+                }
+                log.error("[VIDEO-SUBMIT-URL] jobId={} → NewAPI 提交失败 (attempt {}/{}, 最终): {}",
+                    job.getId(), attempt, maxAttempts, msg);
+                markFailed(job, "submit video (by url) failed (after " + attempt + " attempts): " + msg);
+                throw e;
+            } catch (Exception e) {
+                lastException = e;
+                if (attempt < maxAttempts) {
+                    log.warn("[VIDEO-SUBMIT-URL] jobId={} 提交异常 (attempt {}/{}), 5s 后重试: {}",
+                        job.getId(), attempt, maxAttempts, e.getMessage());
+                    try { Thread.sleep(5000); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    continue;
+                }
+                log.error("[VIDEO-SUBMIT-URL] jobId={} → NewAPI 提交最终失败", job.getId(), e);
+                markFailed(job, "submit video (by url) failed (after " + attempt + " attempts): " + e.getMessage());
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+            }
+        }
+        if (taskId == null) {
+            markFailed(job, "submit video (by url) failed (after " + maxAttempts + " attempts): " +
+                (lastException == null ? "unknown" : lastException.getMessage()));
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                lastException == null ? "submit failed" : lastException.getMessage());
+        }
+
+        // 3. 标 RUNNING
+        inputs.put("taskId", taskId);
+        job.setComfyuiPromptId(taskId);
+        job.setInputsSnapshot(toJsonString(inputs));
+        job.setStatus("RUNNING");
+        job.setStartedAt(LocalDateTime.now());
+        jobRepository.updateById(job);
+        log.info("[VIDEO-SUBMIT-URL] jobId={} → RUNNING, taskId={}, imageUrl={}",
+            job.getId(), taskId, imageUrl);
+
+        return new GenerateResponse(job.getId(), job.getStatus(), taskId);
+    }
+
     // ============================================================
     // 异步轮询
     // ============================================================
@@ -267,13 +417,21 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
             log.error("[VIDEO-POLL] 查询 RUNNING job 失败", e);
             return;
         }
-        if (runningJobs.isEmpty()) return;
-
-        if (runningJobs.size() >= 5) {
-            log.info("[VIDEO-POLL] 发现 {} 个 RUNNING job", runningJobs.size());
-        } else {
-            log.debug("[VIDEO-POLL] 发现 {} 个 RUNNING job", runningJobs.size());
+        if (runningJobs.isEmpty()) {
+            // 诊断日志：每 30 秒打一条空扫日志，确认调度器本身在跑
+            // （防止应用启动但 @Scheduled 没生效的情况被忽略）
+            long now = System.currentTimeMillis();
+            if (lastEmptyPollLog == 0 || now - lastEmptyPollLog > 30_000) {
+                log.info("[VIDEO-POLL] 调度器心跳：无 RUNNING job");
+                lastEmptyPollLog = now;
+            }
+            return;
         }
+        lastEmptyPollLog = 0;  // 有 job → 重置心跳时间戳
+
+        log.info("[VIDEO-POLL] 发现 {} 个 RUNNING job: {}",
+            runningJobs.size(),
+            runningJobs.stream().map(j -> String.valueOf(j.getId())).toList());
         for (Job job : runningJobs) {
             try {
                 processOneVideoJob(job);
@@ -367,6 +525,14 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
                 ? Duration.between(job.getStartedAt(), LocalDateTime.now()).toSeconds()
                 : 0L;
             String url = newApiClient.extractVideoUrl(result);
+            // ===== 诊断日志：把 in_progress 分支的所有判断依据打出来 =====
+            log.info("[VIDEO-POLL-INPROG] job {} 状态 in_progress 决策依据: "
+                    + "url={}, completed_at={}, now={}, completedAt<=now={}, "
+                    + "progress={}, elapsedSec={}, threshold=480s",
+                job.getId(),
+                url == null ? "null" : url.substring(0, Math.min(80, url.length())) + "...",
+                completedAt, now, completedAt > 0 && completedAt <= now,
+                progress, elapsedSec);
             if (url != null && !url.isBlank()) {
                 // 1) 直接完成
                 log.warn("[VIDEO-POLL] job {} NewAPI 状态 in_progress 但有 URL，按 completed 处理: {}",
@@ -387,12 +553,24 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
                 }
             }
             // 其他情况（completed_at 未到 / progress < 50）保持 RUNNING，下次再扫
+            else {
+                // 诊断日志：说明为什么没进任何分支（completed_at 缺失 / progress 不足 / 等）
+                log.info("[VIDEO-POLL-INPROG] job {} 未进任何分支: completed_at={} (条件 completedAt>0={}), "
+                        + "progress={} (条件 progress>=50={}) — 保持 RUNNING 等下次轮询",
+                    job.getId(), completedAt, completedAt > 0, progress, progress >= 50);
+            }
         }
         // unknown → 跳过，下次再扫
     }
 
     /** 视频任务完成：抠 URL → 下载 → 上传 MinIO → 标 COMPLETED */
     private void handleCompleted(Job job, JsonNode result) {
+        // 诊断日志：把 status / completed_at / progress 等关键字段打出来
+        log.info("[VIDEO-DONE-ENTRY] job {} 进入完成处理: status={}, completed_at={}, progress={}",
+            job.getId(),
+            result.path("status").asText("?"),
+            result.path("completed_at").asLong(0),
+            result.path("progress").asInt(0));
         String videoUrl = newApiClient.extractVideoUrl(result);
         if (videoUrl == null || videoUrl.isBlank()) {
             log.error("[VIDEO-DONE] job {} ← 响应中未找到 video URL: {}", job.getId(), result);
@@ -472,6 +650,9 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
                     resp.body() == null ? 0 : resp.body().length);
                 return resp.body();
             }
+            // 诊断日志：下载失败时记录完整响应头（前 1000 字符），便于判断是签名过期还是网络问题
+            log.warn("[VIDEO-DONE] 下载失败: status={}, url={}, headers={}",
+                resp.statusCode(), url, truncateForLog(resp.headers().toString(), 1000));
             throw new RuntimeException("HTTP " + resp.statusCode() + " from GET " + url);
         } catch (Exception e) {
             if (e instanceof RuntimeException) throw (RuntimeException) e;
@@ -548,6 +729,20 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
             if (result == null) return false;
             String status = result.path("status").asText("unknown").toLowerCase();
             String url = newApiClient.extractVideoUrl(result);
+
+            // ✅ NewAPI 主动失败（failed / error / cancelled）→ 把 NewAPI 的错误信息
+            // 透传到 job.errorMessage，controller 会把它抛给前端展示
+            // （前端不再继续自动补刀，直接给用户看错误）
+            if ("failed".equals(status) || "error".equals(status) || "cancelled".equals(status)) {
+                String upstreamMsg = extractUpstreamErrorMessage(result);
+                String reason = "NewAPI 视频任务失败: " + (upstreamMsg.isBlank() ? result.toString() : upstreamMsg);
+                log.error("[VIDEO-RETRY] job {} NewAPI 主动失败，停止补刀: status={}, reason={}",
+                    job.getId(), status, reason);
+                job.setErrorMessage(reason);
+                jobRepository.updateById(job);
+                throw new BusinessException(ErrorCode.NEWAPI_TASK_FAILED, reason);
+            }
+
             if (("completed".equals(status) || "succeeded".equals(status)) && url != null && !url.isBlank()) {
                 // NewAPI 上其实已经完成了！自动下载补刀
                 log.warn("[VIDEO-RETRY] job {} FAILED 但 NewAPI 已 completed，自动补刀: taskId={}",
@@ -563,10 +758,36 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
             log.info("[VIDEO-RETRY] job {} NewAPI 状态={} (URL={})，暂不补刀",
                 job.getId(), status, url == null ? "无" : "有");
             return false;
+        } catch (BusinessException e) {
+            // NewAPI 主动失败时直接抛给 controller（带具体 message）
+            throw e;
         } catch (Exception e) {
             log.warn("[VIDEO-RETRY] job {} 拉取 NewAPI 失败: {}", job.getId(), e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * 从 NewAPI 响应中提取错误信息
+     * 兼容多种错误结构：error.message / message / error.code 等
+     */
+    private String extractUpstreamErrorMessage(JsonNode result) {
+        if (result == null) return "";
+        // 1) error.message / error.code
+        JsonNode error = result.get("error");
+        if (error != null && error.isObject()) {
+            String msg = error.path("message").asText("");
+            String code = error.path("code").asText("");
+            if (!msg.isBlank() && !code.isBlank()) return "[" + code + "] " + msg;
+            if (!msg.isBlank()) return msg;
+            if (!code.isBlank()) return code;
+        }
+        // 2) 顶层 message
+        String topMsg = result.path("message").asText("");
+        if (!topMsg.isBlank()) return topMsg;
+        // 3) error 字段是字符串
+        if (error != null && error.isTextual()) return error.asText();
+        return "";
     }
 
     private void markFailed(Job job, String errorMessage) {

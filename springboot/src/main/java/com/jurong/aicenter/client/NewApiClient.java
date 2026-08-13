@@ -663,11 +663,22 @@ public class NewApiClient {
     public String extractVideoUrl(JsonNode pollResult) {
         if (pollResult == null) return null;
 
+        // ===== 诊断日志：打印响应所有顶层字段名（用于排查 URL 字段偏移） =====
+        java.util.List<String> topFieldNames = new java.util.ArrayList<>();
+        pollResult.fieldNames().forEachRemaining(topFieldNames::add);
+        log.info("[URL-EXTRACT] 响应顶层字段: {}, status={}",
+            topFieldNames, pollResult.path("status").asText("?"));
+
         // 形态 1：metadata.url
         JsonNode metadata = pollResult.get("metadata");
         if (metadata != null && metadata.isObject()) {
+            // 诊断：把 metadata 内的所有字段也打出来（便于发现 url 被改名）
+            java.util.List<String> metaFields = new java.util.ArrayList<>();
+            metadata.fieldNames().forEachRemaining(metaFields::add);
+            log.info("[URL-EXTRACT] metadata 字段: {}", metaFields);
             JsonNode url = metadata.get("url");
             if (url != null && url.isTextual()) {
+                log.info("[URL-EXTRACT] 命中形态 1 (metadata.url)");
                 return url.asText();
             }
         }
@@ -679,6 +690,7 @@ public class NewApiClient {
             if (innerMeta != null && innerMeta.isObject()) {
                 JsonNode url = innerMeta.get("url");
                 if (url != null && url.isTextual()) {
+                    log.info("[URL-EXTRACT] 命中形态 2 (result.metadata.url)");
                     return url.asText();
                 }
             }
@@ -688,6 +700,7 @@ public class NewApiClient {
         if (result != null) {
             JsonNode url = result.get("url");
             if (url != null && url.isTextual()) {
+                log.info("[URL-EXTRACT] 命中形态 3 (result.url)");
                 return url.asText();
             }
         }
@@ -695,10 +708,13 @@ public class NewApiClient {
         // 形态 4：顶层 url
         JsonNode topUrl = pollResult.get("url");
         if (topUrl != null && topUrl.isTextual()) {
+            log.info("[URL-EXTRACT] 命中形态 4 (顶层 url)");
             return topUrl.asText();
         }
 
-        log.warn("Could not extract video URL from NewAPI response: {}", pollResult);
+        // ===== 诊断日志：未命中任意形态，打印完整响应（截断 3000 字符避免日志爆炸） =====
+        log.warn("[URL-EXTRACT] 未命中 4 种形态，完整响应: {}",
+            truncateForLog(pollResult.toString(), 3000));
         return null;
     }
 
@@ -857,6 +873,125 @@ public class NewApiClient {
      */
     public String generateImage(String prompt) {
         return generateImage(prompt, null, null, null);
+    }
+
+    /**
+     * 图生图（图生文）- 按《聚融中转 API 文档》§2
+     * 调用 NewAPI /v1/images/generations（JSON body），用 image 字段传 URL。
+     *
+     * <p>请求体：
+     * <pre>{@code
+     * {
+     *   "model": "gpt-image-2-2k",
+     *   "prompt": "convert to watercolor style",
+     *   "image": "https://example.com/photo.jpg",
+     *   "size": "1024x1024"
+     * }
+     * }</pre>
+     *
+     * @param prompt    用户提示词
+     * @param imageUrls 参考图 URL 列表（http:// / https:// / asset://），取第一张
+     * @param size      图片尺寸
+     * @param quality   图片质量
+     * @param style     图片风格
+     * @return NewAPI 返回的图片 URL 或 base64 data URI
+     */
+    public String generateImageWithImageUrl(
+            String prompt,
+            List<String> imageUrls,
+            String size,
+            String quality,
+            String style) {
+        if (prompt == null || prompt.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
+        }
+        if (imageUrls == null || imageUrls.isEmpty()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "至少需要 1 张参考图 URL");
+        }
+        String imageUrl = imageUrls.get(0);
+
+        // 快速健康检查
+        if (!checkHealth()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 服务不可用，请稍后再试");
+        }
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", "gpt-image-2-2k");
+        body.put("prompt", prompt);
+        body.put("image", imageUrl);  // 文档 §2：image 字段是 URL
+        body.put("size", size != null ? size : "1024x1024");
+        if (quality != null) body.put("quality", quality);
+        if (style != null) body.put("style", style);
+        body.put("response_format", "b64_json");
+
+        log.info("[IMG-I2I] 图生图(image=URL): promptLen={}, image={}, size={}",
+            prompt.length(), imageUrl, size);
+
+        try {
+            JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
+                .post()
+                .uri("/v1/images/generations")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(Duration.ofSeconds(300))
+                .onErrorMap(WebClientResponseException.class, e -> {
+                    log.error("[IMG-I2I] NewAPI 失败: {} {}",
+                        e.getStatusCode(), e.getResponseBodyAsString());
+                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "图生图失败: " + e.getStatusCode() + " " + e.getStatusText());
+                })
+                .onErrorMap(e -> {
+                    if (e instanceof BusinessException) return e;
+                    log.error("[IMG-I2I] NewAPI 异常: {}", e.getMessage());
+                    return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+                })
+                .block();
+
+            if (response == null) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图生图返回为空");
+            }
+            // 复用 generateImage 的响应解析逻辑
+            return parseImageResponse(response);
+        } catch (Exception e) {
+            if (e instanceof BusinessException) throw e;
+            log.error("[IMG-I2I] 调用失败: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图生图失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 把 NewAPI 图片生成响应解析成"可用的字符串"（URL 或 base64 data URI）
+     * 共用于 generateImage / generateImageWithImageUrl
+     */
+    private String parseImageResponse(JsonNode response) {
+        if (!response.has("data")) {
+            if (response.has("url") && response.get("url").isTextual()) {
+                return response.get("url").asText();
+            }
+            if (response.has("b64_json") && response.get("b64_json").isTextual()) {
+                return "data:image/png;base64," + response.get("b64_json").asText();
+            }
+            String errMsg = response.has("error") ? response.get("error").toString() : "未知错误";
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 返回错误: " + errMsg);
+        }
+        JsonNode dataArray = response.get("data");
+        if (!dataArray.isArray() || dataArray.size() == 0) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片生成 data 数组为空");
+        }
+        JsonNode first = dataArray.get(0);
+        if (first.has("b64_json") && first.get("b64_json").isTextual()) {
+            return "data:image/png;base64," + first.get("b64_json").asText();
+        }
+        String[] urlFields = {"url", "image_url", "imageUrl", "img_url", "imgUrl"};
+        for (String field : urlFields) {
+            if (first.has(field) && first.get(field).isTextual()) {
+                return first.get(field).asText();
+            }
+        }
+        throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片生成响应中未找到图片字段");
     }
 
     /**

@@ -115,3 +115,53 @@ export async function listRoles(q: RoleListQuery = {}): Promise<MediaRole[]> {
   if (Array.isArray(res)) return res;
   return res?.items ?? [];
 }
+
+// ============================================================
+// 聚融素材库（按 v2.1 文档 §9，把图片上传到 :8090 拿 asset://aic_xxx）
+// ============================================================
+
+export interface AicomingAsset {
+  /** aicoming 内部 id，形如 aic_xxx */
+  id: string;
+  /** 引用形式，asset://aic_xxx（用于生成图片/视频的 image/image_url 字段） */
+  asset_url: string;
+  name?: string;
+  type?: 'image' | 'video' | 'audio';
+  status?: 'processing' | 'active' | 'failed';
+  thumbnail_url?: string;
+  fail_reason?: string;
+}
+
+/**
+ * 上传图片到 aicoming 素材库，拿到 asset_url（asset://aic_xxx）。
+ * 用于「AI 生成图片」「AI 生成视频」前对引用图片做入库（绕过 PrivacyInformation 审核）。
+ *
+ * 后端实现：/api/assets/upload → :8090/v1/assets（multipart） → 轮询 status=active。
+ */
+export async function uploadAicomingAsset(file: File): Promise<AicomingAsset> {
+  const form = new FormData();
+  form.append('file', file);
+
+  const token = getAccessToken();
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch('/api/assets/upload', {
+    method: 'POST',
+    headers,
+    body: form,
+  });
+
+  let payload: any = undefined;
+  try { payload = await res.json(); } catch { /* ignore */ }
+  if (!res.ok) {
+    throw new Error(payload?.message || `素材上传失败: HTTP ${res.status}`);
+  }
+  if (payload && typeof payload === 'object' && 'code' in payload) {
+    if (payload.code !== 0 && payload.code !== 200) {
+      throw new Error(payload.message || `素材上传失败: code=${payload.code}`);
+    }
+    return payload.data as AicomingAsset;
+  }
+  return payload as AicomingAsset;
+}

@@ -18,4 +18,10 @@ public class ImageGenerateResponse {
 
     /** 原始 NewAPI 返回的 URL（用于调试） */
     private String originalUrl;
+
+    /** MinIO 对象 key（前端用于和历史列表去重 + 收藏用） */
+    private String objectKey;
+
+    /** MinIO 可访问 URL（前端用于和历史列表去重 + 直接展示） */
+    private String assetUrl;
 }

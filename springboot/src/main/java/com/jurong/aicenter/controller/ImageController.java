@@ -16,8 +16,10 @@ import com.jurong.aicenter.service.StorageService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.MediaType;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -65,20 +67,36 @@ public class ImageController {
         Long userId = principal.id();
         String prompt = request.getPrompt();
         List<String> referenceImages = request.getReferenceImages();
+        List<String> imageUrls = request.getImageUrls();
         boolean hasReferences = referenceImages != null && !referenceImages.isEmpty();
+        boolean hasImageUrls = imageUrls != null && !imageUrls.isEmpty();
 
-        log.info("AI 图片生成请求: userId={}, promptLen={}, size={}, quality={}, style={}, refImageCount={}",
+        log.info("AI 图片生成请求: userId={}, promptLen={}, size={}, quality={}, style={}, "
+                + "refImageCount={}, imageUrlsCount={}",
             userId, prompt.length(), request.getSize(), request.getQuality(), request.getStyle(),
-            hasReferences ? referenceImages.size() : 0);
+            hasReferences ? referenceImages.size() : 0,
+            hasImageUrls ? imageUrls.size() : 0);
 
         // 1. 根据是否有引用图片，选择调用不同的 NewAPI 接口
-        // - 有引用图片：调用 /v1/images/edits（图片编辑接口），将引用图片作为素材
+        // - 有引用图片 URL（按文档 §2）：调用 /v1/images/generations（JSON body，image 字段）
+        // - 有引用图片 base64（兼容旧版）：调用 /v1/images/edits（multipart）
         // - 无引用图片：调用 /v1/images/generations（纯文本生成接口）
         String originalData;
         try {
-            if (hasReferences) {
-                // 有引用图片：调用图片编辑接口，将引用图片作为素材结合提示词生成新图片
-                log.info("检测到 {} 张引用图片，调用 /v1/images/edits 接口", referenceImages.size());
+            if (hasImageUrls) {
+                // 文档 §2：image 字段传 URL（http:// / https:// / asset://）
+                log.info("检测到 {} 张引用图片 URL（按文档 §2），调用 /v1/images/generations (JSON, image=URL)",
+                    imageUrls.size());
+                originalData = newApiClient.generateImageWithImageUrl(
+                    prompt,
+                    imageUrls,
+                    request.getSize(),
+                    request.getQuality(),
+                    request.getStyle()
+                );
+            } else if (hasReferences) {
+                // 兼容旧版：base64 data URI → multipart /v1/images/edits
+                log.info("检测到 {} 张引用图片(base64)，调用 /v1/images/edits 接口", referenceImages.size());
                 originalData = newApiClient.editImage(
                     prompt,
                     referenceImages,
@@ -113,13 +131,18 @@ public class ImageController {
 
         // 3. 入库到 media_assets（type=image, source=ai-generated, sourceTool=image）
         //    这样预览窗口的图片会进入任务队列（用户切走再回来也能看到历史）
+        String objectKey = null;
+        String assetUrl = null;
         try {
             int commaIdx = base64DataUri.indexOf(',');
             String mimeType = base64DataUri.startsWith("data:image/png") ? "image/png" : "image/jpeg";
             if (commaIdx != -1) {
                 byte[] imageBytes = Base64.getDecoder().decode(base64DataUri.substring(commaIdx + 1));
                 MediaAssetResponse saved = mediaService.recordGeneratedImage(userId, imageBytes, mimeType);
-                log.info("AI 生成图片已入库: assetId={}, url={}", saved.getId(), saved.getUrl());
+                objectKey = saved.getObjectKey();
+                assetUrl = saved.getUrl();
+                log.info("AI 生成图片已入库: assetId={}, objectKey={}, url={}",
+                    saved.getId(), objectKey, assetUrl);
             }
         } catch (Exception e) {
             // 入库失败不影响主流程（生成已成功），仅记录告警
@@ -127,10 +150,13 @@ public class ImageController {
         }
 
         // 4. 构造响应：imageUrl 为 base64 data URI，可直接在网页中显示
+        //    同时把入库的 objectKey/assetUrl 返回给前端，用于和历史列表去重
         ImageGenerateResponse response = new ImageGenerateResponse(
             base64DataUri,
             "gpt-image-2-2k",
-            base64DataUri
+            base64DataUri,
+            objectKey,
+            assetUrl
         );
 
         // 计算图片详细属性

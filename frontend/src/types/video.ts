@@ -80,8 +80,17 @@ export interface VideoTask {
   status: TaskStatus;
   progress: number; // 0-100
   request: CreateVideoRequest;
-  /** 生成结果的视频 url（成功时） */
+  /**
+   * 预览视频 URL —— 已转成同域后端代理 (/api/media/assets/{id}/stream)
+   * 原因：浏览器对跨域 MinIO/TOS URL 会触发 ORB/CORS 拒绝，导致视频无法播放，
+   *       前端用它直插 <video src>，保证可播。
+   */
   resultUrl?: string;
+  /**
+   * 原始视频 URL —— NewAPI/中转站返回的 TOS 签名 URL（24h 有效，按文档 §7）
+   * 可用于下载/分享/调试。注意：直接给 <video> 会被 ORB 拦截，请用 resultUrl 预览。
+   */
+  videoUrl?: string;
   /** 缩略图 url */
   thumbnailUrl?: string;
   /** 失败原因 */

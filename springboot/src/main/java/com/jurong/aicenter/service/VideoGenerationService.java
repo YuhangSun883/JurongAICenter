@@ -51,6 +51,20 @@ public interface VideoGenerationService {
                                         String prompt, int duration, String resolution);
 
     /**
+     * 提交图生视频任务（按《聚融中转站接口手册 v2.1》§7）
+     * 用 image_urls 数组引用 asset_url（推荐，绕过 ORB/CORS + 支持 asset:// 引用）。
+     *
+     * @param userId     当前用户 ID
+     * @param imageUrl   http(s):// 或 asset://aic_xxx
+     * @param prompt     用户提示词
+     * @param duration   时长（秒）
+     * @param resolution 分辨率，如 480p / 720p
+     */
+    GenerateResponse submitImageToVideoByUrl(Long userId,
+                                             String imageUrl,
+                                             String prompt, int duration, String resolution);
+
+    /**
      * 提交文生视频任务（NewAPI 直调，绕过 ComfyUI）。
      *
      * @param userId  当前用户 ID

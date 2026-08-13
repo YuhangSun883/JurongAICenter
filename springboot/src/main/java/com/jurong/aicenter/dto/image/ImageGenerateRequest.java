@@ -31,4 +31,11 @@ public class ImageGenerateRequest {
      * 为空时调用纯文本生成接口，非空时调用图片编辑接口
      */
     private List<String> referenceImages;
+
+    /**
+     * 引用图片 URL 列表（按聚融中转 API 文档 §2 图生图规定）
+     * 每个元素是 http(s):// 或 asset:// 形式的 URL，对应 NewAPI 的 image 字段。
+     * 与 referenceImages 二选一：如果两个都给了，优先用 imageUrls（更符合文档）。
+     */
+    private List<String> imageUrls;
 }

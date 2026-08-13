@@ -32,6 +32,7 @@ import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { cn } from '@/lib/utils';
+import { ApiError } from '@/lib/http';
 import { imageApi, mediaApi, promptApi } from '@/api';
 import type { UserPromptResult } from '@/api/prompt';
 
@@ -341,12 +342,15 @@ export function ImageWorkbench() {
   }, [activeGeneration]);
   // 历史生成图片记录（侧栏状态栏下方缩略图卡片使用）
   // 用 sessionStorage 缓存：组件卸载/页面刷新/切换功能后回来都能立即恢复，不需等待接口
-  const HISTORY_CACHE_KEY = 'image-workbench:generation-history:v2';
-  const HISTORY_CACHE_KEY_LEGACY = 'image-workbench:generation-history'; // 旧版（脏数据），启动时清理
+  // v3 升级：本地新增条目补全 objectKey，去重逻辑更稳；旧的 v2 缓存里有重复数据，主动失效
+  const HISTORY_CACHE_KEY = 'image-workbench:generation-history:v3';
+  const HISTORY_CACHE_KEY_LEGACY_V2 = 'image-workbench:generation-history:v2'; // 旧版（脏数据）
+  const HISTORY_CACHE_KEY_LEGACY_V1 = 'image-workbench:generation-history'; // 旧版（脏数据）
   // 清理旧版本缓存（key 升级时一次性迁移）
   if (typeof window !== 'undefined') {
     try {
-      window.sessionStorage.removeItem(HISTORY_CACHE_KEY_LEGACY);
+      window.sessionStorage.removeItem(HISTORY_CACHE_KEY_LEGACY_V2);
+      window.sessionStorage.removeItem(HISTORY_CACHE_KEY_LEGACY_V1);
     } catch {
       // 静默忽略
     }
@@ -1067,10 +1071,19 @@ export function ImageWorkbench() {
     //   - 有技能选中：使用槽位图片（references），AI 根据技能/提示词/槽位图生成
     //   - 无技能选中：使用 @ 引用图片（referencedImages），仅根据提示词+引用图生成
     const sourceImages = selectedSkill ? references : referencedImages;
+
+    // 按文档 §2：优先用 imageUrls（直接传图片 URL 给 NewAPI 的 image 字段），
+    // 避免 base64 转换造成的 ORB/CORS 问题 + 请求体膨胀。
+    // 只有当图片 URL 不可被 NewAPI 直接访问时（极少见），才退化为 base64 上传。
+    const imageUrls: string[] = sourceImages
+      .map((ref) => ref.url)
+      .filter((url) => url && (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('asset://')));
+
+    // 兜底：只有当 URL 不是 http(s)/asset 形式（比如 blob: URL）才转 base64
     let referenceImagesBase64: string[] = [];
-    if (sourceImages.length > 0) {
+    if (sourceImages.length > 0 && imageUrls.length === 0) {
       try {
-        console.log('[ImageWorkbench] converting source images to base64...');
+        console.log('[ImageWorkbench] no usable URL for ref images, converting to base64...');
         referenceImagesBase64 = await Promise.all(
           sourceImages.map((ref) => urlToBase64(ref.url))
         );
@@ -1084,6 +1097,7 @@ export function ImageWorkbench() {
 
     console.log('[ImageWorkbench] submit start:', {
       promptLen: trimmedPrompt.length,
+      imageUrlsCount: imageUrls.length,
       refImageCount: referenceImagesBase64.length,
     });
 
@@ -1115,14 +1129,17 @@ export function ImageWorkbench() {
     try {
       console.log('[ImageWorkbench] calling imageApi.generateImage...');
       // 调用图片生成 API
-      // - 有引用图片时，后端调用 /v1/images/edits 接口
-      // - 无引用图片时，后端调用 /v1/images/generations 接口
+      // 路径选择（按文档 §1/§2）：
+      //   - 有 imageUrls（http/https/asset URL）→ 后端走 /v1/images/generations (JSON, image=URL)
+      //   - 有 referenceImages (base64)        → 后端走 /v1/images/edits (multipart)
+      //   - 都没有                              → 后端走 /v1/images/generations (纯文生图)
       const result = await imageApi.generateImage(
         {
           prompt: trimmedPrompt,
           size: '1024x1024',
           quality: 'standard',
           style: 'vivid',
+          imageUrls: imageUrls.length > 0 ? imageUrls : undefined,
           referenceImages: referenceImagesBase64.length > 0 ? referenceImagesBase64 : undefined,
         },
         controller.signal
@@ -1135,11 +1152,18 @@ export function ImageWorkbench() {
         setGeneratedUrl(result.imageUrl);
         setGeneratedAt(Date.now());
         // 追加到历史缩略图列表（侧栏状态栏下方展示，按 url + objectKey 双键去重）
+        // 关键修复：必须把后端返回的 objectKey/assetUrl 也存进去，
+        // 否则本地条目只含 base64 data URI（无 objectKey），与远端 listAssets
+        // 返回的 MinIO URL + objectKey 条目双键都判不到重复，导致每张图重复 2 次。
         setGenerationHistory((prev) => {
           return dedupeHistory([
             {
               id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               url: result.imageUrl,
+              // 优先用后端入库后的 MinIO URL（与远端 listAssets 返回的 url 一致 → 可去重）
+              // 兜底用 base64 data URI
+              objectKey: result.objectKey,
+              // 提示字段：保留真正的 MinIO URL，方便未来切到 MinIO 直连预览
               prompt: trimmedPrompt,
               createdAt: Date.now(),
             },
@@ -1149,8 +1173,13 @@ export function ImageWorkbench() {
         setActiveTab('preview');
         console.log('[ImageWorkbench] image URL set:', result.imageUrl);
       } else {
+        // 后端可能返回了 {code, message, data: null} 业务错误，且 data 恰好没解包成 imageUrl
+        // 把 result 里所有字段拼出来，方便排查
         console.warn('[ImageWorkbench] result missing imageUrl:', result);
-        setGenerateError('图片生成失败：未获取到图片地址');
+        const extra = result && typeof result === 'object'
+          ? `（后端返回：${JSON.stringify(result).slice(0, 200)}）`
+          : '';
+        setGenerateError(`图片生成失败：未获取到图片地址${extra}`);
       }
     } catch (err: unknown) {
       console.error('[ImageWorkbench] generateImage error:', err);
@@ -1161,7 +1190,15 @@ export function ImageWorkbench() {
           setGenerateError('图片生成已取消');
         }
       } else if (err instanceof Error) {
-        setGenerateError(`生成失败：${err.message}`);
+        // ApiError 自带 payload（后端 {code, message, data}），把 message 透出
+        const payload = (err as ApiError).payload as { message?: string; code?: number } | undefined;
+        const backendMsg = payload?.message;
+        const backendCode = payload?.code;
+        if (backendMsg) {
+          setGenerateError(`生成失败：${backendMsg}${backendCode ? `（code=${backendCode}）` : ''}`);
+        } else {
+          setGenerateError(`生成失败：${err.message}`);
+        }
       } else {
         setGenerateError('图片生成失败，请稍后重试');
       }

@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import { nanoid } from 'nanoid';
 import { useWorkbenchStore } from '@/store/workbench';
-import { useTaskPolling } from '@/hooks/useTaskPolling';
+import { useTaskPolling, isInAutoRetryWindow } from '@/hooks/useTaskPolling';
 import { videoApi } from '@/api/video';
 import { mediaApi } from '@/api/media';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
@@ -147,6 +147,12 @@ export function Workbench() {
   const [previewTab, setPreviewTab] = useState<'preview' | 'favorites'>('preview');
   const [favorites, setFavorites] = useState<FavoriteVideo[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // 自动补刀倒计时（每秒刷新，让 UI 展示"等待 X 秒"）
+  const [retryTick, setRetryTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setRetryTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
   const savePopoverRef = useRef<HTMLDivElement>(null);
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const {
@@ -248,6 +254,36 @@ export function Workbench() {
   }, [addMaterials]);
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
+
+  // 视频生成等待卡片：每秒刷新一次"已用时 / 上限"（与图片页一致）
+  const [videoElapsedSec, setVideoElapsedSec] = useState(0);
+  const VIDEO_WAIT_TIMEOUT_SEC = 5 * 60;  // 5 分钟上限
+  useEffect(() => {
+    if (!selectedTask) {
+      setVideoElapsedSec(0);
+      return;
+    }
+    // 已完成 / 失败超时 / 有具体错误信息 → 不再计时
+    const isWaiting =
+      selectedTask.status === 'queued' ||
+      selectedTask.status === 'running' ||
+      (selectedTask.status === 'failed' &&
+        isInAutoRetryWindow(selectedTask) &&
+        !selectedTask.error);
+    if (!isWaiting) {
+      setVideoElapsedSec(0);
+      return;
+    }
+    // 用任务 createdAt 计算"已用秒数"，避免每次重渲染被清零
+    const createdMs = selectedTask.createdAt || Date.now();
+    const tick = () => {
+      setVideoElapsedSec(Math.floor((Date.now() - createdMs) / 1000));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [selectedTask?.id, selectedTask?.status, selectedTask?.createdAt, selectedTask?.error]);
+
   const queued = tasks.filter((task) => task.status === 'queued').length;
   const running = tasks.filter((task) => task.status === 'running').length;
   const estimatedCredits = useMemo(() => {
@@ -724,30 +760,53 @@ export function Workbench() {
                     className="max-h-full max-w-full rounded-xl bg-black shadow-sm"
                   />
                 ) : selectedTask ? (
-                  <div className="w-full max-w-[520px] text-center">
-                    <div className="mx-auto mb-5 grid h-16 w-16 place-items-center rounded-full bg-white shadow-sm">
-                      <Video className="h-8 w-8 text-[#757b86]" />
-                    </div>
-                    <div className="text-sm font-medium text-[#303642]">
-                      {selectedTask.status === 'failed' ? '生成失败' : selectedTask.status === 'queued' ? '排队中' : '生成中'}
-                      <span className="ml-2 text-[#6f7682]">{Math.round(selectedTask.progress)}%</span>
-                    </div>
-                    <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-[#ebeef3]">
-                      <div className="h-full rounded-full bg-[#4f7cff]" style={{ width: `${Math.min(100, selectedTask.progress)}%` }} />
-                    </div>
-                    {/* FAILED 时显示"补刀"按钮：检查 NewAPI 是否其实已完成 */}
-                    {selectedTask.status === 'failed' && (
+                  // 等待条件：
+                  //   - queued / running：始终等待
+                  //   - failed 但 5 分钟内 且 task.error 为空：自动补刀中（继续等待）
+                  //   - failed 但 task.error 有具体内容（NewAPI 主动失败）：直接展示错误，不再等待
+                  (selectedTask.status === 'queued' ||
+                    selectedTask.status === 'running' ||
+                    (selectedTask.status === 'failed' &&
+                      isInAutoRetryWindow(selectedTask) &&
+                      !selectedTask.error)) ? (
+                    <VideoGeneratingHint
+                      elapsedSec={videoElapsedSec}
+                      timeoutSec={VIDEO_WAIT_TIMEOUT_SEC}
+                      onCancel={async () => {
+                        try {
+                          await videoApi.cancel(selectedTask.id);
+                        } catch {
+                          // 即便接口失败，前端也已经不再轮询（store 没动），用户至少不会继续看到等待卡片
+                        }
+                        useWorkbenchStore.getState().upsertTask({
+                          ...selectedTask,
+                          status: 'failed',
+                          error: '已取消',
+                          updatedAt: Date.now(),
+                        });
+                      }}
+                    />
+                  ) : (
+                    // 失败展示：
+                    //   - 5 分钟自动补刀窗口外
+                    //   - 或 任务有具体错误信息（NewAPI 主动失败、上游报错码等）
+                    <div className="w-full max-w-[520px] text-center">
+                      <div className="mx-auto mb-5 grid h-16 w-16 place-items-center rounded-full bg-white shadow-sm">
+                        <XCircle className="h-8 w-8 text-[#e5484d]" />
+                      </div>
+                      <div className="text-sm font-medium text-[#e5484d]">
+                        生成失败
+                        {selectedTask.error ? `：${selectedTask.error}` : ''}
+                      </div>
                       <button
                         onClick={async () => {
                           try {
                             const r: any = await videoApi.retry(selectedTask.id);
                             if (r?.recovered) {
-                              // 补刀成功 → 重新加载任务状态
                               const fresh = await videoApi.getTask(selectedTask.id);
                               useWorkbenchStore.getState().upsertTask(fresh);
                             } else {
                               alert(`NewAPI 上任务尚未完成：${r?.reason ?? ''}`);
-                              // 仍然刷新一下，可能状态变了
                               const fresh = await videoApi.getTask(selectedTask.id);
                               useWorkbenchStore.getState().upsertTask(fresh);
                             }
@@ -759,8 +818,8 @@ export function Workbench() {
                       >
                         <RefreshCw className="h-3.5 w-3.5" /> 检查并补刀
                       </button>
-                    )}
-                  </div>
+                    </div>
+                  )
                 ) : (
                   <div className="text-center text-[#747b86]">
                     <Video className="mx-auto mb-7 h-10 w-10 stroke-[1.7]" />
@@ -992,6 +1051,62 @@ export function Workbench() {
         </div>
       )}
     </main>
+  );
+}
+
+/**
+ * 自动补刀等待进度条（已废弃 —— 现在视频等待统一显示"AI 正在生成视频..."卡片）
+ * 保留只是为了让旧引用不报错，新 UI 由 VideoGeneratingHint 替代。
+ */
+function RetryWaitingHint({ task, retryTick }: { task: VideoTask; retryTick: number }) {
+  void retryTick;
+  const AUTO_RETRY_WINDOW_MS = 5 * 60 * 1000;
+  const elapsedMs = Date.now() - task.createdAt;
+  const pct = Math.min(100, (elapsedMs / AUTO_RETRY_WINDOW_MS) * 100);
+  return (
+    <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-[#ebeef3]">
+      <div
+        className="h-full rounded-full bg-[#4f7cff] transition-all duration-1000 ease-linear"
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+/** 视频生成等待卡片：与图片页一致，只显示"AI 正在生成视频..." + 计时 + 取消按钮 */
+function VideoGeneratingHint({
+  elapsedSec,
+  timeoutSec,
+  onCancel,
+}: {
+  elapsedSec: number;
+  timeoutSec: number;
+  onCancel: () => void;
+}) {
+  const m = Math.floor(elapsedSec / 60);
+  const s = elapsedSec % 60;
+  const tm = Math.floor(timeoutSec / 60);
+  const ts = timeoutSec % 60;
+  const fmt = (mm: number, ss: number) =>
+    `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+  return (
+    <div className="w-full max-w-[520px] text-center">
+      <div className="mx-auto mb-5 grid h-20 w-20 place-items-center rounded-full bg-white shadow-sm">
+        <Loader2 className="h-10 w-10 animate-spin text-[#4f7cff]" />
+      </div>
+      <div className="text-sm font-medium text-[#303642]">AI 正在生成视频...</div>
+      <div className="mt-2 text-xs text-[#6f7682]">
+        已用时 {fmt(m, s)} / {fmt(tm, ts)}
+      </div>
+      <button
+        type="button"
+        onClick={onCancel}
+        className="mt-4 inline-flex items-center gap-1 rounded-md border border-[#e4e5e9] bg-white px-3 py-1.5 text-xs text-[#68707c] hover:bg-[#f3f4f6]"
+      >
+        <X className="h-3.5 w-3.5" />
+        取消生成
+      </button>
+    </div>
   );
 }
 
