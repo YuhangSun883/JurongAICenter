@@ -9,14 +9,21 @@ import com.jurong.aicenter.dto.media.MediaListQuery;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
 import com.jurong.aicenter.dto.media.MediaUploadResponse;
 import com.jurong.aicenter.dto.media.PatchAssetRequest;
+import com.jurong.aicenter.entity.MediaAsset;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.MediaAssetRepository;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.MediaLibraryService;
 import com.jurong.aicenter.service.MediaService;
+import com.jurong.aicenter.service.StorageService;
+import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.InputStreamResource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,11 +32,15 @@ import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.InputStream;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -65,6 +76,8 @@ public class MediaController {
 
     private final MediaService mediaService;
     private final MediaLibraryService mediaLibraryService;
+    private final StorageService storageService;
+    private final MediaAssetRepository assetRepository;
 
     // ==================== 资产库（资产库列表） ====================
 
@@ -88,6 +101,65 @@ public class MediaController {
             @PathVariable Long id) {
         requireUser(user);
         return mediaService.getAsset(user.id(), id);
+    }
+
+    @GetMapping("/assets/{id}/stream")
+    public ResponseEntity<InputStreamResource> stream(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id,
+            @RequestHeader(value = "Range", required = false) String rangeHeader) {
+        requireUser(user);
+        MediaAsset asset = assetRepository.selectById(id);
+        if (asset == null || !asset.getUserId().equals(user.id())) {
+            throw new BusinessException(ErrorCode.MEDIA_ASSET_NOT_FOUND);
+        }
+        String objectKey = asset.getObjectKey();
+        if (objectKey == null || objectKey.isBlank()) {
+            throw new BusinessException(ErrorCode.MEDIA_ASSET_NOT_FOUND);
+        }
+        try {
+            long contentLength = asset.getSizeBytes() != null ? asset.getSizeBytes() : -1;
+            InputStream is = storageService.getFileStream(objectKey);
+
+            if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                String[] ranges = rangeHeader.substring(6).split("-");
+                long start = Long.parseLong(ranges[0]);
+                long end = (ranges.length > 1 && !ranges[1].isBlank())
+                        ? Long.parseLong(ranges[1]) : contentLength - 1;
+                if (contentLength > 0 && end >= contentLength) {
+                    end = contentLength - 1;
+                }
+                long len = end - start + 1;
+
+                is.skip(start);
+
+                String filename = asset.getName() != null ? asset.getName() : "media";
+                String encodedName = URLEncoder.encode(filename, StandardCharsets.UTF_8).replace("+", "%20");
+                return ResponseEntity.status(206)
+                        .header(HttpHeaders.CONTENT_DISPOSITION,
+                                "inline; filename=\"" + encodedName + "\"; filename*=UTF-8''" + encodedName)
+                        .header("Accept-Ranges", "bytes")
+                        .header("Content-Range", "bytes " + start + "-" + end + "/" + contentLength)
+                        .contentLength(len)
+                        .contentType(MediaType.parseMediaType(asset.getMimeType() != null
+                                ? asset.getMimeType() : "application/octet-stream"))
+                        .body(new InputStreamResource(is));
+            }
+
+            String filename = asset.getName() != null ? asset.getName() : "media";
+            String encodedName = URLEncoder.encode(filename, StandardCharsets.UTF_8).replace("+", "%20");
+            return ResponseEntity.ok()
+                    .header(HttpHeaders.CONTENT_DISPOSITION,
+                            "inline; filename=\"" + encodedName + "\"; filename*=UTF-8''" + encodedName)
+                    .header("Accept-Ranges", "bytes")
+                    .contentType(MediaType.parseMediaType(asset.getMimeType() != null
+                            ? asset.getMimeType() : "application/octet-stream"))
+                    .contentLength(contentLength)
+                    .body(new InputStreamResource(is));
+        } catch (Exception e) {
+            log.error("Stream asset failed: id={}, objectKey={}", id, objectKey, e);
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Failed to stream media: " + e.getMessage());
+        }
     }
 
     @PostMapping("/assets")

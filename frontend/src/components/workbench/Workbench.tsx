@@ -12,24 +12,33 @@ import {
   Loader2,
   Maximize2,
   Mic2,
+  Minimize2,
   Package,
   PanelRightClose,
   Play,
   Plus,
+  RefreshCw,
+  Search,
   Sparkles,
+  Star,
+  Trash2,
   UserRound,
   Video,
+  X,
   XCircle,
 } from 'lucide-react';
 import { nanoid } from 'nanoid';
 import { useWorkbenchStore } from '@/store/workbench';
 import { useTaskPolling } from '@/hooks/useTaskPolling';
 import { videoApi } from '@/api/video';
+import { mediaApi } from '@/api/media';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { cn } from '@/lib/utils';
-import type { AspectRatio, AudioMode, Duration, ReferenceMedia, Resolution, VideoModel } from '@/types/video';
+import { promptApi, type UserPromptResult } from '@/api/prompt';
+import { listFavorites, addFavorite, removeFavorite, isFavorited, type FavoriteVideo } from '@/lib/favorites-storage';
+import type { AspectRatio, AudioMode, Duration, ReferenceMedia, Resolution, VideoModel, VideoTask } from '@/types/video';
 
 const MODELS: VideoModel[] = [
   'Seedance-2.0-VIP',
@@ -127,6 +136,18 @@ export function Workbench() {
   const [isWriting, setIsWriting] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [selectedReferences, setSelectedReferences] = useState<ReferenceMedia[]>([]);
+  // 三个图标按钮状态
+  const [showSavePopover, setShowSavePopover] = useState(false);
+  const [savePromptName, setSavePromptName] = useState('');
+  const [showPromptsDialog, setShowPromptsDialog] = useState(false);
+  const [savedPrompts, setSavedPrompts] = useState<UserPromptResult[]>([]);
+  const [promptSearch, setPromptSearch] = useState('');
+  const [isExpanded, setIsExpanded] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [previewTab, setPreviewTab] = useState<'preview' | 'favorites'>('preview');
+  const [favorites, setFavorites] = useState<FavoriteVideo[]>([]);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const savePopoverRef = useRef<HTMLDivElement>(null);
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const {
     script,
@@ -155,6 +176,77 @@ export function Workbench() {
       .catch(() => undefined);
   }, []);
 
+  /**
+   * Agent 模块跳转过来的预填：
+   *   URL 参数：
+   *     prefill=true
+   *     prompt=xxx
+   *     attachmentIds=assetId1,assetId2
+   *
+   * 行为：
+   *   1. 自动填入 prompt（即 script）
+   *   2. 自动把 attachmentIds 加到 selectedReferences
+   */
+  const prefillAppliedRef = useRef(false);
+  useEffect(() => {
+    if (prefillAppliedRef.current) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('prefill') !== 'true') {
+      prefillAppliedRef.current = true;
+      return;
+    }
+    // 1) 填 prompt
+    const p = params.get('prompt');
+    if (p) {
+      useWorkbenchStore.getState().setScript(p);
+    }
+    // 2) 加素材到 references
+    const idsStr = params.get('attachmentIds');
+    if (idsStr) {
+      const ids = idsStr.split(',').filter(Boolean);
+      if (ids.length > 0) {
+        (async () => {
+          const picked: ReferenceMedia[] = [];
+          for (const id of ids) {
+            try {
+              // getAsset 期望 number，但 URL 里来的是 string
+              const numericId = Number(id);
+              if (!Number.isFinite(numericId)) continue;
+              const asset = await mediaApi.getAsset(numericId);
+              if (asset) {
+                picked.push({
+                  id: String(asset.id),
+                  url: asset.url,
+                  type: (asset.type as 'image' | 'video' | 'audio') || 'image',
+                  name: asset.name,
+                  // ReferenceMedia 需要 token 字段，placeholder
+                  token: '',
+                });
+              }
+            } catch (e) {
+              console.warn('[Workbench] failed to load prefill asset', id, e);
+            }
+          }
+          if (picked.length > 0) {
+            setSelectedReferences((prev) => [...prev, ...picked]);
+            addMaterials(picked.map((p) => ({
+              id: p.id,
+              url: p.url,
+              type: p.type,
+              name: p.name,
+            })));
+          }
+        })();
+      }
+    }
+    // 清掉 URL 参数
+    if (typeof window.history?.replaceState === 'function') {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+    prefillAppliedRef.current = true;
+  }, [addMaterials]);
+
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
   const queued = tasks.filter((task) => task.status === 'queued').length;
   const running = tasks.filter((task) => task.status === 'running').length;
@@ -166,22 +258,127 @@ export function Workbench() {
   const canSubmit = script.trim().length > 0 && !isSubmitting;
   const remainingReferenceSlots = Math.max(0, AI_VIDEO_MAX_REFS - selectedReferences.length);
 
+  // ── 三个图标按钮的功能 ──
+
+  /** 保存当前提示词 */
+  function handleOpenSavePopover() {
+    if (!script.trim()) return;
+    setSavePromptName(script.trim().slice(0, 20));
+    setShowSavePopover(true);
+  }
+
+  async function handleConfirmSave() {
+    const name = savePromptName.trim();
+    if (!name || !script.trim()) return;
+    try {
+      await promptApi.savePrompt({ title: name, prompt: script });
+    } catch { /* 接口异常不阻塞UI */ }
+    setShowSavePopover(false);
+    setSavePromptName('');
+  }
+
+  /** 打开「我的提示词」 */
+  async function handleOpenPromptsDialog() {
+    setPromptSearch('');
+    setShowPromptsDialog(true);
+    try {
+      setSavedPrompts(await promptApi.listPrompts());
+    } catch {
+      setSavedPrompts([]);
+    }
+  }
+
+  function handleLoadPrompt(p: UserPromptResult) {
+    setScript(p.prompt);
+    promptApi.usePrompt(p.id).catch(() => {});
+    setShowPromptsDialog(false);
+  }
+
+  async function handleDeletePrompt(id: number) {
+    try {
+      await promptApi.deletePrompt(id);
+      setSavedPrompts((prev) => prev.filter((p) => p.id !== id));
+    } catch { /* ignore */ }
+  }
+
+  /** 展开编辑器：Escape 键关闭 */
+  useEffect(() => {
+    if (!isExpanded) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setIsExpanded(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [isExpanded]);
+
+  // 点击外部关闭保存 popover
+  useEffect(() => {
+    if (!showSavePopover) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.target instanceof Node && !savePopoverRef.current?.contains(e.target)) {
+        setShowSavePopover(false);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [showSavePopover]);
+
   async function submit() {
     if (!canSubmit) return;
     setSubmitting(true);
     try {
-      const { taskId } = await videoApi.create({
-        script,
-        model,
-        aspectRatio,
-        resolution,
-        duration,
-        audioMode,
-        referenceIds: selectedReferences.map((reference) => reference.id),
-      });
+      // 有图片素材时走图生视频接口（POST /api/video/image-to-video）
+      const imageRef = selectedReferences.find((r) => r.type === 'image');
+      let taskId: string;
+
+      if (imageRef) {
+        const result = await videoApi.createImageToVideo(
+          imageRef.url,
+          script,
+          duration,
+          resolution
+        );
+        taskId = result.taskId;
+      } else {
+        const result = await videoApi.create({
+          script,
+          model,
+          aspectRatio,
+          resolution,
+          duration,
+          audioMode,
+          referenceIds: selectedReferences.map((reference) => reference.id),
+        });
+        taskId = result.taskId;
+      }
+
+      // 立即添加一个占位任务（PENDING 状态，初始进度 5%），让用户看到反馈
+      const placeholderTask: VideoTask = {
+        id: taskId,
+        status: 'queued',
+        progress: 5,
+        request: {
+          script,
+          model,
+          aspectRatio,
+          resolution,
+          duration,
+          audioMode,
+          referenceIds: selectedReferences.map((reference) => reference.id),
+        },
+        estimatedCredits,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      useWorkbenchStore.getState().upsertTask(placeholderTask);
+      selectTask(taskId);
+
+      // 立即获取真实数据（可能仍是 PENDING，但会带 createdAt 用于进度模拟）
       const fresh = await videoApi.getTask(taskId);
       useWorkbenchStore.getState().upsertTask(fresh);
-      selectTask(fresh.id);
+      setSubmitError(null);
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : '提交失败，请稍后重试');
     } finally {
       setSubmitting(false);
     }
@@ -267,7 +464,7 @@ export function Workbench() {
 
   return (
     <main className="h-screen overflow-hidden bg-[#f7f7f8] px-4 py-5 text-[#16181d] sm:px-6">
-      <div className="grid h-full min-h-0 grid-cols-[minmax(420px,610px)_minmax(0,1fr)_76px] gap-3">
+      <div className={cn('grid h-full min-h-0 gap-3', sidebarCollapsed ? 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_52px]' : 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_100px]')}>
         <section className="flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-white">
           <div className="flex h-14 items-center justify-between px-4">
             <h1 className="text-sm font-semibold">AI 视频</h1>
@@ -288,10 +485,60 @@ export function Workbench() {
           <div className="mx-3 flex flex-1 min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc]">
             <div className="flex items-center justify-between px-4 pt-4 text-xs text-[#737985]">
               <span>{selectedReferences.length} / {AI_VIDEO_MAX_REFS}</span>
-              <div className="flex items-center gap-3 text-[#a4aab5]">
-                <Package className="h-4 w-4" />
-                <List className="h-4 w-4" />
-                <Maximize2 className="h-4 w-4" />
+              <div className="relative flex items-center gap-3 text-[#a4aab5]" ref={savePopoverRef}>
+                <span title="保存当前提示词" className="contents"><Package className="h-4 w-4 cursor-pointer hover:text-[#4d73ff]" onClick={handleOpenSavePopover} /></span>
+                {showSavePopover && (
+                  <div className="absolute right-0 top-6 z-50 w-[600px] rounded-xl border border-[#dfe2e8] bg-white p-4 shadow-[0_12px_28px_rgba(29,35,48,0.14)]">
+                    <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium text-[#707784]">
+                      <span>设置标题</span>
+                      <span className="font-normal text-[#a4aab5]">{savePromptName.length}/50</span>
+                    </div>
+                    <input
+                      autoFocus
+                      value={savePromptName}
+                      onChange={(e) => setSavePromptName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Escape') setShowSavePopover(false); }}
+                      maxLength={50}
+                      placeholder="输入提示词名称"
+                      className="w-full rounded-lg border border-[#e4e5e9] bg-[#f9fafb] px-2.5 py-1.5 text-xs text-[#242832] outline-none focus:border-[#4d73ff] placeholder:text-[#b8bdc7]"
+                    />
+                    <div className="mb-1.5 mt-3 flex items-center justify-between text-[11px] font-medium text-[#707784]">
+                      <span>提示词内容</span>
+                      <span className="font-normal text-[#a4aab5]">{script.length}/10000</span>
+                    </div>
+                    <textarea
+                      value={script}
+                      readOnly
+                      rows={12}
+                      className="w-full resize-none rounded-lg border border-[#e4e5e9] bg-[#f9fafb] px-2.5 py-1.5 text-xs leading-relaxed text-[#737985] outline-none"
+                    />
+                    <div className="mt-3 flex items-center justify-end">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowSavePopover(false)}
+                          className="rounded-md px-2.5 py-1 text-[11px] text-[#707784] hover:bg-[#f3f4f6]"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleConfirmSave}
+                          disabled={!savePromptName.trim()}
+                          className="rounded-md bg-[#1f232b] px-3 py-1 text-[11px] font-medium text-white hover:bg-[#111318] disabled:opacity-40"
+                        >
+                          保存
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <span title="我的提示词" className="contents"><List className="h-4 w-4 cursor-pointer hover:text-[#4d73ff]" onClick={handleOpenPromptsDialog} /></span>
+                {isExpanded ? (
+                  <span title="收起" className="contents"><Minimize2 className="h-4 w-4 cursor-pointer hover:text-[#4d73ff]" onClick={() => setIsExpanded(false)} /></span>
+                ) : (
+                  <span title="展开编辑" className="contents"><Maximize2 className="h-4 w-4 cursor-pointer hover:text-[#4d73ff]" onClick={() => setIsExpanded(true)} /></span>
+                )}
               </div>
             </div>
 
@@ -420,6 +667,12 @@ export function Workbench() {
           </div>
 
           <div className="m-3 mt-2">
+            {submitError && (
+              <div className="mb-2 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+                <XCircle className="mt-0.5 h-3.5 w-3.5 flex-none" />
+                <span>{submitError}</span>
+              </div>
+            )}
             <button
               type="button"
               disabled={!canSubmit}
@@ -428,61 +681,247 @@ export function Workbench() {
             >
               {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
               立即生成视频
-              <span className="text-xs font-medium opacity-90">预计 {estimatedCredits.toFixed(2)} 积分</span>
+              <span className="text-xs font-medium opacity-90">预计 {estimatedCredits} 积分</span>
             </button>
           </div>
         </section>
 
         <section className="flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc]">
           <div className="flex h-12 items-center gap-7 px-5 text-xs font-semibold">
-            <button className="relative h-12 text-[#1d222b] after:absolute after:bottom-0 after:left-1/2 after:h-0.5 after:w-4 after:-translate-x-1/2 after:rounded-full after:bg-[#1d222b]">
+            <button
+              onClick={() => setPreviewTab('preview')}
+              className={cn(
+                'relative h-12',
+                previewTab === 'preview'
+                  ? 'text-[#1d222b] after:absolute after:bottom-0 after:left-1/2 after:h-0.5 after:w-4 after:-translate-x-1/2 after:rounded-full after:bg-[#1d222b]'
+                  : 'text-[#575e69]'
+              )}
+            >
               预览
             </button>
-            <button className="h-12 text-[#575e69]">收藏</button>
+            <button
+              onClick={() => { setFavorites(listFavorites()); setPreviewTab('favorites'); }}
+              className={cn(
+                'relative h-12',
+                previewTab === 'favorites'
+                  ? 'text-[#1d222b] after:absolute after:bottom-0 after:left-1/2 after:h-0.5 after:w-4 after:-translate-x-1/2 after:rounded-full after:bg-[#1d222b]'
+                  : 'text-[#575e69]'
+              )}
+            >
+              收藏
+            </button>
           </div>
 
-          <div className="grid flex-1 place-items-center px-8 pb-8">
-            {selectedTask?.status === 'succeeded' && selectedTask.resultUrl ? (
-              <video
-                key={selectedTask.id}
-                src={selectedTask.resultUrl}
-                poster={selectedTask.thumbnailUrl}
-                controls
-                className="max-h-full max-w-full rounded-xl bg-black shadow-sm"
-              />
-            ) : selectedTask ? (
-              <div className="w-full max-w-[520px] text-center">
-                <div className="mx-auto mb-5 grid h-16 w-16 place-items-center rounded-full bg-white shadow-sm">
-                  <Video className="h-8 w-8 text-[#757b86]" />
-                </div>
-                <div className="text-sm font-medium text-[#303642]">
-                  {selectedTask.status === 'failed' ? '生成失败' : selectedTask.status === 'queued' ? '排队中' : '生成中'}
-                  <span className="ml-2 text-[#6f7682]">{Math.round(selectedTask.progress)}%</span>
-                </div>
-                <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-[#ebeef3]">
-                  <div className="h-full rounded-full bg-[#4f7cff]" style={{ width: `${Math.min(100, selectedTask.progress)}%` }} />
-                </div>
+          {previewTab === 'preview' ? (
+            <div className="flex min-h-0 flex-1 flex-col px-8 pb-8">
+              <div className="grid flex-1 place-items-center">
+                {selectedTask?.status === 'succeeded' && selectedTask.resultUrl ? (
+                  <video
+                    key={selectedTask.id}
+                    src={selectedTask.resultUrl}
+                    poster={selectedTask.thumbnailUrl}
+                    controls
+                    className="max-h-full max-w-full rounded-xl bg-black shadow-sm"
+                  />
+                ) : selectedTask ? (
+                  <div className="w-full max-w-[520px] text-center">
+                    <div className="mx-auto mb-5 grid h-16 w-16 place-items-center rounded-full bg-white shadow-sm">
+                      <Video className="h-8 w-8 text-[#757b86]" />
+                    </div>
+                    <div className="text-sm font-medium text-[#303642]">
+                      {selectedTask.status === 'failed' ? '生成失败' : selectedTask.status === 'queued' ? '排队中' : '生成中'}
+                      <span className="ml-2 text-[#6f7682]">{Math.round(selectedTask.progress)}%</span>
+                    </div>
+                    <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-[#ebeef3]">
+                      <div className="h-full rounded-full bg-[#4f7cff]" style={{ width: `${Math.min(100, selectedTask.progress)}%` }} />
+                    </div>
+                    {/* FAILED 时显示"补刀"按钮：检查 NewAPI 是否其实已完成 */}
+                    {selectedTask.status === 'failed' && (
+                      <button
+                        onClick={async () => {
+                          try {
+                            const r: any = await videoApi.retry(selectedTask.id);
+                            if (r?.recovered) {
+                              // 补刀成功 → 重新加载任务状态
+                              const fresh = await videoApi.getTask(selectedTask.id);
+                              useWorkbenchStore.getState().upsertTask(fresh);
+                            } else {
+                              alert(`NewAPI 上任务尚未完成：${r?.reason ?? ''}`);
+                              // 仍然刷新一下，可能状态变了
+                              const fresh = await videoApi.getTask(selectedTask.id);
+                              useWorkbenchStore.getState().upsertTask(fresh);
+                            }
+                          } catch (e) {
+                            alert('补刀失败：' + (e instanceof Error ? e.message : String(e)));
+                          }
+                        }}
+                        className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-[#4f7cff] px-4 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ce5]"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" /> 检查并补刀
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-center text-[#747b86]">
+                    <Video className="mx-auto mb-7 h-10 w-10 stroke-[1.7]" />
+                    <p className="text-sm">点击右侧队列中带成片的任务即可预览。</p>
+                  </div>
+                )}
               </div>
-            ) : (
-              <div className="text-center text-[#747b86]">
-                <Video className="mx-auto mb-7 h-10 w-10 stroke-[1.7]" />
-                <p className="text-sm">点击右侧队列中带成片的任务即可预览。</p>
-              </div>
-            )}
-          </div>
+              {selectedTask?.status === 'succeeded' && selectedTask.resultUrl && (
+                <div className="flex justify-center pt-4">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isFavorited(selectedTask.id)) {
+                        removeFavorite(selectedTask.id);
+                      } else {
+                        addFavorite({
+                          id: `fav_${Date.now()}`,
+                          taskId: selectedTask.id,
+                          resultUrl: selectedTask.resultUrl!,
+                          thumbnailUrl: selectedTask.thumbnailUrl,
+                          script,
+                          model,
+                          duration,
+                          createdAt: Date.now(),
+                        });
+                      }
+                      setFavorites(listFavorites());
+                    }}
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition',
+                      isFavorited(selectedTask.id)
+                        ? 'border-[#ffb700] bg-[#fff9eb] text-[#b8860b]'
+                        : 'border-[#e4e5e9] bg-white text-[#707784] hover:border-[#ffb700] hover:text-[#b8860b]'
+                    )}
+                  >
+                    <Star className={cn('h-3.5 w-3.5', isFavorited(selectedTask.id) && 'fill-[#ffb700] text-[#ffb700]')} />
+                    {isFavorited(selectedTask.id) ? '已收藏' : '收藏'}
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 overflow-auto px-5 pb-4">
+              {favorites.length === 0 ? (
+                <div className="grid place-items-center py-14 text-center">
+                  <Star className="mb-3 h-8 w-8 text-[#d0d4dc]" />
+                  <p className="text-xs text-[#a4aab5]">暂无收藏的视频</p>
+                  <p className="mt-1 text-[10px] text-[#c2c6cf]">生成视频后点击下方的收藏按钮即可保存</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {favorites.map((fav) => (
+                    <div key={fav.id} className="group overflow-hidden rounded-xl border border-[#e7e9ed] bg-white shadow-sm">
+                      <div className="relative aspect-video bg-black">
+                        {fav.thumbnailUrl ? (
+                          <img src={fav.thumbnailUrl} alt="" className="h-full w-full object-cover" />
+                        ) : (
+                          <video src={fav.resultUrl} className="h-full w-full object-cover" muted playsInline preload="metadata" onLoadedMetadata={(e) => { const v = e.currentTarget; if (v.currentTime < 0.1) v.currentTime = 0.1; }} />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            removeFavorite(fav.taskId);
+                            setFavorites(listFavorites());
+                          }}
+                          className="absolute right-2 top-2 grid h-6 w-6 place-items-center rounded-full bg-black/50 text-white opacity-0 transition group-hover:opacity-100 hover:bg-red-500"
+                          title="取消收藏"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                      <div className="p-2.5">
+                        <div className="line-clamp-2 text-[11px] leading-relaxed text-[#3f4652]">{fav.script || '(空脚本)'}</div>
+                        <div className="mt-1.5 flex items-center gap-2 text-[10px] text-[#a4aab5]">
+                          <span>{fav.model}</span>
+                          <span>·</span>
+                          <span>{fav.duration}s</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </section>
 
-        <aside className="flex min-h-0 flex-col items-center rounded-xl border border-[#e4e5e9] bg-[#fbfbfc] py-5">
-          <PanelRightClose className="h-4 w-4 text-[#a6abb4]" />
-          <div className="mt-8 w-14 rounded-lg border border-[#eceef2] bg-white py-3 text-center shadow-sm">
-            <div className="text-xs text-[#9ca2ad]">排队中</div>
-            <div className="text-2xl font-semibold leading-7">{queued}</div>
-            <div className="mt-2 text-xs text-[#9ca2ad]">生成中</div>
-            <div className="text-2xl font-semibold leading-7">{running}</div>
-          </div>
-          <div className="mt-auto pb-2">
-            <ChevronRight className="h-4 w-4 text-[#a6abb4]" />
-          </div>
+        <aside className="flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-[#fbfbfc] py-4">
+          {sidebarCollapsed ? (
+            <button
+              type="button"
+              onClick={() => setSidebarCollapsed(false)}
+              className="mx-auto grid h-7 w-7 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
+              title="展开侧栏"
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          ) : (
+            <div className="flex items-center justify-between px-3">
+              <span className="text-xs font-semibold text-[#3f4652]">任务队列</span>
+              <button
+                type="button"
+                onClick={() => setSidebarCollapsed(true)}
+                className="grid h-6 w-6 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
+                title="收起侧栏"
+              >
+                <PanelRightClose className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {!sidebarCollapsed && (
+            <>
+              <div className="mt-5 flex gap-2 rounded-lg border border-[#eceef2] bg-white px-2.5 py-2.5 text-center shadow-sm">
+                <div className="flex-1">
+                  <div className="text-[10px] text-[#9ca2ad]">排队中</div>
+                  <div className="text-base font-semibold leading-5">{queued}</div>
+                </div>
+                <div className="w-px bg-[#eceef2]" />
+                <div className="flex-1">
+                  <div className="text-[10px] text-[#9ca2ad]">生成中</div>
+                  <div className="text-base font-semibold leading-5">{running}</div>
+                </div>
+              </div>
+              <div className="mt-3 flex min-h-0 flex-1 flex-col items-center gap-2 overflow-auto px-1.5">
+                {tasks.length === 0 ? (
+                  <p className="pt-8 text-[10px] text-[#c2c6cf]">暂无任务</p>
+                ) : (
+                  tasks.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => selectTask(t.id)}
+                      className={cn(
+                        'relative w-[76px] flex-none overflow-hidden rounded-lg border shadow-sm transition',
+                        selectedTaskId === t.id
+                          ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
+                          : 'border-[#e7e9ed] hover:border-[#cbd3e6]'
+                      )}
+                    >
+                      {t.status === 'succeeded' && t.thumbnailUrl ? (
+                        <img src={t.thumbnailUrl} alt="" className="aspect-video w-full object-cover" />
+                      ) : t.status === 'succeeded' && t.resultUrl ? (
+                        <video src={t.resultUrl} className="aspect-video w-full object-cover" muted playsInline preload="metadata" onLoadedMetadata={(e) => { const v = e.currentTarget; if (v.currentTime < 0.1) v.currentTime = 0.1; }} />
+                      ) : (
+                        <div className="flex aspect-video w-full flex-col items-center justify-center bg-[#f4f5f7] text-[#9ca2ad]">
+                          <Loader2 className={cn('h-4 w-4', t.status === 'running' && 'animate-spin text-[#4f7cff]')} />
+                          <span className="mt-0.5 text-[9px] text-[#a4aab5]">
+                            {t.status === 'queued' ? '排队' : t.status === 'running' ? `${Math.round(t.progress)}%` : '失败'}
+                          </span>
+                        </div>
+                      )}
+                      {t.status === 'running' && (
+                        <div className="absolute bottom-0 left-0 h-0.5 bg-[#4f7cff]" style={{ width: `${Math.min(100, t.progress)}%` }} />
+                      )}
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="mt-auto pb-2" />
+            </>
+          )}
         </aside>
       </div>
       <MediaPickerDialog
@@ -498,6 +937,60 @@ export function Workbench() {
         showMockAssets={false}
         max={remainingReferenceSlots}
       />
+
+      {/* 我的提示词弹窗 */}
+      {showPromptsDialog && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" onClick={() => setShowPromptsDialog(false)}>
+          <div className="flex max-h-[480px] w-[400px] max-w-[90vw] flex-col rounded-2xl border border-[#e4e5e9] bg-white shadow-[0_20px_50px_rgba(0,0,0,0.18)]" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-[#eff0f3] px-5 py-3.5">
+              <h3 className="text-sm font-semibold text-[#1d222b]">我的提示词</h3>
+              <button type="button" onClick={() => setShowPromptsDialog(false)} className="grid h-7 w-7 place-items-center rounded-md text-[#a4aab5] hover:bg-[#f3f4f6] hover:text-[#3f4652]"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="flex items-center gap-2 border-b border-[#eff0f3] px-5 py-2.5">
+              <Search className="h-3.5 w-3.5 text-[#a4aab5]" />
+              <input value={promptSearch} onChange={(e) => setPromptSearch(e.target.value)} placeholder="搜索已保存的提示词..." className="flex-1 bg-transparent text-xs text-[#242832] outline-none placeholder:text-[#b8bdc7]" />
+            </div>
+            <div className="flex-1 overflow-auto">
+              {savedPrompts.length === 0 ? (
+                <div className="grid place-items-center px-4 py-14 text-xs text-[#a4aab5]">暂无保存的提示词</div>
+              ) : (() => {
+                const filtered = promptSearch.trim() ? savedPrompts.filter((p) => p.prompt.includes(promptSearch.trim())) : savedPrompts;
+                if (filtered.length === 0) return <div className="grid place-items-center px-4 py-14 text-xs text-[#a4aab5]">没有匹配的提示词</div>;
+                return filtered.map((p) => (
+                  <div key={p.id} className="group flex items-start gap-3 border-b border-[#f3f4f6] px-5 py-3 last:border-b-0 hover:bg-[#f8f9fb]">
+                    <div className="min-w-0 flex-1 cursor-pointer" onClick={() => handleLoadPrompt(p)}>
+                      <div className="text-xs font-medium text-[#242832]">{p.title || p.prompt.slice(0, 20)}</div>
+                      <div className="mt-0.5 line-clamp-2 text-[11px] leading-relaxed text-[#9ca2ad]">{p.prompt}</div>
+                      <div className="mt-1 flex items-center gap-2 text-[10px] text-[#c2c6cf]">
+                        <span>{new Date(p.createdAt).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+                        <span>使用 {p.useCount} 次</span>
+                      </div>
+                    </div>
+                    <button type="button" onClick={() => handleDeletePrompt(p.id)} className="mt-0.5 grid h-6 w-6 flex-none place-items-center rounded opacity-0 transition group-hover:opacity-100 hover:bg-[#fef0ef] hover:text-[#e5484d]" title="删除"><Trash2 className="h-3.5 w-3.5" /></button>
+                  </div>
+                ));
+              })()}
+            </div>
+            <div className="border-t border-[#eff0f3] px-5 py-2 text-[10px] text-[#c2c6cf]">共 {savedPrompts.length} 条 · 点击条目加载到编辑器</div>
+          </div>
+        </div>
+      )}
+
+      {/* 展开编辑全屏 */}
+      {isExpanded && (
+        <div className="fixed inset-0 z-[100] flex flex-col bg-[#f7f7f8]">
+          <div className="flex h-14 items-center justify-between border-b border-[#e4e5e9] bg-white px-5">
+            <h2 className="text-sm font-semibold text-[#1d222b]">编辑提示词</h2>
+            <div className="flex items-center gap-3">
+              <span className="text-xs text-[#a4aab5]">{script.length} / 10000</span>
+              <button type="button" onClick={() => setIsExpanded(false)} className="inline-flex items-center gap-1.5 rounded-lg border border-[#e4e5e9] bg-white px-3 py-1.5 text-xs text-[#707784] hover:bg-[#f3f4f6]"><Minimize2 className="h-3.5 w-3.5" /> 收起</button>
+            </div>
+          </div>
+          <div className="flex flex-1 justify-center overflow-hidden px-6 py-6">
+            <textarea autoFocus value={script} onChange={(e) => setScript(e.target.value)} maxLength={10000} placeholder="输入视频脚本，描述你想要的画面、节奏、风格..." className="h-full w-full max-w-[900px] resize-none rounded-xl border border-[#e4e5e9] bg-white p-6 text-sm leading-7 text-[#242832] shadow-sm outline-none placeholder:text-[#b8bdc7] focus:border-[#c4c9d4]" />
+          </div>
+        </div>
+      )}
     </main>
   );
 }

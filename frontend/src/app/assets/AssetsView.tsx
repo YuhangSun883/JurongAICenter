@@ -15,10 +15,15 @@ import {
   Pencil,
   Info,
   Download,
+  Play,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { mediaApi } from '@/api/media';
 import type { MediaItem, MediaLibrary, MediaType } from '@/types/media';
 import { cn } from '@/lib/utils';
+import { getAccessToken } from '@/lib/auth-store';
+import { VideoThumbnail } from '@/components/common/VideoThumbnail';
 
 type TypeFilter = 'all' | MediaType;
 type SortOrder = 'desc' | 'asc';
@@ -53,6 +58,11 @@ function formatDate(s?: string) {
   return s.slice(0, 10);
 }
 
+function getStreamUrl(assetId: number): string {
+  const token = getAccessToken();
+  return `/api/media/assets/${assetId}/stream${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+}
+
 export function AssetsView() {
   const [libs, setLibs] = useState<MediaLibrary[]>([]);
   const [activeLibId, setActiveLibId] = useState<number | null>(null);
@@ -72,6 +82,9 @@ export function AssetsView() {
 
   // 资产编辑弹窗
   const [editingAsset, setEditingAsset] = useState<MediaItem | null>(null);
+
+  // 视频播放器
+  const [playingVideo, setPlayingVideo] = useState<MediaItem | null>(null);
 
   // 上传
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -472,6 +485,7 @@ export function AssetsView() {
               onEdit={() => handleEditAsset(a)}
               onDelete={() => handleDeleteAsset(a)}
               onDownload={() => handleDownloadAsset(a)}
+              onPlayVideo={(asset) => setPlayingVideo(asset)}
             />
           ))}
             </div>
@@ -530,6 +544,14 @@ export function AssetsView() {
           currentLibId={activeLibId}
           onClose={() => setEditingAsset(null)}
           onSave={handleSaveAssetName}
+        />
+      )}
+
+      {/* 视频播放器弹窗 */}
+      {playingVideo && (
+        <VideoPlayerModal
+          asset={playingVideo}
+          onClose={() => setPlayingVideo(null)}
         />
       )}
     </div>
@@ -772,7 +794,17 @@ function AssetEditDialog({
                   className="h-full w-full object-cover"
                 />
               ) : asset.type === 'video' ? (
-                <Film className="h-6 w-6 text-[#cbd5e1]" />
+                <video
+                  src={asset.url}
+                  className="h-full w-full object-cover"
+                  muted
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    if (v.currentTime < 0.1) v.currentTime = 0.1;
+                  }}
+                />
               ) : (
                 <Music2 className="h-6 w-6 text-[#cbd5e1]" />
               )}
@@ -955,6 +987,7 @@ function AssetCard({
   onEdit,
   onDelete,
   onDownload,
+  onPlayVideo,
 }: {
   asset: MediaItem;
   selecting: boolean;
@@ -963,6 +996,7 @@ function AssetCard({
   onEdit: () => void;
   onDelete: () => void;
   onDownload: () => void;
+  onPlayVideo: (asset: MediaItem) => void;
 }) {
   return (
     <div
@@ -984,9 +1018,10 @@ function AssetCard({
             }}
           />
         ) : asset.type === 'video' ? (
-          <div className="grid h-full w-full place-items-center">
-            <Film className="h-9 w-9 text-[#cbd5e1]" strokeWidth={1.5} />
-          </div>
+          <VideoThumbnail
+            assetId={asset.id}
+            onPlay={() => onPlayVideo(asset)}
+          />
         ) : (
           <div className="grid h-full w-full place-items-center">
             <Music2 className="h-9 w-9 text-[#cbd5e1]" strokeWidth={1.5} />
@@ -1059,6 +1094,73 @@ function AssetCard({
         <div className="mt-0.5 flex items-center justify-between text-[11px] text-[#8a909b]">
           <span>{formatSize(asset.size)}</span>
           <span>{formatDate(asset.createdAt)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VideoPlayerModal({
+  asset,
+  onClose,
+}: {
+  asset: MediaItem;
+  onClose: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [muted, setMuted] = useState(false);
+
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="relative max-h-[90vh] w-full max-w-4xl overflow-hidden rounded-2xl bg-black shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between bg-black/60 px-4 py-2.5">
+          <span className="truncate text-sm font-medium text-white">
+            {asset.name}
+          </span>
+          <button
+            onClick={onClose}
+            className="grid h-7 w-7 place-items-center rounded-lg text-white/80 transition hover:bg-white/10 hover:text-white"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="relative bg-black">
+          <video
+            ref={videoRef}
+            src={getStreamUrl(asset.id)}
+            className="max-h-[75vh] w-full"
+            controls
+            autoPlay
+            muted={muted}
+            playsInline
+            onError={(e) => {
+              const el = e.currentTarget;
+              el.style.display = 'none';
+            }}
+          />
+          <div className="absolute bottom-4 right-4 flex gap-2">
+            <button
+              onClick={() => setMuted(!muted)}
+              className="grid h-8 w-8 place-items-center rounded-full bg-black/50 text-white backdrop-blur-sm transition hover:bg-black/70"
+              title={muted ? '取消静音' : '静音'}
+            >
+              {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+            </button>
+          </div>
         </div>
       </div>
     </div>

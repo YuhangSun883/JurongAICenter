@@ -12,6 +12,7 @@ import com.jurong.aicenter.repository.AgentMessageRepository;
 import com.jurong.aicenter.repository.AgentSessionRepository;
 import com.jurong.aicenter.repository.UserRepository;
 import com.jurong.aicenter.service.AgentService;
+import com.jurong.aicenter.service.MediaService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -91,6 +92,7 @@ public class AgentServiceImpl implements AgentService {
     private final AgentMessageRepository messageRepo;
     private final UserRepository userRepo;
     private final NewApiClient newApiClient;
+    private final MediaService mediaService;
 
     @Value("${llm.model:deepseek-v4-flash}")
     private String llmModel;
@@ -179,6 +181,7 @@ public class AgentServiceImpl implements AgentService {
     @Override
     @Transactional
     public AgentSendResponse send(Long userId, AgentSendRequest req) {
+        // 1) 找/建 session
         AgentSession session;
         if (req.getSessionId() == null || req.getSessionId().isBlank()) {
             String defaultTitle = req.getContent().trim();
@@ -190,42 +193,195 @@ public class AgentServiceImpl implements AgentService {
             session = requireOwnedSession(userId, req.getSessionId());
         }
 
+        // 2) 把 attachmentIds 转成图片 URL（多模态用）+ 完整素材信息（前端显示用）
+        List<String> imageUrls = mediaService.getImageUrlsByIds(
+            userId, req.getAttachmentIds()
+        );
+        List<Map<String, Object>> attachmentInfos = new java.util.ArrayList<>();
+        if (req.getAttachmentIds() != null && !req.getAttachmentIds().isEmpty()) {
+            // 拉素材详情（含 url/name/type）
+            List<com.jurong.aicenter.entity.MediaAsset> assets =
+                mediaService.getAssetsByIds(userId, req.getAttachmentIds());
+            for (com.jurong.aicenter.entity.MediaAsset a : assets) {
+                Map<String, Object> m = new java.util.HashMap<>();
+                m.put("id", String.valueOf(a.getId()));
+                m.put("type", a.getType());
+                m.put("name", a.getName());
+                m.put("url", a.getObjectKey() == null
+                    ? null
+                    : mediaService.getPresignedUrl(a.getObjectKey(), 24));
+                attachmentInfos.add(m);
+            }
+        }
+
+        // 3) 存用户消息（含 attachments JSON 数组）
         AgentMessage userMsg = new AgentMessage();
         userMsg.setSessionId(session.getId());
         userMsg.setUserId(userId);
         userMsg.setRole("user");
         userMsg.setContent(req.getContent());
+        if (!attachmentInfos.isEmpty()) {
+            // 存完整的 attachment 信息（含 url/name/type），前端消息气泡显示图片用
+            try {
+                userMsg.setAttachments(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(attachmentInfos));
+            } catch (Exception ignore) {
+                userMsg.setAttachments(null);
+            }
+        }
         userMsg.setCreatedAt(LocalDateTime.now());
         messageRepo.insert(userMsg);
 
+        // 4) 拉历史消息
         List<AgentMessage> history = messageRepo.selectList(
                 new QueryWrapper<AgentMessage>()
                         .eq("session_id", session.getId())
                         .orderByAsc("created_at")
         );
 
-        String assistantContent = callLlm(history);
+        // 5) 调 LLM（多模态 vs 文字）
+        String llmReply;
+        try {
+            if (imageUrls.isEmpty()) {
+                llmReply = callLlmTextOnly(history);
+            } else {
+                llmReply = newApiClient.chatCompletionWithImages(
+                    llmModel, llmSystemPrompt, req.getContent(),
+                    imageUrls, llmMaxTokens
+                );
+            }
+        } catch (Exception e) {
+            log.error("Agent LLM call failed: {}", e.getMessage());
+            llmReply = "抱歉，AI 助手暂时无法回复，请稍后再试。";
+        }
 
+        // 6) 解析 tool_call JSON，提取显示内容和工具调用
+        ParsedLlmReply parsed = parseLlmReply(llmReply);
+
+        // 7) 存 assistant 消息
         AgentMessage assistantMsg = new AgentMessage();
         assistantMsg.setSessionId(session.getId());
         assistantMsg.setUserId(userId);
         assistantMsg.setRole("assistant");
-        assistantMsg.setContent(assistantContent);
+        assistantMsg.setContent(parsed.displayContent);
+        if (parsed.toolCallJson != null) {
+            assistantMsg.setToolCalls(parsed.toolCallJson);
+        }
         assistantMsg.setCreatedAt(LocalDateTime.now());
         messageRepo.insert(assistantMsg);
 
+        // 8) 更新 session 积分
         int creditsUsed = (session.getCreditsUsed() == null ? 0 : session.getCreditsUsed()) + DEFAULT_CREDITS_PER_MESSAGE;
         session.setCreditsUsed(creditsUsed);
         session.setUpdatedAt(LocalDateTime.now());
         sessionRepo.updateById(session);
 
-        return new AgentSendResponse(
+        // 9) 构造响应
+        AgentSendResponse resp = new AgentSendResponse(
                 session.getId(),
                 userMsg.getId(),
                 assistantMsg.getId(),
                 creditsUsed,
-                DEFAULT_CREDITS_PER_MESSAGE
+                DEFAULT_CREDITS_PER_MESSAGE,
+                null
         );
+
+        // 10) 如果有 tool_call，附在响应里
+        if (parsed.toolCall != null) {
+            AgentSendResponse.ToolCall tc = new AgentSendResponse.ToolCall();
+            tc.setAction(parsed.toolCall.getAction());
+            tc.setPrompt(parsed.toolCall.getPrompt());
+            tc.setReason(parsed.toolCall.getReason());
+            // 携带用户上传的素材 ID（前端跳转时用）
+            tc.setAttachmentIds(req.getAttachmentIds());
+            resp.setToolCall(tc);
+            log.info("Agent toolCall detected: action={}, prompt={}, attachments={}",
+                tc.getAction(), tc.getPrompt(), tc.getAttachmentIds() == null ? 0 : tc.getAttachmentIds().size());
+        }
+
+        return resp;
+    }
+
+    /** 内部：LLM 回复解析结果（显示文本 + 工具调用） */
+    private static class ParsedLlmReply {
+        String displayContent;     // 显示给用户的纯文本
+        String toolCallJson;       // 原始 tool_call JSON（存 DB）
+        AgentSendResponse.ToolCall toolCall;  // 解析后的对象
+    }
+
+    /** 解析 LLM 回复，提取 tool_call JSON（如果存在） */
+    private ParsedLlmReply parseLlmReply(String reply) {
+        ParsedLlmReply result = new ParsedLlmReply();
+        if (reply == null) {
+            result.displayContent = "";
+            return result;
+        }
+        // 提取 {"tool_call": {...}} 部分（支持嵌套花括号）
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+            "\\{\\s*\"tool_call\"\\s*:\\s*\\{(?:[^{}]|\\{[^{}]*\\})*\\}\\s*\\}",
+            java.util.regex.Pattern.DOTALL
+        );
+        java.util.regex.Matcher m = p.matcher(reply);
+        if (m.find()) {
+            String toolJson = m.group();
+            result.toolCallJson = toolJson;
+            // 把 JSON 从 content 里剔除
+            String before = reply.substring(0, m.start()).trim();
+            String after = reply.substring(m.end()).trim();
+            result.displayContent = (before + " " + after).trim();
+            // 解析 JSON 拿 action/prompt/reason
+            try {
+                com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+                com.fasterxml.jackson.databind.JsonNode node = mapper.readTree(toolJson);
+                com.fasterxml.jackson.databind.JsonNode tc = node.get("tool_call");
+                if (tc != null) {
+                    AgentSendResponse.ToolCall t = new AgentSendResponse.ToolCall();
+                    if (tc.has("action")) t.setAction(tc.get("action").asText());
+                    if (tc.has("prompt")) t.setPrompt(tc.get("prompt").asText());
+                    if (tc.has("reason")) t.setReason(tc.get("reason").asText());
+                    result.toolCall = t;
+                }
+            } catch (Exception e) {
+                log.warn("Failed to parse tool_call JSON: {}", e.getMessage());
+            }
+        } else {
+            result.displayContent = reply.trim();
+        }
+        return result;
+    }
+
+    /**
+     * 纯文字 LLM 调用（无图片时用，保持旧逻辑）。
+     */
+    private String callLlmTextOnly(List<AgentMessage> history) {
+        // 构造 messages 数组
+        List<Map<String, String>> messages = new ArrayList<>();
+        for (AgentMessage m : history) {
+            String role = m.getRole();
+            if (!"user".equals(role) && !"assistant".equals(role) && !"system".equals(role)) continue;
+            Map<String, String> msg = new HashMap<>();
+            msg.put("role", role);
+            msg.put("content", m.getContent());
+            messages.add(msg);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(llmSystemPrompt).append("\n\n");
+        for (Map<String, String> m : messages) {
+            String role = m.get("role");
+            if ("system".equals(role)) continue;
+            sb.append("[").append(role.toUpperCase()).append("]\n");
+            sb.append(m.get("content")).append("\n\n");
+        }
+        sb.append("[ASSISTANT]\n");
+        String userPrompt = sb.toString();
+
+        try {
+            return newApiClient.chatCompletion(llmModel, llmSystemPrompt, userPrompt, llmMaxTokens);
+        } catch (Exception e) {
+            log.error("LLM call failed: {}", e.getMessage());
+            return "抱歉，AI 助手暂时无法回复，请稍后再试。";
+        }
     }
 
     @Override

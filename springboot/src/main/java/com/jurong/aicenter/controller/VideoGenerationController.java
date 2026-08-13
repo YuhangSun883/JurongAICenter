@@ -1,59 +1,109 @@
 package com.jurong.aicenter.controller;
 
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
+import com.jurong.aicenter.dto.job.JobResponse;
+import com.jurong.aicenter.dto.video.VideoOptions;
+import com.jurong.aicenter.entity.Job;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.JobRepository;
+import com.jurong.aicenter.repository.MediaAssetRepository;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.VideoGenerationService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * 视频生成端点（图生视频）— 走 NewAPI 中转站，绕过 ComfyUI。
- *
- * <p>严格按 Assets-API 参考手册 §5 端到端流程：
- * 上传图片到 proxy → 轮询 asset active → 调 NewAPI /v1/videos → 异步轮询视频任务。
+ * 视频生成端点 — 全部走 NewAPI 中转站（2026-08-11 重构：移除 ComfyUI 流程）。
  *
  * <p>端点：
  * <pre>
- *   POST /api/video/image-to-video   (multipart/form-data)
- *     参数：file (图片, 必填) + prompt (提示词, 必填)
- *           + duration (秒, 可选, 默认 4)
- *           + resolution (480P/720P, 可选, 默认 480P)
- *     返回：{jobId, status, promptId}  （status=RUNNING, promptId=NewAPI task_id）
+ *   POST /api/videos/text-to-video          (JSON body, 文字生成视频 → NewAPI)
+ *   POST /api/videos/image-to-video         (multipart/form-data, 图片生成视频 → NewAPI)
+ *   POST /api/videos/multi-image-to-video   (multipart/form-data, 多图生成视频 → NewAPI)
+ *   GET  /api/videos                        (列出本用户的视频生成任务)
  * </pre>
- *
- * <p>查询/下载复用现有端点：
- * <ul>
- *   <li>{@code GET /api/jobs/{id}} 查任务状态（COMPLETED 时 resultUrls 含 MinIO URL）</li>
- *   <li>{@code GET /api/jobs/{id}/result/{filename}} 302 跳转到 MinIO 签名 URL</li>
- *   <li>{@code DELETE /api/jobs/{id}} 取消/删除任务</li>
- * </ul>
  */
+@Slf4j
 @RestController
-@RequestMapping("/api/video")
+@RequestMapping("/api/videos")
 @RequiredArgsConstructor
 public class VideoGenerationController {
-    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
-    private static final Logger log = LoggerFactory.getLogger(VideoGenerationController.class);
 
     private final VideoGenerationService videoGenerationService;
+    private final JobRepository jobRepository;
+    private final ObjectMapper objectMapper;
+    private final MediaAssetRepository mediaAssetRepository;
 
     /**
-     * 图生视频：上传图片 + 提示词 → 异步生成视频。
+     * 文字生成视频 — NewAPI 中转站。
      *
-     * <p>同步返回 jobId（status=RUNNING），前端轮询 GET /api/jobs/{id} 拿结果。
+     * <p>2026-08-11：移除 ComfyUI 流程，统一走 NewAPI。
+     * 请求体：{script, model, aspectRatio, resolution, duration, audioMode, seed?}
+     */
+    @PostMapping("/text-to-video")
+    public GenerateResponse textToVideo(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @RequestBody Map<String, Object> request) {
+        if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
+
+        String script = (String) request.getOrDefault("script", "");
+        if (script == null || script.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "script 不能为空");
+        }
+
+        String frontModel = (String) request.getOrDefault("model", "Seedance-2.0-VIP");
+        String aspectRatio = (String) request.getOrDefault("aspectRatio", "16:9");
+        // aicoming 只接受小写 resolution（480p/720p/1080p/4k）
+        String resolution = (String) request.getOrDefault("resolution", "720p");
+        int duration = request.get("duration") instanceof Number n ? n.intValue() : 4;
+        String audioMode = (String) request.getOrDefault("audioMode", "mute");
+        Long seed = request.get("seed") instanceof Number ns ? ns.longValue() : 0L;
+
+        // 映射前端 videoModel 枚举到后端 model ID
+        // 前端三档：Seedance-2.0-VIP / Seedance-2.0-Fast-VIP / Seedance-2.0-Mini-VIP
+        // 后端 NewAPI 当前只支持 doubao-seedance-2.0 基础模型（NewAPI 文档 §2）
+        String backendModel = mapFrontendModel(frontModel);
+
+        // 组装 VideoOptions
+        VideoOptions options = VideoOptions.builder()
+            .duration(mapToValidDuration(duration))
+            .resolution(resolution)
+            .ratio(aspectRatio)
+            .generateAudio(!"mute".equalsIgnoreCase(audioMode))
+            .watermark(false)
+            .returnLastFrame(true)
+            .seed(seed == null ? 0L : seed)
+            .model(backendModel)
+            .build();
+
+        log.info("[T2V-REQ] userId={}, frontModel={}, backendModel={}, duration={}, resolution={}, "
+                + "ratio={}, audioMode={}, seed={}",
+            principal.id(), frontModel, backendModel, options.getDuration(), options.getResolution(),
+            options.getRatio(), audioMode, options.getSeed());
+
+        GenerateResponse resp = videoGenerationService.submitTextToVideo(principal.id(), script, options);
+        log.info("[T2V-REQ] 文生视频任务已提交: userId={}, jobId={}, status={}, taskId={}",
+            principal.id(), resp.getJobId(), resp.getStatus(), resp.getComfyuiPromptId());
+        return resp;
+    }
+
+    /**
+     * 图生视频：上传图片 + 提示词 → NewAPI 中转站 → 异步生成视频。
      */
     @PostMapping("/image-to-video")
     public GenerateResponse imageToVideo(
@@ -62,17 +112,13 @@ public class VideoGenerationController {
             @RequestParam("prompt") String prompt,
             @RequestParam(value = "duration", defaultValue = "4") int duration,
             @RequestParam(value = "resolution", defaultValue = "480p") String resolution) {
-
-        // 入口日志：记录全部关键参数（不含图片字节本身，只记大小和元信息）
-        log.info("[I2V-REQ] 收到图生视频请求: userId={}, filename={}, contentType={}, size={}B, "
-                + "promptLen={}, duration={}, resolution={}",
+        log.info("[I2V-REQ] 收到图生视频请求: userId={}, filename={}, contentType={}, size={}B, promptLen={}, duration={}, resolution={}",
             principal == null ? null : principal.id(),
             file == null ? null : file.getOriginalFilename(),
             file == null ? null : file.getContentType(),
             file == null ? 0 : file.getSize(),
             prompt == null ? 0 : prompt.length(),
-            duration,
-            resolution);
+            duration, resolution);
 
         if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
         if (file == null || file.isEmpty()) {
@@ -93,14 +139,8 @@ public class VideoGenerationController {
             throw new BusinessException(ErrorCode.INVALID_PARAM, "读取文件失败: " + e.getMessage());
         }
         GenerateResponse resp = videoGenerationService.submitImageToVideo(
-            principal.id(),
-            fileBytes,
-            file.getOriginalFilename(),
-            file.getContentType(),
-            prompt,
-            duration,
-            resolution
-        );
+            principal.id(), fileBytes, file.getOriginalFilename(), file.getContentType(),
+            prompt, duration, resolution);
         log.info("[I2V-REQ] 图生视频任务已提交: userId={}, jobId={}, status={}, taskId={}",
             principal.id(), resp.getJobId(), resp.getStatus(), resp.getComfyuiPromptId());
         return resp;

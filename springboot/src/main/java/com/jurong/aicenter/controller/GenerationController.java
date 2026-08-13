@@ -1,13 +1,18 @@
 package com.jurong.aicenter.controller;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.dto.generation.GenerateRequest;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.dto.job.JobResponse;
 import com.jurong.aicenter.entity.Job;
+import com.jurong.aicenter.entity.MediaAsset;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.MediaAssetRepository;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.GenerationService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,6 +33,8 @@ import java.util.Map;
 public class GenerationController {
 
     private final GenerationService generationService;
+    private final ObjectMapper objectMapper;
+    private final MediaAssetRepository mediaAssetRepository;
 
     @PostMapping("/generate")
     public GenerateResponse generate(
@@ -81,7 +88,8 @@ public class GenerationController {
             resultUrls,
             job.getErrorMessage(),
             job.getCreatedAt(),
-            job.getCompletedAt()
+            job.getCompletedAt(),
+            mediaAssetId
         );
     }
 

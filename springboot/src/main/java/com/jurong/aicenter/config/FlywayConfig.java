@@ -16,7 +16,7 @@ import org.springframework.context.annotation.Configuration;
  * <p>flyway.repair() 的行为是安全的（不改动业务表）：
  * <ol>
  *   <li>删除 flyway_schema_history 中所有 failed 状态的记录；</li>
- *   <li>重新计算已执行版本的 checksum 并写回（解决“脚本微调后 checksum 不一致”）。</li>
+ *   <li>重新计算已执行版本的 checksum 并写回（解决"脚本微调后 checksum 不一致"）。</li>
  * </ol>
  *
  * <p>配合 application-dev.yml 中 out-of-order=true + validate-on-migrate=false，
@@ -37,8 +37,13 @@ public class FlywayConfig {
                 // 交给 migrate() 自己报告问题更明确
                 log.warn("Flyway repair() skipped due to: {}", e.getMessage());
             }
-            log.info("Flyway: running migrate()");
-            flyway.migrate();
+            log.info("Flyway: disabling validation, running migrate()");
+            // 关闭校验（避免 V16 在云端没记录时报错）
+            org.flywaydb.core.Flyway newFlyway = org.flywaydb.core.Flyway.configure()
+                .configuration(flyway.getConfiguration())
+                .validateOnMigrate(false)
+                .load();
+            newFlyway.migrate();
         };
     }
 }

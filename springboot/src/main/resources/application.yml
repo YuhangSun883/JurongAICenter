@@ -53,6 +53,23 @@ springdoc:
     path: /swagger-ui.html
     enabled: true
 
+# ============================================================
+# NewAPI 中转站配置（视频生成 / 聊天统一走这里 :3000）
+# ============================================================
+newapi:
+  base-url: ${NEWAPI_BASE_URL:http://localhost:3000}
+  token: ${NEWAPI_TOKEN:}
+
+# ============================================================
+# aicoming-video-proxy 配置（素材库 CRUD 走这里 :8080）
+# 文档 §3 明说：素材上传不走 new-api（:3000 会 404），必须直连 proxy
+# 默认指向雨云 192.140.163.161:8080，部署时通过环境变量覆盖
+# ============================================================
+aicoming:
+  proxy:
+    base-url: ${AICOMING_PROXY_BASE_URL:http://192.140.163.161:8080}
+    token: ${AICOMING_PROXY_TOKEN:${NEWAPI_TOKEN:}}   # 默认复用 newapi token
+
 management:
   endpoints:
     web:
@@ -72,16 +89,48 @@ logging:
 # LLM 配置（画布文本润色 / Agent 对话共用）
 # ============================================================
 llm:
-  model: deepseek-v4-flash       # 模型名（NewAPI /v1/models 返回）
-  max-tokens: 2048                # 最大输出 token
+  model: claude-sonnet-4-6  # 多模态模型（NewAPI 实际可用），支持图片理解
+  max-tokens: 2048
   system-prompt: |
-    你是一个专业的文案润色师。请保持核心信息和意图不变，改善表达使文字更有感染力，适合用于电商详情页、社交媒体等场景。输出纯文本，不要使用 markdown 格式。
+    你是 Jurong AI 助手。用户可能上传图片给你。
+
+    **任务**：
+    1. 先识别图片内容（如果上传了图片）
+    2. 根据用户意图决定是否需要跳转生成模块
+
+    **生成跳转规则**（满足时输出 tool_call JSON）：
+    - 用户动词包含"生成/做/画/创建/转换/变成/转成/换成/加上/做个"
+    - 描述了具体目标（如"红色背景""卡通风格""短视频"）
+    - 上传图片 + 想生成 → 用图片作素材
+
+    **不要跳转的情况**：
+    - "分析/描述/这是什么/看看/帮我看下/是什么东西" → 只回答，不跳转
+
+    **工具调用格式**（仅在需要跳转时输出，JSON 放在回复末尾）：
+    {"tool_call": {"action": "<action_name>", "prompt": "<用户意图>", "reason": "<简短解释>"}}
+
+    **支持的 action**：
+    - jump-to-image: 文生图（没有参考图）
+    - jump-to-image-edit: 图生图（有参考图，要编辑/转换）
+    - jump-to-video: 文生视频
+    - jump-to-image-to-video: 图生视频
+    - jump-to-product-image: 商详图
+    - jump-to-image-enhancer: 图像增强
+
+    **示例**：
+    用户："把这张图变成红色背景"
+    → 回复："我看到这是一张风景照。" + {"tool_call": {"action": "jump-to-image-edit", "prompt": "把背景换成红色", "reason": "图生图需求"}}
+
+    用户："这是什么花？"
+    → 回复："这是玫瑰花。"（不加 tool_call）
+
+    普通问题直接回答，输出简洁，不要 markdown 格式。
   image-poll-timeout-sec: 600    # ComfyUI text-to-image 超时（10 分钟）
   video-poll-timeout-sec: 1800   # NewAPI 视频生成超时（30 分钟）
 
 # 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
 canvas:
-  workflows-dir: D:/ymWork/JurongAICenter/workflows/
+  workflows-dir: E:/8-10/JurongAICenter/workflows/
   # 画布节点的默认模型参数（最便宜档位，节省测试费用）
   defaults:
     image-model: gpt-image-2-1k

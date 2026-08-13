@@ -55,7 +55,6 @@ import java.util.stream.IntStream;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class VideoFrameCaptionService {
 
     /** 发给 VL 模型的 prompt —— 单帧版,聚焦动作而不是静态画面,严格 30 字内 */
@@ -96,6 +95,22 @@ public class VideoFrameCaptionService {
     // 错峰:每帧请求前加递增延迟,让 NewAPI 喘口气
     private static final long CAPTION_STAGGER_MS = 50;
     private final ObjectMapper objectMapper;
+
+    public VideoFrameCaptionService(VideoFrameExtractor extractor,
+                                    NewApiClient newApiClient,
+                                    StorageService storageService,
+                                    CanvasTaskRepository taskRepository,
+                                    CanvasNodeRepository nodeRepository,
+                                    @Qualifier("captionExecutor") Executor captionExecutor,
+                                    ObjectMapper objectMapper) {
+        this.extractor = extractor;
+        this.newApiClient = newApiClient;
+        this.storageService = storageService;
+        this.taskRepository = taskRepository;
+        this.nodeRepository = nodeRepository;
+        this.captionExecutor = captionExecutor;
+        this.objectMapper = objectMapper;
+    }
 
     /**
      * 异步入口。被 CanvasServiceImpl.extractAndCaption() 调用。

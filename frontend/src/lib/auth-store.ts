@@ -37,8 +37,22 @@ function notifyAuthChange(event: 'login' | 'logout' | 'refresh') {
 // ===== 读取 token（启动时从 localStorage 同步到内存） =====
 export function bootstrapTokens(): void {
   if (typeof window === 'undefined') return;
-  accessTokenInMemory = localStorage.getItem(ACCESS_TOKEN_KEY);
-  refreshTokenInMemory = localStorage.getItem(REFRESH_TOKEN_KEY);
+  const rawAccess = localStorage.getItem(ACCESS_TOKEN_KEY);
+  const rawRefresh = localStorage.getItem(REFRESH_TOKEN_KEY);
+  // 校验 token 格式（JWT 格式: xxx.yyy.zzz），清除无效 token
+  const jwtRe = /^[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+$/;
+  if (rawAccess && !jwtRe.test(rawAccess)) {
+    console.warn('[auth] invalid access token format detected, clearing');
+    clearTokens();
+    return;
+  }
+  if (rawRefresh && !jwtRe.test(rawRefresh)) {
+    console.warn('[auth] invalid refresh token format detected, clearing');
+    clearTokens();
+    return;
+  }
+  accessTokenInMemory = rawAccess;
+  refreshTokenInMemory = rawRefresh;
   const expiry = localStorage.getItem(ACCESS_TOKEN_EXPIRY_KEY);
   accessTokenExpiryInMemory = expiry ? parseInt(expiry, 10) : null;
 }
@@ -160,7 +174,7 @@ export async function silentRefresh(): Promise<boolean> {
 }
 
 function buildApiUrl(path: string): string {
-  const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+  const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
   return new URL(path, base).toString();
 }
 

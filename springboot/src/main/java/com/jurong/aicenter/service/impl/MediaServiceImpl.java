@@ -30,6 +30,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -301,6 +302,80 @@ public class MediaServiceImpl implements MediaService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public MediaAssetResponse saveFavoriteAsAsset(Long userId, byte[] imageBytes, String mimeType, String displayName) {
+        return saveImageAsAsset(userId, imageBytes, mimeType, "favorite");
+    }
+
+    /**
+     * AI 图片工作台同步生成的图片入库（sourceTool=image，用于"预览"Tab）。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse recordGeneratedImage(Long userId, byte[] imageBytes, String mimeType) {
+        return saveImageAsAsset(userId, imageBytes, mimeType, "image");
+    }
+
+    /**
+     * 收藏 = 修改已有 AI 生成记录的 source_tool 字段（不复制图片）。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse markAsFavorite(Long userId, String objectKey) {
+        if (objectKey == null || objectKey.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "objectKey 不能为空");
+        }
+        MediaAsset asset = findByUserAndObjectKey(userId, objectKey);
+        if (asset == null) {
+            throw new BusinessException(ErrorCode.MEDIA_ASSET_NOT_FOUND, "未找到该图片资产");
+        }
+        asset.setSourceTool("favorite");
+        asset.setUpdatedAt(LocalDateTime.now());
+        assetRepository.updateById(asset);
+        log.info("Marked as favorite: assetId={}, userId={}, objectKey={}", asset.getId(), userId, objectKey);
+        MediaLibrary lib = asset.getLibraryId() != null ? libraryRepository.selectById(asset.getLibraryId()) : null;
+        return toResponse(asset, lib != null ? lib.getName() : null);
+    }
+
+    /**
+     * 撤销收藏 = 把 source_tool 改回 'image'。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse unmarkAsFavorite(Long userId, String objectKey) {
+        if (objectKey == null || objectKey.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "objectKey 不能为空");
+        }
+        MediaAsset asset = findByUserAndObjectKey(userId, objectKey);
+        if (asset == null) {
+            throw new BusinessException(ErrorCode.MEDIA_ASSET_NOT_FOUND, "未找到该图片资产");
+        }
+        asset.setSourceTool("image");
+        asset.setUpdatedAt(LocalDateTime.now());
+        assetRepository.updateById(asset);
+        log.info("Unmarked favorite: assetId={}, userId={}, objectKey={}", asset.getId(), userId, objectKey);
+        MediaLibrary lib = asset.getLibraryId() != null ? libraryRepository.selectById(asset.getLibraryId()) : null;
+        return toResponse(asset, lib != null ? lib.getName() : null);
+    }
+
+    /**
+     * 工具方法：按 user_id + object_key 唯一查找（忽略软删除）。
+     */
+    private MediaAsset findByUserAndObjectKey(Long userId, String objectKey) {
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId)
+               .eq(MediaAsset::getObjectKey, objectKey);
+        // 显式覆盖软删除过滤（如有）
+        return assetRepository.selectOne(wrapper);
+    }
+
+    /**
+     * 通用图片入库逻辑：上传 MinIO + 写 media_assets。
+     *
+     * @param userId      用户 ID
+     * @param imageBytes  图片字节
+     * @param mimeType    MIME 类型
+     * @param sourceTool  写入 sourceTool 字段（"favorite" 用于收藏 Tab，"image" 用于预览 Tab）
+     */
+    private MediaAssetResponse saveImageAsAsset(Long userId, byte[] imageBytes, String mimeType, String sourceTool) {
         if (imageBytes == null || imageBytes.length == 0) {
             throw new BusinessException(ErrorCode.MEDIA_FILE_EMPTY);
         }
@@ -315,7 +390,7 @@ public class MediaServiceImpl implements MediaService {
         try (ByteArrayInputStream is = new ByteArrayInputStream(imageBytes)) {
             url = storageService.uploadObject(objectKey, is, mimeType);
         } catch (Exception e) {
-            log.error("Favorite save upload failed: {}", e.getMessage());
+            log.error("Image asset upload failed (sourceTool={}): {}", sourceTool, e.getMessage());
             throw new BusinessException(ErrorCode.MEDIA_UPLOAD_FAILED, e.getMessage());
         }
 
@@ -332,13 +407,13 @@ public class MediaServiceImpl implements MediaService {
         asset.setMimeType(mimeType);
         asset.setSizeBytes(size);
         asset.setObjectKey(objectKey);
-        asset.setSourceTool("favorite");
+        asset.setSourceTool(sourceTool);
         asset.setCreatedAt(LocalDateTime.now());
         asset.setUpdatedAt(LocalDateTime.now());
         assetRepository.insert(asset);
 
-        log.info("Favorite saved as asset: id={}, userId={}, libraryId={}, size={}, objectKey={}",
-            asset.getId(), userId, aiLibId, size, objectKey);
+        log.info("Image asset saved: id={}, userId={}, libraryId={}, size={}, sourceTool={}, objectKey={}",
+            asset.getId(), userId, aiLibId, size, sourceTool, objectKey);
 
         MediaLibrary lib = libraryRepository.selectById(aiLibId);
         return toResponse(asset, lib != null ? lib.getName() : null);
@@ -358,6 +433,55 @@ public class MediaServiceImpl implements MediaService {
         }
         log.info("Cascade delete assets by library: userId={}, libraryId={}, count={}",
             userId, libraryId, assets.size());
+    }
+
+    @Override
+    public List<String> getImageUrlsByIds(Long userId, List<String> ids) {
+        if (userId == null || ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId)
+               .eq(MediaAsset::getType, "image")
+               .in(MediaAsset::getId, ids);
+        List<MediaAsset> assets = assetRepository.selectList(wrapper);
+        if (assets == null || assets.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<String> urls = assets.stream()
+                .map(MediaAsset::getObjectKey)
+                .filter(Objects::nonNull)
+                .filter(s -> !s.isBlank())
+                .map(key -> storageService.getPresignedUrl(key, 24))
+                .filter(Objects::nonNull)
+                .filter(s -> !s.isBlank())
+                .distinct()
+                .collect(Collectors.toList());
+        log.debug("Agent getImageUrlsByIds: userId={}, inputIds={}, imageUrls={}",
+            userId, ids.size(), urls.size());
+        return urls;
+    }
+
+    @Override
+    public List<MediaAsset> getAssetsByIds(Long userId, List<String> ids) {
+        if (userId == null || ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId).in(MediaAsset::getId, ids);
+        List<MediaAsset> assets = assetRepository.selectList(wrapper);
+        if (assets == null) {
+            return Collections.emptyList();
+        }
+        log.debug("Agent getAssetsByIds: userId={}, inputIds={}, assets={}",
+            userId, ids.size(), assets.size());
+        return assets;
+    }
+
+    @Override
+    public String getPresignedUrl(String objectKey, int hours) {
+        if (objectKey == null || objectKey.isBlank()) return null;
+        return storageService.getPresignedUrl(objectKey, hours);
     }
 
     @Override
@@ -441,6 +565,7 @@ public class MediaServiceImpl implements MediaService {
         response.setHeight(asset.getHeight());
         response.setDurationSec(asset.getDurationSec());
         response.setUrl(presign(asset.getObjectKey()));
+        response.setObjectKey(asset.getObjectKey());
         response.setSourceTool(asset.getSourceTool());
         response.setSourceTaskId(asset.getSourceTaskId());
         response.setCreatedAt(asset.getCreatedAt());

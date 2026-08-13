@@ -111,6 +111,21 @@ public class StorageServiceImpl implements StorageService {
         }
     }
 
+    @Override
+    public InputStream getFileStream(String objectKey) {
+        try {
+            return minioClient.getObject(
+                io.minio.GetObjectArgs.builder()
+                    .bucket(bucket)
+                    .object(objectKey)
+                    .build()
+            );
+        } catch (Exception e) {
+            log.error("Get file stream failed: objectKey={}, error={}", objectKey, e.getMessage());
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "Failed to read file: " + e.getMessage());
+        }
+    }
+
     public io.minio.MinioClient getMinioClient() {
         return minioClient;
     }
