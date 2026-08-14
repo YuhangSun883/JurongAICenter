@@ -1424,15 +1424,53 @@ public class CanvasVideoGenService {
 
 
                 if ("FAILED".equalsIgnoreCase(status) || "ERROR".equalsIgnoreCase(status)) {
-                    // 2026-08-13 14:30 修复:job 已 FAILED 时直接跳出兜底循环,不再每 5 秒无意义地查询
-                    //   之前只 log 不断轮询 = "假努力",10 分钟跑空 120 次
-                    //   @Scheduled 后续若把 status 改回 COMPLETED(误判恢复),画布下次重提交会触发新一轮兜底
-                    //   若 @Scheduled 保持 FAILED(真失败),也已经标记,无需兜底再查
-                    log.warn("[canvas-video-gen] 兜底轮询: job 标 {} (可能是误判),跳出兜底循环 (elapsed={}s)", status, elapsed);
-                    break;
+                    // 2026-08-14 修复:job 已被某线程标 FAILED 时,先查一次 NewAPI 拿 taskId 真实状态。
+                    //   原因:@Scheduled pollRunningVideoJobs 在某些环境不跑,但 NewAPI 后台任务仍在跑,
+                    //   此时 job.status 已被其它路径(例:GenerateImpl.minioFallback)误标 FAILED,
+                    //   兜底轮询却因 status==FAILED 直接跳出 = 视频能生成但被丢弃。
+                    //   修复:status=FAILED 时仍主动查 NewAPI 一次,若 completed 且有 URL → 翻 SUCCESS。
+                    log.warn("[canvas-video-gen] 兜底轮询: job 标 {} (怀疑误判),主动查 NewAPI 一次 (elapsed={}s, taskId={})",
+                        status, elapsed, newApiTaskId);
+                    if (newApiTaskId != null) {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode newApiResp = newApiClient.pollVideo(newApiTaskId);
+                            if (newApiResp != null) {
+                                String newApiStatus = newApiResp.path("status").asText("").toLowerCase();
+                                log.info("[canvas-video-gen] FAILED 后兜底查 NewAPI: taskId={} status={}",
+                                    newApiTaskId, newApiStatus);
+                                if ("completed".equals(newApiStatus) || "succeeded".equals(newApiStatus) || "success".equals(newApiStatus)) {
+                                    String videoUrl = newApiClient.extractVideoUrl(newApiResp);
+                                    if (videoUrl != null && !videoUrl.isBlank()) {
+                                        log.info("[canvas-video-gen] FAILED 误判恢复: 从 NewAPI 拿到 URL, 翻 SUCCESS: {}", videoUrl);
+                                        finalVideoUrl = videoUrl;
+                                        job.setStatus("SUCCESS");
+                                        job.setResultUrls("[\"" + videoUrl + "\"]");
+                                        job.setCompletedAt(java.time.LocalDateTime.now());
+                                        jobRepository.updateById(job);
+                                        break;
+                                    }
+                                }
+                                // NewAPI 也是 failed → 真失败,跳出
+                                if ("failed".equals(newApiStatus) || "error".equals(newApiStatus) || "cancelled".equals(newApiStatus)) {
+                                    log.warn("[canvas-video-gen] FAILED 误判排除: NewAPI 也标 failed,真失败,跳出");
+                                    break;
+                                }
+                                // NewAPI 还在处理中 (in_progress/queued) → job.status 也应翻回 RUNNING,继续等
+                                log.info("[canvas-video-gen] FAILED 误判排除: NewAPI 状态={},翻 RUNNING 继续等", newApiStatus);
+                                job.setStatus("RUNNING");
+                                jobRepository.updateById(job);
+                                status = "RUNNING";  // 同步本地变量,继续 for 循环
+                                // 继续等 → 不 break
+                            }
+                        } catch (Exception ex) {
+                            log.warn("[canvas-video-gen] FAILED 后兜底 NewAPI 轮询失败: {}", ex.getMessage());
+                        }
+                    }
+                    // 只有上面没翻 RUNNING 才 break (即真 failed)
+                    if (!"RUNNING".equalsIgnoreCase(status)) {
+                        break;
+                    }
                 }
-
-
                 // 2026-08-10 兜底轮询:job.status 还是 RUNNING,直接查 NewAPI。
                 // 这条路径保证即使 @Scheduled 调度器没运行,我们也能拿到 NewAPI 完成的视频。
                 // 2026-08-13 修复:前 60 秒只查 job.status(让 @Scheduled 处理,避免和 @Scheduled 重复调
@@ -1966,7 +2004,19 @@ public class CanvasVideoGenService {
         sb.append("- 如有口播原文,确保画面节奏配合口播的语义断句\n");
 
 
-        sb.append("- 如果用户额外要求与分镜描述冲突,以用户要求为准");
+        sb.append("- 如果用户额外要求与分镜描述冲突,以用户要求为准\n");
+
+
+        // 2026-08-14 强约束:让模型严格按参考图生成,不自由发挥
+
+
+        sb.append("- 【强约束】严格以参考图为准:人物姿态、构图、衣着、背景、灯光、镜头均按参考图复刻,不要自行改换主体、不要补全不存在的人或物、不要改写服装款式与颜色\n");
+
+
+        sb.append("- 【强约束】分镜描述只用来控制动作节奏与镜头,不控制画面的人物长相/衣服外观(由参考图决定)\n");
+
+
+        sb.append("- 【强约束】禁止输出与参考图无关的人物(如陌生人、明星脸)、禁止添加明显 logo/商标,避免触发表情/版权审查");
 
 
         return sb.toString();
