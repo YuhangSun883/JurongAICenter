@@ -5,11 +5,13 @@ import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.dto.agent.*;
 import com.jurong.aicenter.entity.AgentMessage;
 import com.jurong.aicenter.entity.AgentSession;
+import com.jurong.aicenter.entity.BillingLog;
 import com.jurong.aicenter.entity.User;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.repository.AgentMessageRepository;
 import com.jurong.aicenter.repository.AgentSessionRepository;
+import com.jurong.aicenter.repository.BillingLogRepository;
 import com.jurong.aicenter.repository.UserRepository;
 import com.jurong.aicenter.service.AgentService;
 import com.jurong.aicenter.service.MediaService;
@@ -91,6 +93,7 @@ public class AgentServiceImpl implements AgentService {
     private final AgentSessionRepository sessionRepo;
     private final AgentMessageRepository messageRepo;
     private final UserRepository userRepo;
+    private final BillingLogRepository billingLogRepo;
     private final NewApiClient newApiClient;
     private final MediaService mediaService;
 
@@ -574,22 +577,28 @@ public class AgentServiceImpl implements AgentService {
         }
 
         int creditsAdded = 100 + Math.abs(code.hashCode() % 901);
-        int remaining = addCreditsToUser(userId, creditsAdded);
+        String receiptId = "rc_" + randomId();
+        int remaining = addCreditsToUser(userId, creditsAdded, "卡密兑换入账", receiptId, "RECHARGE");
         return new RedeemCardResponse(
                 creditsAdded,
                 365,
-                "rc_" + randomId(),
+                receiptId,
                 remaining
         );
     }
 
     private void applyOrderEffect(OrderRecord order, Long userId) {
         if (order.applied.compareAndSet(false, true)) {
-            addCreditsToUser(userId, order.credits);
+            String description = order.kind == OrderKind.PLAN ? "会员套餐充值入账" : "积分包充值入账";
+            addCreditsToUser(userId, order.credits, description, order.orderId, "RECHARGE");
         }
     }
 
     private int addCreditsToUser(Long userId, int delta) {
+        return addCreditsToUser(userId, delta, "积分入账", null, "RECHARGE");
+    }
+
+    private int addCreditsToUser(Long userId, int delta, String description, String paymentId, String type) {
         User user = requireUser(userId);
         int base = user.getCredits() != null
                 ? Math.max(0, user.getCredits())
@@ -598,7 +607,22 @@ public class AgentServiceImpl implements AgentService {
         user.setCredits(total);
         user.setUpdatedAt(LocalDateTime.now());
         userRepo.updateById(user);
+        writeBillingLog(userId, null, type, Math.max(0, delta), total, description, paymentId);
         return total;
+    }
+
+    private void writeBillingLog(Long userId, Long jobId, String type, int creditsDelta, int balanceAfter,
+                                 String description, String paymentId) {
+        BillingLog log = new BillingLog();
+        log.setUserId(userId);
+        log.setJobId(jobId);
+        log.setType(type);
+        log.setCreditsDelta(creditsDelta);
+        log.setBalanceAfter(balanceAfter);
+        log.setDescription(description);
+        log.setPaymentId(paymentId);
+        log.setCreatedAt(LocalDateTime.now());
+        billingLogRepo.insert(log);
     }
 
     private User requireUser(Long userId) {

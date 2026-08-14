@@ -38,11 +38,19 @@ public class JwtTokenProvider {
     }
 
     public String generateAccessToken(Long userId, String email, String role) {
-        return generate(userId, email, role, "access", accessExpiry);
+        return generate(userId, email, role, "access", "APP", accessExpiry);
     }
 
     public String generateRefreshToken(Long userId, String email, String role) {
-        return generate(userId, email, role, "refresh", refreshExpiry);
+        return generate(userId, email, role, "refresh", "APP", refreshExpiry);
+    }
+
+    public String generateConsoleAccessToken(Long userId, String email, String role) {
+        return generate(userId, email, role, "access", "CONSOLE", accessExpiry);
+    }
+
+    public String generateConsoleRefreshToken(Long userId, String email, String role) {
+        return generate(userId, email, role, "refresh", "CONSOLE", refreshExpiry);
     }
 
     // 兼容旧调用：role 缺失时按 USER 处理
@@ -54,7 +62,7 @@ public class JwtTokenProvider {
         return generateRefreshToken(userId, email, "USER");
     }
 
-    private String generate(Long userId, String email, String role, String type, Duration expiry) {
+    private String generate(Long userId, String email, String role, String type, String channel, Duration expiry) {
         Instant now = Instant.now();
         return Jwts.builder()
             // jti() 让 JJWT 自动生成 UUID（refresh token 撤销时用作唯一标识）
@@ -64,6 +72,7 @@ public class JwtTokenProvider {
             .claim("email", email)
             .claim("role", role == null ? "USER" : role)
             .claim("type", type)
+            .claim("channel", channel == null ? "APP" : channel)
             .issuedAt(Date.from(now))
             .expiration(Date.from(now.plus(expiry)))
             .signWith(key)
@@ -87,7 +96,7 @@ public class JwtTokenProvider {
 
     // 兼容旧签名（不传 role = 视为 USER）
     private String generate(Long userId, String email, String type, Duration expiry) {
-        return generate(userId, email, "USER", type, expiry);
+        return generate(userId, email, "USER", type, "APP", expiry);
     }
 
     public Claims parse(String token) {

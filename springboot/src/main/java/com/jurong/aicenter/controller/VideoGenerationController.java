@@ -366,4 +366,15 @@ public class VideoGenerationController {
         Integer duration,
         String resolution
     ) {}
+
+    private String mapFrontendModel(String frontModel) {
+        return "doubao-seedance-2.0";
+    }
+
+    private int mapToValidDuration(int duration) {
+        if (duration <= 0) return 4;
+        if (duration <= 4) return 4;
+        if (duration <= 8) return 8;
+        return 12;
+    }
 }

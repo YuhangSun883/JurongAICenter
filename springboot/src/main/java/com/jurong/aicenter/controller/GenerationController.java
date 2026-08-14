@@ -78,6 +78,17 @@ public class GenerationController {
                     e.getMessage());
             }
         }
+        Long mediaAssetId = null;
+        MediaAsset asset = mediaAssetRepository.selectOne(
+            new LambdaQueryWrapper<MediaAsset>()
+                .eq(MediaAsset::getUserId, principal.id())
+                .eq(MediaAsset::getSourceTaskId, String.valueOf(job.getId()))
+                .orderByDesc(MediaAsset::getCreatedAt)
+                .last("LIMIT 1")
+        );
+        if (asset != null) {
+            mediaAssetId = asset.getId();
+        }
         return new JobResponse(
             job.getId(),
             job.getWorkflowId(),

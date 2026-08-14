@@ -45,6 +45,8 @@ public interface StorageService {
 
     String getPresignedUrl(String objectKey, int expiryHours);
 
+    InputStream getFileStream(String objectKey);
+
     /**
      * 2026-08-13 新增:MinIO 兜底轮询 - 按前缀列对象
      *

@@ -92,6 +92,59 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
     }
 
     @Override
+    public GenerateResponse submitImageToVideoByAssetUrl(Long userId,
+                                                         String preUploadedAssetUrl,
+                                                         String prompt,
+                                                         int duration,
+                                                         String resolution) {
+        if (userId == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "user not logged in");
+        }
+        if (preUploadedAssetUrl == null || preUploadedAssetUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "assetUrl is required");
+        }
+        if (prompt == null || prompt.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt is required");
+        }
+
+        Map<String, Object> inputs = new HashMap<>();
+        inputs.put("prompt", prompt);
+        inputs.put("assetUrl", preUploadedAssetUrl);
+        inputs.put("duration", duration);
+        inputs.put("resolution", resolution);
+
+        Job job = new Job();
+        job.setUserId(userId);
+        job.setTemplateId(TEMPLATE_IMAGE_TO_VIDEO);
+        job.setStatus("PENDING");
+        job.setInputsSnapshot(toJsonString(inputs));
+        job.setCreditsCost(0);
+        job.setCreatedAt(LocalDateTime.now());
+        jobRepository.insert(job);
+
+        try {
+            NewApiClient.SubmitResult result = newApiClient.submitVideoByAssetRef(
+                prompt, preUploadedAssetUrl, duration, resolution);
+            job.setComfyuiPromptId(result.taskId());
+            inputs.put("taskId", result.taskId());
+            job.setInputsSnapshot(toJsonString(inputs));
+            job.setStatus("RUNNING");
+            job.setStartedAt(LocalDateTime.now());
+            jobRepository.updateById(job);
+            if (result.hasUrl()) {
+                markCompleted(job, List.of(result.url()));
+            }
+            return new GenerateResponse(job.getId(), job.getStatus(), result.taskId());
+        } catch (BusinessException e) {
+            markFailed(job, e.getMessage());
+            throw e;
+        } catch (Exception e) {
+            markFailed(job, e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    @Override
     public GenerateResponse submitTextToVideo(Long userId, String prompt, VideoOptions options) {
         return submitInternal(userId, TEMPLATE_TEXT_TO_VIDEO, prompt, options, null, null);
     }
@@ -100,6 +153,29 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
     public GenerateResponse submitMultiImageToVideo(Long userId, String prompt,
                                                     List<byte[]> imageBytesList, VideoOptions options) {
         return submitInternal(userId, TEMPLATE_MULTI_IMAGE_TO_VIDEO, prompt, options, imageBytesList, null);
+    }
+
+    @Override
+    public GenerateResponse submitVideoFromVideoWithReferences(Long userId,
+                                                               List<byte[]> referenceImageBytes,
+                                                               List<String> referenceFilenames,
+                                                               List<String> referenceMimeTypes,
+                                                               String prompt,
+                                                               int duration,
+                                                               String resolution,
+                                                               String sourceVideoUrl) {
+        VideoOptions options = VideoOptions.builder()
+            .duration(duration)
+            .resolution(resolution)
+            .build();
+        String finalPrompt = prompt;
+        if (sourceVideoUrl != null && !sourceVideoUrl.isBlank()) {
+            finalPrompt = prompt + "\nSource video: " + sourceVideoUrl;
+        }
+        String firstFilename = referenceFilenames == null || referenceFilenames.isEmpty()
+            ? null : referenceFilenames.get(0);
+        return submitInternal(userId, TEMPLATE_MULTI_IMAGE_TO_VIDEO, finalPrompt, options,
+            referenceImageBytes, firstFilename);
     }
 
     /**

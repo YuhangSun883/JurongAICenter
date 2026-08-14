@@ -5,6 +5,8 @@ export interface UserInfo {
   nickname: string;
   avatar?: string;
   email?: string;
+  role?: 'USER' | 'ADMIN' | string;
+  channel?: 'APP' | 'CONSOLE' | string;
 }
 
 export interface LoginRequest {
