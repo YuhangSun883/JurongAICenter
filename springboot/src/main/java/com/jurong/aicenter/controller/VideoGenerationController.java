@@ -366,4 +366,21 @@ public class VideoGenerationController {
         Integer duration,
         String resolution
     ) {}
+
+    // 2026-08-14 补:前端 videoModel 枚举映射到后端 NewAPI model ID
+    private static String mapFrontendModel(String frontModel) {
+        if (frontModel == null || frontModel.isBlank()) return "doubao-seedance-2.0";
+        // 三档前端模型目前都映射到 doubao-seedance-2.0(NewAPI 只支持基础模型)
+        if (frontModel.startsWith("Seedance") || frontModel.contains("seedance")) {
+            return "doubao-seedance-2.0";
+        }
+        return frontModel;
+    }
+
+    // 2026-08-14 补:duration 合法性校验 + 限制范围(避免 NewAPI 拒绝)
+    private static int mapToValidDuration(int duration) {
+        if (duration <= 0) return 4;     // 默认 4 秒
+        if (duration > 60) return 60;   // 上限 60 秒
+        return duration;
+    }
 }

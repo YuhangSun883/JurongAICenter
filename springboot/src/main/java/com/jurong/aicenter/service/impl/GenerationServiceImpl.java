@@ -129,6 +129,72 @@ public class GenerationServiceImpl implements GenerationService {
             graph = applyInputs(graph, request.getInputs());
         }
 
+        // 2026-08-14 新增:把 referenceImages 注入到 workflow 的 image_ref / image 输入。
+        //   - 用户在前端点击 @引用 时,会传 base64 data URI 数组
+        //   - 这里自动找到 prompt 节点(KSampler/CheckpointLoader 等)的 image / image_ref 字段
+        //   - 把第一张图作为 image_ref(参考图)注入,其他作为 image 多参考
+        if (request.getReferenceImages() != null && !request.getReferenceImages().isEmpty()) {
+            graph = applyReferenceImages(graph, request.getReferenceImages());
+            log.info("Injected {} reference image(s) into workflow", request.getReferenceImages().size());
+        }
+
+        return graph;
+    }
+
+    /**
+     * 2026-08-14 新增:把 referenceImages 数组注入到 workflow 的 image / image_ref 输入节点。
+     * 工作流 KSampler / LoadImage / CheckpointLoader 等节点通常有 image / image_ref 字段,
+     * 我们把第一张作为 image_ref(主参考),其他作为 image(多参考)。
+     */
+    private JsonNode applyReferenceImages(JsonNode graph, java.util.List<String> referenceImages) {
+        if (graph == null || !graph.has("nodes") || referenceImages == null || referenceImages.isEmpty()) {
+            return graph;
+        }
+        com.fasterxml.jackson.databind.node.ObjectNode graphObj =
+            (com.fasterxml.jackson.databind.node.ObjectNode) graph;
+
+        com.fasterxml.jackson.databind.node.ArrayNode nodes =
+            (com.fasterxml.jackson.databind.node.ArrayNode) graphObj.get("nodes");
+
+        // 候选字段名（按优先级）
+        String[] imageFields = { "image_ref", "image" };
+
+        // 把 base64 引用图包成 ArrayNode（ComfyUI 多参考支持）
+        com.fasterxml.jackson.databind.node.ArrayNode imagesArray =
+            objectMapper.createArrayNode();
+        for (String img : referenceImages) {
+            imagesArray.add(img);
+        }
+
+        int injectedCount = 0;
+        for (int i = 0; i < nodes.size(); i++) {
+            com.fasterxml.jackson.databind.node.ObjectNode node =
+                (com.fasterxml.jackson.databind.node.ObjectNode) nodes.get(i);
+            com.fasterxml.jackson.databind.node.ObjectNode inputs =
+                node.has("inputs") && node.get("inputs") instanceof com.fasterxml.jackson.databind.node.ObjectNode
+                    ? (com.fasterxml.jackson.databind.node.ObjectNode) node.get("inputs")
+                    : null;
+            if (inputs == null) continue;
+
+            // 优先 image_ref,其次 image
+            if (inputs.has("image_ref") && !inputs.has("image")) {
+                inputs.set("image", imagesArray);
+                log.info("Node {} ({}): set image = [{} ref images]", node.path("id").asText(), node.path("type").asText(), referenceImages.size());
+                injectedCount++;
+                break; // 一次只注入第一个匹配的节点
+            } else if (inputs.has("image") && inputs.get("image") instanceof com.fasterxml.jackson.databind.node.ArrayNode) {
+                // 如果 image 字段已存在且是数组,合并
+                com.fasterxml.jackson.databind.node.ArrayNode existing =
+                    (com.fasterxml.jackson.databind.node.ArrayNode) inputs.get("image");
+                for (String img : referenceImages) existing.add(img);
+                log.info("Node {} ({}): merged {} ref images into existing image array", node.path("id").asText(), node.path("type").asText(), referenceImages.size());
+                injectedCount++;
+                break;
+            }
+        }
+        if (injectedCount == 0) {
+            log.warn("No suitable node found to inject reference images (looked for image_ref/image fields)");
+        }
         return graph;
     }
 

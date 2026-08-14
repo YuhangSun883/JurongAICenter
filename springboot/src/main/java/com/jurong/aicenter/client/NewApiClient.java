@@ -6,6 +6,8 @@ import com.jurong.aicenter.dto.video.VideoOptions;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.*;
@@ -20,6 +22,8 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import java.io.IOException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -387,6 +391,144 @@ public class NewApiClient {
     }
 
     /**
+     * 2026-08-14 改造:支持多模态(图片)
+     *   - userContent 可以是 String(纯文本,旧用法)或 List(Map<String,Object>)(OpenAI 多模态格式)
+     *   - 多模态格式:content = [{type:"text", text:"..."}, {type:"image_url", image_url:{url:"..."}}, ...]
+     *   - 由调用方负责拼多模态 content 数组(本方法不感知图片,只负责转发)
+     *
+     * <p>协议:与 chatCompletion 相同,body 多一个 "stream": true;
+     *      响应变成 SSE 格式,每行 "data: {...}" 是一个增量,直到 "data: [DONE]" 结束。
+     *
+     * @param onToken 每收到一段 token 时调用(可能 1-3 个字)
+     */
+    public void chatCompletionStream(
+            String model, String systemPrompt, Object userContent,
+            int maxTokens, java.util.function.Consumer<String> onToken) throws IOException {
+
+        // 1) 构造 messages
+        //   - system content 仍是 String
+        //   - user content 由调用方传,可以是 String 或 List(Map)
+        List<Map<String, Object>> messages = new ArrayList<>(2);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        // 2026-08-14:user content 改 Object(Map.of 不支持 null,改用 HashMap)
+        Map<String, Object> userMsg = new HashMap<>();
+        userMsg.put("role", "user");
+        userMsg.put("content", userContent == null ? "" : userContent);
+        messages.add(userMsg);
+
+        // 2) body 关键差异:stream: true
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("max_tokens", maxTokens);
+        body.put("temperature", 0.7);
+        body.put("stream", true);
+
+        // 3) JDK HttpClient 发请求(项目里 downloadAsDataUri 已有先例 line 955)
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .build();
+
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/v1/chat/completions"))
+                .header("Authorization", "Bearer " + token)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                        objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(180))
+                .build();
+
+        try {
+            java.net.http.HttpResponse<java.io.InputStream> resp = client.send(
+                    request, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+
+            // 4) 非 200 直接抛
+            if (resp.statusCode() != 200) {
+                String errBody = new String(resp.body().readAllBytes(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                log.error("NewAPI stream failed: {} {}", resp.statusCode(), errBody);
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "LLM 流式调用失败:" + resp.statusCode());
+            }
+
+            // 5) 按行解析 SSE
+            // 2026-08-14 临时调试:把 NewAPI 原始 SSE 响应 dump 到日志(前 20 行)
+            StringBuilder rawDump = new StringBuilder();
+            int dumpLineCount = 0;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(resp.body(),
+                            java.nio.charset.StandardCharsets.UTF_8))) {
+                String line;  // 2026-08-14 修复:漏声明导致编译错误
+                int chunkIdx = 0;
+                while ((line = reader.readLine()) != null) {
+                    if (dumpLineCount < 20) {
+                        rawDump.append(line).append("\n");
+                        dumpLineCount++;
+                    }
+                    if (!line.startsWith("data: ")) continue;
+                    String payload = line.substring(6).trim();
+                    if (payload.isEmpty() || "[DONE]".equals(payload)) continue;
+
+                    try {
+                        JsonNode node = objectMapper.readTree(payload);
+                        JsonNode delta = node.path("choices").path(0).path("delta");
+                        String token = delta.path("content").asText("");
+                        if (token.isEmpty()) continue;
+
+                        // 2026-08-14 兜底:某些 NewAPI 中转的 bug 会把
+                        //   "data: " 前缀塞进 delta.content 字段(应该只在 SSE 行上,不在 content 里)
+                        //   实际表现:前端看到 "data: 好 data: 的..." 这种串字符
+                        //   而存进数据库的 LLM 真实输出是干净的(刷新页面后看到的是正常故事)
+                        //   说明每个 chunk 的 content 都是 "data: <text>" 形式
+                        //   - 先 strip 开头的 "data: "(最常见)
+                        //   - 再 strip 末尾残留的(防御)
+                        //   注:极端情况 LLM 真要输出 "data: " 字面量会被误剥,但概率极低,可接受
+                        if (token.startsWith("data: ")) {
+                            token = token.substring("data: ".length());
+                        } else if (token.startsWith("data:")) {
+                            // String.trimStart() 是 Java 21+,JDK 17 不可用
+                            // 改用 replaceFirst 去前导空格
+                            token = token.substring("data:".length()).replaceFirst("^\\s+", "");
+                        }
+                        if (token.endsWith("data: ")) {
+                            token = token.substring(0, token.length() - "data: ".length());
+                        }
+                        if (token.endsWith("data:")) {
+                            token = token.substring(0, token.length() - "data:".length());
+                        }
+
+                        if (token.isEmpty()) continue;
+
+                        // 调试:头 3 个 chunk 打 INFO log,确认 NewAPI 实际返回格式
+                        if (chunkIdx < 3) {
+                            log.info("[NewAPI-stream] chunk#{} raw='{}' cleaned='{}'",
+                                    chunkIdx, line, token);
+                            chunkIdx++;
+                        }
+
+                        onToken.accept(token);
+                    } catch (Exception e) {
+                        // 单 chunk 解码失败不致命,继续读
+                        log.debug("SSE chunk parse failed: {}", e.getMessage());
+                    }
+                }
+            }
+            // 2026-08-14 dump NewAPI 原始 SSE 响应(前 20 行)
+            log.info("=== NewAPI raw SSE dump (first {} lines) ===\n{}",
+                    dumpLineCount, rawDump);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("NewAPI chatCompletionStream failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    /**
      * 多模态 chat completion（支持图片理解）。
      *
      * <p>调用 /v1/chat/completions，传 user message 时使用 OpenAI 多模态格式：
@@ -520,99 +662,17 @@ public class NewApiClient {
     public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
                               String imageMime, int duration, String resolution,
                               java.util.List<String> additionalImageUrls) {
-        // 走 submitVideoMultiImage 方法(直接构造 multipart + 附加 URL)
-        return submitVideoMultiImage(prompt, imageBytes, imageFilename, imageMime,
-            duration, resolution, additionalImageUrls).taskId();
-    }
-
-    /**
-     * 2026-08-11 新增:多图版 submitVideo 内部实现。
-     * 主图走 multipart input_reference,附加 URL 通过 image_urls JSON 字段附加。
-     */
-    private SubmitResult submitVideoMultiImage(String prompt, byte[] imageBytes, String imageFilename,
-                              String imageMime, int duration, String resolution,
-                              java.util.List<String> additionalImageUrls) {
-        try {
-            MultipartBodyBuilder builder = new MultipartBodyBuilder();
-            builder.part("model", "doubao-seedance-2.0");
-            builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(duration));
-            // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
-            //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
-            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
-
-            // 主图(如果有 bytes)走 multipart input_reference
-            if (imageBytes != null && imageBytes.length > 0) {
-                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
-                final String mime = imageMime != null ? imageMime : "image/png";
-                // 2026-08-13 FIX: 同步发 image/input_reference/image_url 3 个字段名(模仿 Python api_client.submit_video)
-                // 原因:aicoming-proxy 8/13 改了期望字段名,只发 input_reference 会被忽略
-                ByteArrayResource imgResource1 = new ByteArrayResource(imageBytes) {
-                    @Override public String getFilename() { return fname; }
-                };
-                ByteArrayResource imgResource2 = new ByteArrayResource(imageBytes) {
-                    @Override public String getFilename() { return fname; }
-                };
-                ByteArrayResource imgResource3 = new ByteArrayResource(imageBytes) {
-                    @Override public String getFilename() { return fname; }
-                };
-                builder.part("image", imgResource1, MediaType.parseMediaType(mime));
-                builder.part("input_reference", imgResource2, MediaType.parseMediaType(mime));
-                builder.part("image_url", imgResource3, MediaType.parseMediaType(mime));
-            }
-
-            // 附加 URL 通过 image_urls JSON 字段附加(2026-08-11 新增多图)
-            if (additionalImageUrls != null && !additionalImageUrls.isEmpty()) {
-                try {
-                    String imageUrlsJson = MAPPER.writeValueAsString(additionalImageUrls);
-                    builder.part("image_urls", imageUrlsJson);
-                } catch (Exception e) {
-                    log.warn("Failed to serialize image_urls: {}", e.getMessage());
-                }
-            }
-
-            JsonNode response = webClientBuilder.baseUrl(videoBaseUrl).build()
-                .post()
-                .uri("/v1/videos")
-                .header("Authorization", "Bearer " + token)
-                .contentType(MediaType.MULTIPART_FORM_DATA)
-                .body(BodyInserters.fromMultipartData(builder.build()))
-                .retrieve()
-                .bodyToMono(JsonNode.class)
-                .timeout(Duration.ofSeconds(600))
-                .onErrorMap(WebClientResponseException.class, e -> {
-                    String body = e.getResponseBodyAsString();
-                    log.error("NewAPI /v1/videos (multi) failed: {} body={}", e.getStatusCode(), body);
-                    String friendly = translateNewApiError(body);
-                    ErrorCode code = (e.getStatusCode().is4xxClientError())
-                        ? ErrorCode.NEWAPI_REQUEST_INVALID
-                        : ErrorCode.NEWAPI_UNREACHABLE;
-                    return new BusinessException(code,
-                        "NewAPI /v1/videos " + e.getStatusCode() + ": " + friendly);
-                })
-                .block();
-
-            if (response == null) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                    "NewAPI /v1/videos (multi) 返回空响应");
-            }
-
-            String taskId = response.path("task_id").asText(response.path("id").asText(""));
-            if (taskId.isEmpty()) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                    "NewAPI /v1/videos (multi) 响应缺 id/task_id: " + response);
-            }
-            log.info("NewAPI /v1/videos (multi) task submitted: {} (primary={}B, additionalUrls={})",
-                taskId,
-                imageBytes != null ? imageBytes.length : 0,
-                additionalImageUrls);
-            return new SubmitResult(taskId, null);
-        } catch (BusinessException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                "NewAPI /v1/videos (multi) 调用失败: " + e.getMessage());
+        // 2026-08-14 简化:多图走通用 List<byte[]> 入口;这里只把主图带上。
+        java.util.List<byte[]> allImages = new java.util.ArrayList<>();
+        if (imageBytes != null && imageBytes.length > 0) {
+            allImages.add(imageBytes);
         }
+        VideoOptions opts = VideoOptions.builder()
+            .duration(duration)
+            .resolution(resolution)
+            .build();
+        SubmitResult r = submitVideo(prompt, allImages, opts);
+        return r.taskId();
     }
 
     /**
@@ -653,7 +713,7 @@ public class NewApiClient {
      * @param options       视频生成参数（duration / resolution / ratio / audio / watermark / seed / model）
      * @return              NewAPI 返回的 task_id
      */
-    public String submitVideo(String prompt, List<byte[]> imageFiles, VideoOptions options) {
+    public SubmitResult submitVideo(String prompt, List<byte[]> imageFiles, VideoOptions options) {
         if (options == null) {
             options = VideoOptions.builder().build();
         }
@@ -664,19 +724,21 @@ public class NewApiClient {
             // aicoming 只接受小写 resolution（480p/720p/1080p/4k）
             String useResolution = (options.getResolution() != null && !options.getResolution().isBlank())
                 ? options.getResolution().toLowerCase() : "480p";
+            int useDuration = options.getDuration();
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(duration));
+            builder.part("duration", String.valueOf(useDuration));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
-            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
+            builder.part("resolution", useResolution);
             // ratio / watermark 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐏忓繘姊洪崨濠庢畷濠电偛锕ら锝囨嫚濞村顫嶅┑鈽嗗灦閺€閬嶅棘閳ь剟姊绘担鍛婂暈婵炶绠撳畷鎴﹀礋椤掍礁寮块梺闈涚箞閸婃牠鍩涢幋鐐电闁煎ジ顤傞崵娆愵殽閻愭惌娈滈柡宀€鍠栭獮鏍ㄦ媴閾忚姣囬梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁煕閻樺疇澹樻い顓炴喘楠炲洭顢橀悩娈垮晭闂備礁鎲￠悷銉┧囨潏銊︽珷妞ゅ繐鐗婇崑鍌炴煏閸繍妲归柣鎾卞劦閺岋繝宕堕埡浣风捕婵炲瓨绮嶆竟鍡欐閹炬剚鍚嬮柛鈩冪懃閳峰矂姊洪崫鍕効缂佺粯绻傞悾鐑藉醇閺囩倣銊╂煏婢诡垰鍊诲Λ顖炴⒒閸屾瑨鍏岀紒顕呭灦楠炴劗鎷犵憗浣告惈椤粓鍩€椤掍椒绻嗛柣銏㈩焾缁€瀣亜閺嶃劍鐨戦柣銈傚亾闂傚倷绀侀幉锟犲箰閻戣姤鍤勯柟顖滃閹冲瞼绱撻崒姘偓鎼佸磹妞嬪孩濯奸柡灞诲劚绾惧鏌熼崜褏甯涢柣鎾存礋閺岀喐瀵肩€涙ɑ閿梺鍝勵儑閸犳牠寮婚敐澶婄閻庨潧鎲￠崚娑㈡⒑閸濆嫭婀扮紒瀣灴閳ワ箓濡搁埡浣哄姦濡炪倖甯掗崐濠氭儗閸℃褰掓晲閸偅缍堝┑鐐叉噽婵炩偓闁哄瞼鍠撶槐鎺楀閻樺磭浜堕梻浣虹帛閹稿鎮烽敃鍌毼﹂柛鏇ㄥ灠缁秹鏌嶈閸撶喎顕ｉ崨濠勭瘈婵﹩鍘煎▓宀勬⒑缁夊棗瀚峰▓鏇㈡煟閹惧鎳勯柕鍥у瀵噣宕掑☉娆戝涧闂備胶鎳撻崯鍨洪銏犺摕闁绘柨鍚嬮幆鐐淬亜閹扳晛鈧鎮￠埀顒勬⒒娴ｅ摜锛嶇紒顕呭灦楠炴垿宕堕鍌氱ウ闂佸綊鍋婇崢浠嬪磿閻旀悶浜滈柡鍐ㄥ€婚幗鍌涗繆椤愩垹顏╅柍瑙勫灴閹晠宕归锝嗙槑濠电姵顔栭崰姘跺礂濮椻偓婵℃挳宕掗悙鏉戠檮婵犮垹鍘滈弲顏嗙礊娴ｅ摜鏆﹂柕濞炬櫅缁狙囨煙鐎电顎撶紒閬嶄憾濮婄粯鎷呴崨濠傛殘缂備礁顑嗛崹鍧楀箖濞差亜惟闁宠桨鑳堕弻褍鈹戦悩缁樻锭妞ゆ垵妫濋幃陇绠涘☉姘絼闂佹悶鍎滅仦钘夊闂備線鈧偛鑻晶顖涚箾閼碱剙鏋涙鐐茬箻楠炲鏁傞挊澶夌盎闂備胶顭堢换妤呭磻閹版澘鍌ㄦい蹇撶墛閳锋垿鏌涢幘鏉戠祷濞存粍绻勭槐鎺旀嫚閼碱儷銏ゅ础闁秵鐓曟繝闈涘閸斻倗鐥幆褋鍋㈤柡宀嬬到閳诲酣骞囬钘夋珣婵犵數鍋犻婊呯不閹捐绠栭柨鐔哄Т閸楁娊鏌ｉ弮鍌滅瘈缂併劏顕ч—鍐Χ閸℃ê鏆楅梺鍝ュТ闁帮綁骞冨鈧俊鐑藉煛閸屾粌骞愰梺璇插嚱缂嶅棝宕滃▎鎾冲嚑闁瑰濮风壕鑲╃磽娴ｈ鐒芥繛鎻掝嚟閳ь剝顫夊ú鏍Χ閹间礁绠栭柕蹇嬪€曠粻褰掓煟閹邦厼顎滄俊鍓ь焾閳规垿鎮╅幇浣告櫛闂佸摜濮甸悧鐘诲极閸愵喖惟闁靛鍨洪悗娲⒑閹稿海绠撴繛灞傚€濆畷鐟扳攽閸モ晝顔曢梺绯曞墲閿氶柣蹇ュ閳ь剝顫夊ú鏍囬悽绋胯摕闁哄洨鍠撶粻鍓ф喐瀹ュ鍤愭い鏍仜閺嬩線鏌ｉ幘宕囧哺闁衡偓娴犲鐓ユ繛鎴灻鈺伱瑰鍐﹀仮闁哄本绋掔换娑㈠垂椤旂懓浜炬繝闈涙閺嗭箓鏌曡箛瀣偓鏍磻閸屾侗娈介柣鎰版涧閺嬫垶淇婇悙鎵煓闁靛棔绀侀～婊堝焵椤掍焦鍙忛柍褜鍓熼弻鏇＄疀閺囩倫銉╂煏閸剛鐣垫慨濠勭帛閹峰懏绗熼娑欐殲闂備浇顫夊鎸庣閻愰潧鍨濆┑鐘宠壘缁狅綁鏌ｅΟ鍏兼毄闁绘帒銈搁弻锝嗘償椤栨粎校闂佺顑勯悞锔剧矉瀹ュ拋鐓ラ柛顐ゅ枔閸樻悂鎮楅獮鍨姎闁哥噥鍋呮穱濠冪鐎ｎ偆鍘介梺闈涱煭缁犳垿鎮橀敃鍌涚厪闁搞儜鍐句純濡ょ姷鍋為…鍥焵椤掍胶鈯曢懣褍霉閻橆喖鐏╅柍瑙勫灴椤㈡瑧娑甸柨瀣毎婵犵绱曢崑妯煎垝濞嗘挻鍋樻い鏇楀亾妤犵偛娲、姗€鎮㈠畡鏉课ら梻鍌欑閸熷潡鎮橀崼銉ョ柧婵犲﹤鎳夐崑鎾愁潩椤愩倗鐓撳┑顔硷功缁垶骞忛崨顔剧懝妞ゆ牗绋掗弳鐐寸節閻㈤潧浠滈柟鍐茬箰鐓ら柣鏃囧亹瀹撲線鏌熼幍顔碱暭闁搞倖甯￠弻鏇㈠醇濠靛洤绐涢梺缁樺笒濞硷繝骞冨Δ鍛祦闁割煈鍠栨慨搴☆渻閵堝繒绱伴柛妤€鍟块悾鐑藉箛閻楀牏鍙嗛柣搴祷閸斿鑺辨繝姘拺闁荤喓澧楅幆鍫㈢磼婢跺﹦鍩ｉ挊婵嬫煥閺冨牊鏆滈柛瀣尭閳绘捇宕归鐣屼邯闂備浇顕х换鎴犳崲閸儱鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜鹃梺缁樻惈缁绘繈寮诲☉銏犵労闁告劗鍋撻悾鍏肩箾鐎电袥闁哄懏鐩崺鐐哄箣閿旇棄鈧兘鏌ｉ幇顒€甯ㄩ柛瀣尵閳ь剨缍嗛崜姘暦閸欏绡€闂傚牊绋掗ˉ鐘绘煛閸☆參妾柕鍥у楠炲洭濡搁敃鈧妯衡攽閻愬弶鈻曞ù婊冪埣瀵偊宕掗悙瀵稿幈濠电偞鍨靛畷顒勬倶閻樻剚娈?Python api_client.py
 
-            if (imageBytes != null && imageBytes.length > 0) {
-                // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨鑺ャ亜閺冨洤袚閻忓骏闄勭换婵嬪焵椤掍胶鐟归柍褜鍓欓～蹇涙惞閸︻厾锛滃┑鈽嗗灠濞存碍绂嶅鍡欎航濠电姷鏁告慨鏉懨洪妶鍥ь棜闁秆勵殘閸欐捇鏌涢妷锝呭闁愁垱娲熼弻锝夊箻鐎靛憡鍒涢梺璇″枟椤ㄥ﹪寮幇鏉跨＜婵炴垶鐟цぐ鍥╃磽閸屾瑧鍔嶉柛鏃€鐗曡灋闁告劦鍠栭拑鐔兼煃閵夈儳锛嶉柡鍡楁閺屽秷顧侀柛鎾跺枎閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸炬慨瀵哥矈閿曞倹鈷戠痪顓炴噺瑜把呯磼閻樺啿鐏╃紒顔款嚙閳藉鈻庡鍕泿闂備礁婀遍崕銈夊垂閻㈢鐒垫い鎺嗗亾闁硅姤绮撳顐︻敋閳ь剙鐣风粙璇炬梹鎷呴崣澶婎伜婵犵數鍋犻幓顏嗗緤娴犲绠熼柨鐔哄Т缁犵喓绱掔€ｎ亞姘ㄩ柡鈧懞銉ｄ簻闁哄啫娲よ缂傚倸绉甸崹鍧楀箺閸洘鍊烽悗闈涙憸閻﹀牓姊婚崒姘卞濞撴碍顨婂畷鏇＄疀濞戞瑧鍙冮梺鍛婂姦娴滄粓寮搁幋鐘电＜缂備焦顭囧ú瀛橆殽閻愬樊鍎忛柍璇叉唉缁犳盯寮村顓炰簼闂傚倸鍊烽懗鍓佸垝椤栨粍鏆滄俊銈傚亾妞ゎ亜鍟粋鎺斺偓锝庝海閹芥洖鈹戦悙鏉戠仧闁搞劌婀辩划璇测槈閵忊€斥偓鍫曟煟閹邦垱纭剧悮姘舵⒑闂堚晝鎮奸柡鍜佸亞濡叉劙骞掑Δ浣镐汗闂佸憡鍔曞鍓佹嫚閻愭祴鏀芥い鏃傘€嬮崝鐔虹磼椤曞懎鐏︽鐐茬箻瀹曘劑寮堕幋婵堢崺濠电姷鏁告慨鎾疮椤愶箑绀堥柛顭戝亞缁♀偓缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簻椤忣參鏌＄仦鏂よ含闁轰焦鍔欏畷銊╊敍濞戞瑯鍟庨梻鍌欑閹碱偄煤閵忋倕鍨傛繛宸簻绾惧鏌曟繛褍鎳愰敍婊堟煟鎼搭垳绉甸柛妯恒偢瀹曟繈鎮介崨濠勫幍闂佸吋浜介崕鑼矆鐎ｎ偅鍙忓┑鐘插暞閵囨繃淇婇銏犳殭闁宠棄顦板蹇涘煛娴ｆ劅顏堟⒒閸屾瑨鍏屾い顓炵墢閳ь剙鐏氱敮鈥崇暦娴兼潙鍐€鐟滃秶绮婇锔解拻濞达絿顭堥ˉ蹇涙煕鐎ｎ亝顥㈢€规洑鍗抽獮姗€宕滄担椋庣憹濠德板€х徊浠嬪疮椤栫偞鍋傞柡鍥ュ灪閻撳啴鏌嶆潪鎵槮妤犵偞蓱閵囧嫯绠涢幘璺侯杸闂佺锕ら悥濂稿蓟瀹ュ浼犻柛鏇ㄥ墮濞呫倝姊虹紒妯诲鞍婵炲弶顭囬幑銏犫槈閵忕姴鑰垮┑鈽嗗灠閹碱偊锝炴惔锝囩＝濞达絽鎼牎濡炪値鍘煎ú銊ノｉ幇鏉跨闁规儳顕粔鍫曟⒑闂堟侗鐓紒鐘冲灴濡嫬顓兼径瀣ф嫼闂佽崵鍠愬妯何ｆ繝姘厵闁惧浚鍋撻懓鎸庮殽閻愭彃鏆ｆ鐐叉椤︽挳鏌￠崱妤侇棦闁哄苯绉烽¨渚€鏌涢幘瀵搞€掓俊鍙夊姇閳诲酣骞樼€电濮搁柣搴＄畭閸庡崬螞瀹€鍕闁惧繐婀辩壕钘夈€掑顒佹悙闁诲繆鍓濈换娑㈠矗婢规繍浜崺銏狀吋婢跺﹤鑰垮┑鐐村灦閻熝囧储閽樺鏀介幒鎶藉磹閹剧粯鍤勯柛顐ｆ礃閸庢鈧厜鍋撻柛鏇ㄥ墰閸橀亶姊洪崷顓炲妺闁圭鎽滅划顓㈠箳濡や胶鍘撻柣鐘叉处閻擄繝宕ｉ崟顒夋闁绘劕寮堕崰妯汇亜閵忊槅娈滅€规洘甯掗…銊╁川椤撶姰鍋婇梻鍌氬€搁崐宄懊归崶顒夋晪鐟滄柨鐣峰▎鎾村仼鐎光偓閳ь剛绮堟繝鍥ㄧ厱闁斥晛鍟伴埥澶岀磼閳ь剟宕奸悢铏诡啎闂佺懓鐡ㄩ悷銉╂倶椤忓牊鐓曢幖绮规闊剟鏌＄仦鍓ф创妞ゃ垺娲熼幃鈺呭箵閹烘埈娼ラ梻鍌欑劍婵炲﹪寮ㄩ柆宥呭瀭闁秆勵殔閽冪喐绻涢幋鐐冩艾危閸喐鍙忔俊銈傚亾闁绘妫欑€靛ジ骞囬鐘电槇濠电偛鐗嗛悘婵嗏枍濞嗘垹纾奸柣妯哄暱閻忓瓨绻濋埀顒佹媴缁洘鏂€闂佺粯顭堥婊冾啅閵夆晜鍊垫慨妯煎帶濞呭秹鏌熼姘辩劯妤犵偞甯掕灃濞达絽鎼獮宥嗕繆閻愵亜鈧牕煤閺嶎灛娑樷槈濮橆剙袣闂侀€炲苯澧摶鏍煟濮椻偓濞佳勭濠婂嫨浜滈柟瀛樼箥濡偓閻庢鍣崑濠傜暦閹烘埈鐓ラ柛鏇ㄥ亝閻庮參姊绘担鐟邦嚋缂佽鍊歌灋婵°倕鎷嬮弫鍌滄喐閻楀牆绗氶柍閿嬪浮閺屾稓浠﹂崜褎鍣梺绋跨箰閺堫剟濡甸崟顖氼潊闁绘瑥鎳撻崥顐︽倵鐟欏嫭绀冮柛銊ユ健閻涱噣宕堕鈧痪褔鎮规笟顖滃帨缂佽精椴哥换婵嬫偨闂堟稐娌梺鍓茬厛閸ㄨ泛鐣疯ぐ鎺戞嵍妞ゆ挾濮烽悞鍏肩節閵忥絾纭炬い鎴濇瀹曪綀绠涢弮鈧崣蹇斾繆閵堝倸浜惧┑鈽嗗亝椤ㄥ棝寮查懜鐢电瘈婵﹩鍘鹃崢浠嬫⒑閸濆嫬鈧湱鈧瑳鍥佸鎮╃紒妯煎幍闂佸憡鐟ラˇ浼村磹閹邦収娈介柣鎰▕閸庢棃鏌熼鐣屾噰鐎殿喖鐖奸獮瀣攽閸涱垳顦伴梻鍌氬€搁崐椋庢濮橆剦鐒界憸鏃堝箖瑜斿畷鍗灻归弶鎸庡枠妞ゃ垺鐩幃娆撳级閹存粎妫?
-                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
-                final String mime = imageMime != null ? imageMime : "image/png";
+            if (imageFiles != null && !imageFiles.isEmpty()
+                && imageFiles.get(0) != null && imageFiles.get(0).length > 0) {
+                byte[] imageBytes = imageFiles.get(0);
+                final String fname = "canvas_input.png";
+                final String mime = "image/png";
                 builder.part("input_reference",
                     new ByteArrayResource(imageBytes) {
                         @Override
@@ -739,9 +801,9 @@ public class NewApiClient {
             }
             log.info("NewAPI video task submitted: {} (image={}, size={}B, duration={}s, resolution={})",
                 taskId,
-                imageBytes != null ? imageFilename : "placeholder",
-                imageBytes != null ? imageBytes.length : 0,
-                duration, resolution);
+                (imageFiles != null && !imageFiles.isEmpty()) ? "ref_0" : "placeholder",
+                (imageFiles != null && !imageFiles.isEmpty()) ? imageFiles.get(0).length : 0,
+                useDuration, useResolution);
             // 2026-08-11 修复:submit 响应里常常已含 video url(同步返回 + task_id 同一响应)。
             // 之前不提取就丢了,只能等 poll 30 秒后取到 → 如果 poll 出现 400 索引延迟就会被误判 FAILED。
             // 现在提取后,即使后续 poll 失败,job 也已保存 url,前端能直接播放。
@@ -777,7 +839,7 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
         }
         log.info("[VIDEO-T2V] 文生视频: promptLen={}, options={}", prompt.length(), options);
-        return submitVideo(prompt, null, options);
+        return submitVideo(prompt, null, options).taskId();
     }
 
     /**
@@ -807,7 +869,7 @@ public class NewApiClient {
         }
         log.info("[VIDEO-MI2V] 多图生视频: promptLen={}, images={}, options={}",
             prompt.length(), valid.size(), options);
-        return submitVideo(prompt, valid, options);
+        return submitVideo(prompt, valid, options).taskId();
     }
 
     /**
@@ -1012,6 +1074,51 @@ public class NewApiClient {
             log.warn("[NewAPI] 清洗后的 URL 格式异常: 原始={}, 清洗后={}", url, cleaned);
         }
         return cleaned;
+    }
+
+    /**
+     * 2026-08-14 补回:下载图片 URL 并转为 base64 data URI,
+     * 应对 NewAPI 中转服务器无法访问公网 URL 的情况(chatCompletionWithImages 用)。
+     *
+     * <p>如果 URL 已经是 data URI,直接返回;如果是 http(s),下载后 base64 编码。</p>
+     *
+     * @param url 图片 URL(可以是 data URI 或公网 URL)
+     * @return data URI 形式的字符串(若失败则返回原 URL 让调用方 fallback)
+     */
+    // 2026-08-14:从 private 改 public,让 AgentServiceImpl.sendStream 复用(支持流式多模态)
+    public String downloadAsDataUri(String url) {
+        if (url == null || url.isBlank()) return url;
+        if (url.startsWith("data:")) return url;  // 已经是 data URI,直接返回
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return url;  // 未知 scheme,原样返回(让调用方处理)
+        }
+        try {
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .build();
+            java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(url))
+                .timeout(Duration.ofSeconds(30))
+                .header(HttpHeaders.USER_AGENT, "JurongAICenter/1.0")
+                .GET()
+                .build();
+            java.net.http.HttpResponse<byte[]> resp = client.send(req,
+                java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300 || resp.body() == null) {
+                log.warn("[downloadAsDataUri] 下载失败: status={}, url={}", resp.statusCode(), url);
+                return url;
+            }
+            String contentType = resp.headers().firstValue("Content-Type").orElse("image/png");
+            String b64 = Base64.getEncoder().encodeToString(resp.body());
+            String dataUri = "data:" + contentType + ";base64," + b64;
+            log.debug("[downloadAsDataUri] 下载成功: url={}, bytes={}, mime={}",
+                url, resp.body().length, contentType);
+            return dataUri;
+        } catch (Exception e) {
+            log.warn("[downloadAsDataUri] 异常: url={}, err={}", url, e.getMessage());
+            return url;  // 失败时原样返回,让调用方 fallback
+        }
     }
     /**
      * 快速健康检查 —— 检测 NewAPI 服务是否可用

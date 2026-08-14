@@ -103,6 +103,55 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
     }
 
     /**
+     * 2026-08-14 补回接口声明的抽象方法。
+     * 当前最小实现:仅委托 submitImageToVideo(参数拼装:assetUrl 不直接传,走的是字节路径,
+     * 这里只让接口满足编译,业务上该方法应被上层业务方法用其他方式实现)。
+     */
+    @Override
+    public GenerateResponse submitImageToVideoByAssetUrl(Long userId,
+                                                         String preUploadedAssetUrl,
+                                                         String prompt,
+                                                         int duration,
+                                                         String resolution) {
+        log.warn("[VIDEO-ASSET-URL] submitImageToVideoByAssetUrl 当前未完全实现,fallback 到 NewAPI asset 路径: "
+            + "userId={}, assetUrl={}, duration={}, resolution={}",
+            userId, preUploadedAssetUrl, duration, resolution);
+        // 2026-08-14 简化:占位实现 - 抛 UnsupportedOperationException,避免静默错误
+        throw new UnsupportedOperationException(
+            "submitImageToVideoByAssetUrl 暂未实现,请改用 submitImageToVideo 上传字节版");
+    }
+
+    /**
+     * 2026-08-14 新增:视频生成视频(多图参考)入口。
+     * 当前最小实现:把多张参考图当成多图生视频走 NewAPI,sourceVideoUrl 仅记录到 inputs。
+     */
+    @Override
+    public GenerateResponse submitVideoFromVideoWithReferences(Long userId,
+                                                              List<byte[]> referenceImageBytes,
+                                                              List<String> referenceFilenames,
+                                                              List<String> referenceMimeTypes,
+                                                              String prompt,
+                                                              int duration,
+                                                              String resolution,
+                                                              String sourceVideoUrl) {
+        if (referenceImageBytes == null || referenceImageBytes.isEmpty()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "参考图字节列表为空");
+        }
+        VideoOptions options = VideoOptions.builder()
+            .duration(duration)
+            .resolution(resolution == null || resolution.isBlank() ? "480p" : resolution)
+            .build();
+        // 把 sourceVideoUrl 注入到 prompt 末尾,让 NewAPI 知道原视频
+        String fullPrompt = (sourceVideoUrl == null || sourceVideoUrl.isBlank())
+            ? prompt
+            : (prompt + "\n\n[source video: " + sourceVideoUrl + "]");
+        // 复用多图生视频路径(同 submitMultiImageToVideo)
+        return submitInternal(userId, TEMPLATE_MULTI_IMAGE_TO_VIDEO, fullPrompt, options,
+            referenceImageBytes,
+            referenceFilenames != null && !referenceFilenames.isEmpty() ? referenceFilenames.get(0) : null);
+    }
+
+    /**
      * 统一的提交逻辑：建 job → 调 NewAPI 提交 → 标 RUNNING。
      *
      * @param userId          当前用户 ID

@@ -1,5 +1,6 @@
 // 真实后端实现 —— 后端给接口后，按此改 URL 即可
 import { request } from '@/lib/http';
+import { getAccessToken } from '@/lib/auth-store';
 import type {
   AgentCreateSessionRequest,
   AgentCreateSessionResponse,
@@ -63,9 +64,18 @@ export async function send(req: AgentSendRequest): Promise<AgentSendResponse> {
 
 /** 发送消息（流式版：返回 ReadableStream，前端逐块解析） */
 export async function sendStream(req: AgentSendRequest): Promise<Response> {
-  return fetch('/api/agent/send/stream', {
+  // 2026-08-14 修复:必须带 Authorization,否则后端返回 401
+  // 不能走 request(),因为 SSE 响应不能被消费 body;这里自己拼 fetch + token
+  const token = getAccessToken();
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  // 2026-08-14 关键修复:Next.js dev server 的 rewrites 会 buffer 整个 SSE 响应,
+  //   导致前端 reader 一直阻塞("正在思考")。必须绕过 dev server,直连后端 8080。
+  //   生产环境用 nginx 不会有这个问题,但保险起见也走绝对 URL。
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8080';
+  return fetch(`${apiBase}/api/agent/send/stream`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(req),
   });
 }
