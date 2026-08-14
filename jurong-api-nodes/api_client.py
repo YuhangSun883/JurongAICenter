@@ -440,15 +440,22 @@ def poll_video(task_id: str) -> dict:
 
 
 def wait_for_video(task_id: str, timeout_sec: int = 600,
-                   poll_interval: int = 8) -> dict:
+                   poll_interval: int = 10,
+                   max_retry_after_completed: int = 3) -> dict:
     """轮询直到视频任务完成或超时。
     完成的返回：{"status": "completed", "metadata": {"url": "..."}}
 
     2026-08-07 修复:同 wait_for_image_task,处理 404 sentinel 和缓存最终响应。
+    2026-08-11 升级:加假完成检测(aicoming 偶发 status=completed 但响应里没 URL),
+                此时再轮询 max_retry_after_completed 次再放弃,避免被假完成坑掉。
+
+    兼容状态: completed/succeeded/success
+    兼容错误: failed/error/cancelled
     """
     start = time.time()
     last_status = None
     last_success_result = None  # 记住最后一次 status=completed 的响应
+    completed_no_url_retries = 0
     while time.time() - start < timeout_sec:
         result = poll_video(task_id)
 
@@ -473,12 +480,36 @@ def wait_for_video(task_id: str, timeout_sec: int = 600,
             logger.info("Video task %s status: %s", task_id, status)
             last_status = status
         if status in ("completed", "succeeded", "success"):
-            last_success_result = result  # 缓存
-            return result
+            last_success_result = result
+            # 检查是否假完成(completed 但没有 URL)
+            url = _safe_extract_url(result)
+            if url:
+                return result
+            completed_no_url_retries += 1
+            logger.warning(
+                "Video task %s status=completed but no URL found (retry %d/%d). Full: %s",
+                task_id, completed_no_url_retries, max_retry_after_completed, result
+            )
+            if completed_no_url_retries >= max_retry_after_completed:
+                # 真的没 URL,抛清晰错误
+                raise RuntimeError(
+                    f"aicoming 返回 status=completed 累计 {max_retry_after_completed + 1} 次 "
+                    f"但响应里都没有 URL 字段。最后一次响应: {result}"
+                )
+            time.sleep(poll_interval * 2)  # 假完成时拉长间隔
+            continue
         if status in ("failed", "error", "cancelled"):
             raise RuntimeError(f"Video task {task_id} failed: {result}")
         time.sleep(poll_interval)
     raise TimeoutError(f"Video task {task_id} did not complete in {timeout_sec}s")
+
+
+def _safe_extract_url(poll_result: dict):
+    """从 poll 响应里安全提取 URL(只做检查,不抛异常,找不到返回 None)。"""
+    try:
+        return extract_video_url(poll_result)
+    except Exception:
+        return None
 
 
 # 16x16 透明 PNG 占位图（用于 text-to-video 必须传文件的场景）

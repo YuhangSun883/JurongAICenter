@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jurong.aicenter.client.AicomingAssetsClient;
 import com.jurong.aicenter.client.ComfyUIClient;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.exception.BusinessException;
@@ -46,6 +47,7 @@ public class RealCanvasAiService implements CanvasAiService {
 
     private final NewApiClient newApiClient;
     private final ComfyUIClient comfyUIClient;
+    private final AicomingAssetsClient aicomingAssetsClient;  // 2026-08-11 新增:画布视频走素材库白名单
     private final StorageService storageService;
     private final ObjectMapper objectMapper;
 
@@ -202,6 +204,66 @@ public class RealCanvasAiService implements CanvasAiService {
         return url;
     }
 
+    /**
+     * 2026-08-11 新增:图生图(ComfyUI workflow 04 + LoadImage + JurongImageToImage)
+     * 上游有图片节点时调用,根据用户描述修改图片(改人物三视图、换商品等)。
+     */
+    @Override
+    public String editImage(String imageUrl, String prompt, String upstreamContent) {
+        // 1. 上传上游图到 ComfyUI input 目录(复用 generateVideo 的方法)
+        String imageFilename = uploadImageToComfyUiInput(imageUrl);
+
+        // 2. 读 workflow 04 模板
+        String template = readWorkflowTemplate("04-image-edit.json");
+
+        // 3. 智能合并 prompt(用户描述为主,上游文本作为风格参考)
+        String finalPrompt = mergePrompts(prompt, upstreamContent);
+
+        // 4. 替换占位符
+        String workflowJson = template
+            .replace("{{image_filename}}", escapeJson(imageFilename))
+            .replace("{{prompt}}", escapeJson(finalPrompt));
+
+        // 5. 提交 ComfyUI
+        JsonNode workflow;
+        try {
+            workflow = objectMapper.readTree(workflowJson);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "workflow JSON 解析失败: " + e.getMessage());
+        }
+
+        String promptId = comfyUIClient.submit(workflow);
+        log.info("Canvas image-edit workflow submitted: promptId={}, imageFilename={}", promptId, imageFilename);
+
+        // 6. 轮询 history 直到完成
+        JsonNode history = pollUntilDone(promptId, imagePollTimeoutSec);
+
+        // 7. 提取 outputs["3"].images[]（SaveImage 节点的输出）
+        JsonNode entry = history.get(promptId);
+        JsonNode outputs = entry.get("outputs");
+        if (outputs == null || !outputs.has("3")) {
+            throw new BusinessException(ErrorCode.COMFYUI_REJECTED, "ComfyUI 未返回 SaveImage 节点 outputs");
+        }
+        JsonNode saveNode = outputs.get("3");
+        JsonNode images = saveNode.get("images");
+        if (images == null || !images.isArray() || images.size() == 0) {
+            throw new BusinessException(ErrorCode.COMFYUI_REJECTED, "SaveImage 节点 outputs.images 为空");
+        }
+
+        // 8. 下载 + 上传 MinIO
+        JsonNode firstImage = images.get(0);
+        String filename = firstImage.path("filename").asText("");
+        String subfolder = firstImage.path("subfolder").asText("");
+        String type = firstImage.path("type").asText("output");
+        if (filename.isEmpty()) {
+            throw new BusinessException(ErrorCode.COMFYUI_REJECTED, "SaveImage 输出无 filename");
+        }
+
+        String url = downloadAndUpload(promptId, filename, subfolder, type, "image", "image");
+        log.info("Canvas image-edit generated: promptId={}, url={}", promptId, url);
+        return url;
+    }
+
     // ============= 视频生成（真 ComfyUI + 真 NewAPI 调用） =============
 
     @Override
@@ -209,12 +271,209 @@ public class RealCanvasAiService implements CanvasAiService {
         // 2026-08-09:用户确认 ComfyUI 图生视频路径工作正常,统一走 ComfyUI
         //   - 有上游图片 → workflow 03 (SVD),上传图作为起始帧
         //   - 无上游图片 → workflow 02(纯文生视频,经验证可用)
-        String imageFilename = null;
+        // 2026-08-11:ComfyUI 容器 token 失效,改为直接走 NewAPI(绕开 ComfyUI)
         if (imageUrl != null && !imageUrl.isBlank()) {
-            imageFilename = uploadImageToComfyUiInput(imageUrl);
+            return generateVideoViaNewApi(prompt, imageUrl, upstreamContent);
         }
-        return generateVideoViaComfyUI(prompt, imageFilename, upstreamContent);
+        // 无上游图片:走文生视频(也是直接调 NewAPI)
+        return generateVideoViaNewApi(prompt, null, upstreamContent);
     }
+
+    /**
+     * 2026-08-11 新增:多图版生成视频。
+     * 把多个 image 节点的 URL 全部传给 NewAPI /v1/videos 的 image_urls 参数。
+     * 适用于"三视图+换装帧图+其他参考图"场景。
+     */
+    @Override
+    public String generateVideoMulti(String prompt, java.util.List<String> imageUrls, String upstreamContent) {
+        // 智能合并 prompt
+        String finalPrompt = mergePrompts(prompt, upstreamContent);
+
+        // 兜底:图生视频必须有 prompt(NewAPI 400 会拒)
+        // 关键:仿照 jurong-api-nodes/image_to_video.py 的 _enhance_prompt
+        // 自动在 prompt 末尾追加 CRITICAL 后缀,强制锁定参考图主体
+        if (finalPrompt == null || finalPrompt.trim().isEmpty()) {
+            // 没输入:默认走一个轻描述,后缀会接 CRITICAL
+            finalPrompt = "Animate these reference images with subtle, natural motion. Cinematic, smooth camera movement.";
+        }
+        // 无论是默认还是用户输入,都加 CRITICAL 后缀
+        finalPrompt = enhanceVideoPrompt(finalPrompt);
+
+        // 过滤空 URL
+        java.util.List<String> validUrls = new java.util.ArrayList<>();
+        if (imageUrls != null) {
+            for (String u : imageUrls) {
+                if (u != null && !u.isBlank()) validUrls.add(u);
+            }
+        }
+
+        log.info("Canvas video (NewAPI multi) prompt={} imageUrls={}",
+            finalPrompt.substring(0, Math.min(80, finalPrompt.length())),
+            validUrls);
+
+        // 1) 无上游图片 → 文生视频(直接传 prompt)
+        if (validUrls.isEmpty()) {
+            String taskId = newApiClient.submitVideo(
+                finalPrompt, null, null, null, 4, "480P");
+            return pollAndDownload(taskId, finalPrompt);
+        }
+
+        // 2) 单图 → 走单图版(走素材库白名单)
+        if (validUrls.size() == 1) {
+            return generateVideoViaNewApi(finalPrompt, validUrls.get(0), null);
+        }
+
+        // 3) 多图 → 2026-08-11 改:把所有图片上传到 aicoming-proxy 素材库,拿到 asset_url 列表
+        //    然后用 submitVideoByAssetRefList 走白名单
+        java.util.List<String> assetUrls = new java.util.ArrayList<>();
+        for (int i = 0; i < validUrls.size(); i++) {
+            String url = validUrls.get(i);
+            String name = "canvas-video-multi-" + System.currentTimeMillis() + "-" + i;
+            String assetUrl = uploadImageUrlToAsset(url, name);
+            assetUrls.add(assetUrl);
+        }
+        log.info("Canvas video (NewAPI multi via asset_url): uploaded {} images, first={}",
+            assetUrls.size(), assetUrls.get(0));
+
+        // 提交 NewAPI 视频任务(多图 asset_url 列表)
+        NewApiClient.SubmitResult result = newApiClient.submitVideoByAssetRefList(
+            finalPrompt, assetUrls, 4, "480P");
+        String taskId = result.taskId();
+        if (taskId == null || taskId.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI submit (asset_url list) 返回 taskId 为空");
+        }
+
+        // 如果响应里已含 video url,直接走 MinIO
+        String directUrl = result.url();
+        String videoUrl = null;
+        if (directUrl != null && !directUrl.isBlank()) {
+            log.info("Canvas video (NewAPI multi via asset_url) 响应已含 video url: {}", directUrl);
+            videoUrl = directUrl;
+        } else {
+            // 轮询等结果
+            JsonNode pollResult = newApiClient.waitForVideo(taskId, videoPollTimeoutSec);
+            log.info("Canvas video (NewAPI multi) taskId={} completed", taskId);
+            videoUrl = newApiClient.extractVideoUrl(pollResult);
+        }
+        if (videoUrl == null || videoUrl.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_VIDEO_URL_MISSING,
+                "NewAPI multi 响应中未找到视频 URL: " + taskId);
+        }
+
+        // 下载视频 → 上传 MinIO
+        try (java.io.InputStream is = new java.net.URI(videoUrl).toURL().openStream()) {
+            String ext = "mp4";
+            if (videoUrl.contains(".mov")) ext = "mov";
+            String objectKey = STORAGE_PREFIX + "/" + taskId + "." + ext;
+            String uploaded = storageService.uploadObject(objectKey, is, "video/" + ext);
+            log.info("Canvas video (multi) uploaded: taskId={}, url={}", taskId, uploaded);
+            return uploaded;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                "视频下载/上传失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 辅助:轮询 + 下载视频 + 上传 MinIO(从 generateVideoViaNewApi 抽出来复用)
+     */
+    private String pollAndDownload(String taskId, String finalPrompt) {
+        JsonNode pollResult = newApiClient.waitForVideo(taskId, videoPollTimeoutSec);
+        log.info("Canvas video (NewAPI) taskId={} completed", taskId);
+
+        String videoUrl = newApiClient.extractVideoUrl(pollResult);
+        if (videoUrl == null || videoUrl.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_VIDEO_URL_MISSING,
+                "NewAPI 响应中未找到视频 URL: " + pollResult);
+        }
+
+        try (java.io.InputStream is = new java.net.URI(videoUrl).toURL().openStream()) {
+            String ext = "mp4";
+            if (videoUrl.contains(".mov")) ext = "mov";
+            String objectKey = STORAGE_PREFIX + "/" + taskId + "." + ext;
+            String uploaded = storageService.uploadObject(objectKey, is, "video/" + ext);
+            log.info("Canvas video uploaded: taskId={}, url={}", taskId, uploaded);
+            return uploaded;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                "视频下载/上传失败: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 辅助:PNG 转 JPEG(给 aicoming-proxy 用)
+     */
+    private byte[] convertPngToJpegIfNeeded(byte[] rawBytes, String originalName) {
+        try {
+            java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(rawBytes);
+            java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(bais);
+            if (img != null) {
+                java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+                javax.imageio.ImageIO.write(img, "jpg", baos);
+                log.info("Canvas video (multi) PNG→JPEG: {}B → {}B, filename={}",
+                         rawBytes.length, baos.size(), originalName.replaceAll("\\.png$", ".jpg"));
+                return baos.toByteArray();
+            }
+        } catch (Exception e) {
+            log.warn("PNG→JPEG conversion failed, using raw: {}", e.getMessage());
+        }
+        return rawBytes;
+    }
+
+    /**
+     * 2026-08-11 新增:把图片 URL(公网/MinIO)上传到 aicoming-proxy 素材库,返回 asset_url。
+     * 用于画布视频节点的"走素材库白名单"机制(参考 Assets-API-参考手册.md §4.1)。
+     * NewAPI 上游 doubao-seedance 对 asset_url 走白名单路径,跳过真人检测。
+     *
+     * @param imageUrl   公网可访问的图片 URL
+     * @param assetName  资产名(用于日志/调试)
+     * @return aicoming-proxy 返回的 asset_url(如 asset://aic_xxx)
+     */
+    private String uploadImageUrlToAsset(String imageUrl, String assetName) {
+        if (imageUrl == null || imageUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "uploadImageUrlToAsset: imageUrl 为空");
+        }
+        try {
+            // 1. 下载上游图片字节
+            byte[] imageBytes;
+            try (java.io.InputStream is = new URI(imageUrl).toURL().openStream()) {
+                imageBytes = is.readAllBytes();
+            }
+            // 2. 强制转 JPEG(aicoming-proxy 兼容性更好,且白名单审核更稳)
+            imageBytes = convertPngToJpegIfNeeded(imageBytes, "asset_" + System.currentTimeMillis() + ".jpg");
+            String filename = "asset_" + System.currentTimeMillis() + ".jpg";
+
+            // 3. 上传到 aicoming-proxy,获取 asset_id
+            JsonNode resp = aicomingAssetsClient.uploadAssetByMultipart(
+                imageBytes, filename, "image/jpeg", assetName);
+            String assetId = resp.path("id").asText("");
+            String assetUrl = resp.path("asset_url").asText("");
+
+            if (assetId.isEmpty() || assetUrl.isEmpty()) {
+                throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                    "aicoming-proxy 上传未返回 asset_id/asset_url: " + resp);
+            }
+            log.info("[Canvas video asset upload] url={} → assetId={}, assetUrl={}",
+                imageUrl, assetId, assetUrl);
+
+            // 4. 轮询等到 active(参考 Assets-API-参考手册 §4.2)
+            JsonNode polled = aicomingAssetsClient.pollUntilActive(assetId, 90, 3);
+            String status = polled.path("data").path("status").asText("");
+            if (!"active".equalsIgnoreCase(status)) {
+                throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                    "aicoming-proxy 资产未 active, status=" + status);
+            }
+            log.info("[Canvas video asset upload] assetId={} active, ready for NewAPI", assetId);
+            return assetUrl;
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "上传图片到 aicoming-proxy 素材库失败: " + e.getMessage());
+        }
+    }
+
     /**
      * 图生视频：直接调 NewAPI /v1/videos，绕开 ComfyUI
      * 调用链：MinIO → 字节 → NewAPI → aicoming.top 视频模型 → URL → 下载 → MinIO
@@ -224,81 +483,44 @@ public class RealCanvasAiService implements CanvasAiService {
         String finalPrompt = mergePrompts(prompt, upstreamContent);
 
         // 兑底：图生视频必须有 prompt（NewAPI 400 会拒）
-        // 关键：仿照 jurong-api-nodes/image_to_video.py 的 _enhance_prompt
-        // 自动在 prompt 末尾追加 CRITICAL 后缀，强制锁定参考图主体
         if (finalPrompt == null || finalPrompt.trim().isEmpty()) {
-            // 没输入：默认走一个轻描述，后缀会接 CRITICAL
             finalPrompt = "Animate this image with subtle, natural motion. Cinematic, smooth camera movement.";
         }
-        // 无论是默认还是用户输入，都加 CRITICAL 后缀
+        // 加 CRITICAL 后缀锁定参考图主体
         finalPrompt = enhanceVideoPrompt(finalPrompt);
 
-        // 2. 从 MinIO 下载上游图片字节
-        byte[] imageBytes;
-        String imageFilename;
-        String imageMime;
-        try (InputStream is = new URI(imageUrl).toURL().openStream()) {
-            byte[] rawBytes = is.readAllBytes();
-            // 去掉 presigned URL 的 query string，取纯文件名
-            String fullName = imageUrl.contains("/")
-                ? imageUrl.substring(imageUrl.lastIndexOf('/') + 1)
-                : "canvas_input.png";
-            String originalName = fullName.contains("?")
-                ? fullName.substring(0, fullName.indexOf('?'))
-                : fullName;
-            imageFilename = originalName;
-            String originalMime = inferContentType(originalName, "image");
+        // 2. 2026-08-11 改:走素材库白名单(参考 Assets-API-参考手册.md §4)
+        //   上传上游图到 aicoming-proxy → 拿到 asset_url → 用 asset_url 调 NewAPI
+        //   这样 NewAPI 上游 doubao-seedance 走白名单路径,跳过真人检测
+        String assetUrl = uploadImageUrlToAsset(imageUrl, "canvas-video-" + System.currentTimeMillis());
+        log.info("Canvas video (NewAPI via asset_url) input: assetUrl={}, prompt={}",
+            assetUrl, finalPrompt.substring(0, Math.min(60, finalPrompt.length())));
 
-            // 关键修复：aicoming-video-proxy 只接受 JPEG 做 image ref，PNG 被静默忽略
-            // 验证：测试 README 里 input_reference 示例就是 filename="source.jpg" + image/jpeg
-            // 我们强制转成 JPEG，文件大小通常还更小
-            if (originalMime != null && originalMime.toLowerCase().contains("png")) {
-                try {
-                    java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(rawBytes);
-                    java.awt.image.BufferedImage img = javax.imageio.ImageIO.read(bais);
-                    if (img != null) {
-                        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                        javax.imageio.ImageIO.write(img, "jpg", baos);
-                        imageBytes = baos.toByteArray();
-                        imageFilename = originalName.replaceAll("\\.png$", ".jpg");
-                        imageMime = "image/jpeg";
-                        log.info("Canvas video (NewAPI) converted PNG→JPEG: {}B → {}B, filename={}",
-                                 rawBytes.length, imageBytes.length, imageFilename);
-                    } else {
-                        imageBytes = rawBytes;
-                        imageMime = originalMime;
-                    }
-                } catch (Exception imgErr) {
-                    log.warn("Canvas video (NewAPI) PNG→JPEG conversion failed, using raw bytes: {}",
-                             imgErr.getMessage());
-                    imageBytes = rawBytes;
-                    imageMime = originalMime;
-                }
-            } else {
-                imageBytes = rawBytes;
-                imageMime = originalMime;
-            }
-        } catch (Exception e) {
-            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
-                "下载上游图片失败: " + e.getMessage());
+        // 3. 提交 NewAPI 视频任务(用 asset_url 走白名单)
+        // 4 秒 / 480P,后续可从 req.getSettings() 读用户设置
+        NewApiClient.SubmitResult result = newApiClient.submitVideoByAssetRef(
+            finalPrompt, assetUrl, 4, "480P");
+        String taskId = result.taskId();
+        if (taskId == null || taskId.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI submit (asset_url) 返回 taskId 为空");
         }
-        log.info("Canvas video (NewAPI) input: imageBytes={}B, filename={}, mime={}, prompt={}",
-            imageBytes.length, imageFilename, imageMime, finalPrompt.substring(0, Math.min(60, finalPrompt.length())));
 
-        // 3. 提交 NewAPI 视频任务（图生视频）
-        // 硬编码 4 秒 / 480P，后续可以从 req.getSettings() 读用户设置
-        String taskId = newApiClient.submitVideo(
-            finalPrompt, imageBytes, imageFilename, imageMime, 4, "480P");
-
-        // 4. 轮询等结果
-        JsonNode pollResult = newApiClient.waitForVideo(taskId, videoPollTimeoutSec);
-        log.info("Canvas video (NewAPI) taskId={} completed: {}", taskId, pollResult);
-
-        // 5. 提取视频 URL
-        String videoUrl = newApiClient.extractVideoUrl(pollResult);
+        // 4. 如果响应里已经带 video url,直接走 MinIO(避免后续 poll 失败)
+        String directUrl = result.url();
+        String videoUrl = null;
+        if (directUrl != null && !directUrl.isBlank()) {
+            log.info("Canvas video (NewAPI via asset_url) 响应已含 video url: {}", directUrl);
+            videoUrl = directUrl;
+        } else {
+            // 5. 轮询等结果
+            JsonNode pollResult = newApiClient.waitForVideo(taskId, videoPollTimeoutSec);
+            log.info("Canvas video (NewAPI) taskId={} completed: {}", taskId, pollResult);
+            videoUrl = newApiClient.extractVideoUrl(pollResult);
+        }
         if (videoUrl == null || videoUrl.isEmpty()) {
             throw new BusinessException(ErrorCode.NEWAPI_VIDEO_URL_MISSING,
-                "NewAPI 响应中未找到视频 URL: " + pollResult);
+                "NewAPI 响应中未找到视频 URL: " + taskId);
         }
 
         // 6. 下载视频 → 上传 MinIO

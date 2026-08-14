@@ -3,7 +3,7 @@
 
 import { getAccessToken, silentRefresh, clearTokens } from './auth-store';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
 
 export class ApiError extends Error {
   constructor(public status: number, message: string, public payload?: unknown) {
@@ -85,6 +85,7 @@ async function requestInner<T>(path: string, opts: RequestOptions = {}, isRetry 
   if (!res.ok) {
     let payload: unknown = undefined;
     try { payload = await res.json(); } catch { /* ignore */ }
+    console.error('[http] non-OK response', { url: buildUrl(path, query), status: res.status, payload });
     throw new ApiError(res.status, `HTTP ${res.status}`, payload);
   }
 

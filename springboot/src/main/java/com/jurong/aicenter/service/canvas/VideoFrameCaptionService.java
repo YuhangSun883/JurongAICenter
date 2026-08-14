@@ -12,6 +12,7 @@ import com.jurong.aicenter.repository.CanvasTaskRepository;
 import com.jurong.aicenter.service.StorageService;
 import com.jurong.aicenter.service.VideoFrameExtractor;
 import com.jurong.aicenter.service.VideoFrameExtractor.FrameMeta;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Async;
@@ -135,7 +136,7 @@ public class VideoFrameCaptionService {
         try {
             // ① 抽帧
             List<FrameMeta> frames = extractor.extractFrames(videoUrl, tmpDir, fps);
-            log.info("[video-caption] 抽帧完成: {} 帧, fps={}, mode={}", frames.size(), fps, mode);
+            log.debug("[video-caption] 抽帧完成: {} 帧, fps={}, mode={}", frames.size(), fps, mode);
 
             // ② 并行上传到 MinIO(无论 mode 都要上传,frames mode 要在 canvas 上展示)
             List<CompletableFuture<String>> uploadJobs = frames.stream()
@@ -151,7 +152,7 @@ public class VideoFrameCaptionService {
                 .toList();
             List<String> frameUrls = uploadJobs.stream().map(CompletableFuture::join).toList();
             long uploadOk = frameUrls.stream().filter(u -> u != null).count();
-            log.info("[video-caption] 帧上传完成: {}/{} 成功", uploadOk, frameUrls.size());
+            log.debug("[video-caption] 帧上传完成: {}/{} 成功", uploadOk, frameUrls.size());
 
             boolean needCaption = "script".equals(mode) || "both".equals(mode);
             String content = "";
@@ -303,7 +304,7 @@ public class VideoFrameCaptionService {
             // 前端轮询成功后只拉这些节点追加，不 reload 整张画布
             java.util.List<String> createdIds = new java.util.ArrayList<>();
             try {
-                createSidecarByMode(node, frameUrls, content, mode, combinedUrl, createdIds);
+                createSidecarByMode(node, frameUrls, content, mode, combinedUrl, frames.size(), createdIds);
             } catch (Exception sidecarErr) {
                 log.warn("[video-caption] sidecar creation failed (non-fatal): {}",
                     sidecarErr.getMessage(), sidecarErr);
@@ -360,7 +361,7 @@ public class VideoFrameCaptionService {
      */
     private void createSidecarByMode(CanvasNode videoNode, List<String> frameUrls,
                                        String scriptText, String mode, String combinedUrl,
-                                       java.util.List<String> createdIds) {
+                                       int frameCount, java.util.List<String> createdIds) {
         boolean needText = "script".equals(mode) || "both".equals(mode);
         boolean needFrames = "frames".equals(mode) || "both".equals(mode);
 
@@ -371,7 +372,7 @@ public class VideoFrameCaptionService {
 
         CanvasNode frameGridNode = null;
         if (needFrames) {
-            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, createdIds);
+            frameGridNode = createFrameGridSidecar(videoNode, combinedUrl, frameCount, createdIds);
             if (frameGridNode != null) {
                 connectNodes(videoNode, "frames", frameGridNode, "video");
             }
@@ -391,7 +392,7 @@ public class VideoFrameCaptionService {
      * 帧内容、文字标注、网格布局都在那张大图里里。画布上只看到 1 个 image 节点。
      */
     private CanvasNode createFrameGridSidecar(CanvasNode videoNode, String combinedUrl,
-                                              java.util.List<String> createdIds) {
+                                                int frameCount, java.util.List<String> createdIds) {
         if (combinedUrl == null || combinedUrl.isBlank()) {
             log.warn("[video-sidecar-frames] combinedUrl 为空，跳过帧拼图节点创建");
             return null;
@@ -409,14 +410,20 @@ public class VideoFrameCaptionService {
         node.setPositionX(baseX);
         node.setPositionY(baseY);
         node.setStatus("success");
+        // 2026-08-10 fix:把帧数写进 settings JSON,前端可读取(替代之前在 content "已抽帧 N 张..." 的正则匹配)
+        try {
+            node.setSettings("{\"frameCount\":" + frameCount + ",\"source\":\"video-extract\"}");
+        } catch (Exception e) {
+            log.warn("[video-sidecar-frames] settings JSON failed (non-fatal): {}", e.getMessage());
+        }
         LocalDateTime now = LocalDateTime.now();
         node.setCreatedAt(now);
         node.setUpdatedAt(now);
         nodeRepository.insert(node);
         createdIds.add(node.getId());
 
-        log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}",
-            videoNode.getId(), node.getId());
+        log.info("[video-sidecar-frames] OK: videoNodeId={}, combinedNodeId={}, frameCount={}",
+            videoNode.getId(), node.getId(), frameCount);
         return node;
     }
 
@@ -739,11 +746,6 @@ public class VideoFrameCaptionService {
                 sb.append("⏭️ ").append(action);
             } else {
                 sb.append("运镜:").append(camera).append(" 动作:").append(action);
-            }
-            // 添加口播(ASR 提取的原文)
-            String dubText = dubMap == null ? null : dubMap.get(i);
-            if (dubText != null && !dubText.isBlank()) {
-                sb.append(" 口播:\"").append(dubText).append("\"");
             }
             if (!"__FAILED__".equals(camera) && !"__SKIPPED__".equals(camera)) {
                 successCount++;

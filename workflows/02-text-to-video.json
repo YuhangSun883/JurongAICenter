@@ -6,7 +6,7 @@
       "prompt": "{{prompt}}",
       "model": "doubao-seedance-2.0",
       "duration": "4",
-      "resolution": "480P",
+      "resolution": "480p",
       "seed": 0,
       "camera_control": "none",
       "aspect_ratio": "16:9",

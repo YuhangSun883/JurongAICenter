@@ -82,6 +82,8 @@ export default function Page() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState<CanvasListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     setHistoryLoading(true);
@@ -121,14 +123,23 @@ export default function Page() {
   };
 
   const handleDeleteCanvas = async (item: CanvasListItem) => {
-    if (!window.confirm(`\u786e\u5b9a\u5220\u9664\u300c${item.name || UNTITLED_CANVAS}\u300d\u5417\uff1f`)) return;
+    setConfirmDelete(item);
+  };
+
+  const handleConfirmDelete = async () => {
+    const target = confirmDelete;
+    if (!target || deleting) return;
+    setDeleting(true);
     try {
-      await canvasApi.deleteCanvas(item.id);
-      setCanvasHistory((current) => current.filter((canvas) => canvas.id !== item.id));
+      await canvasApi.deleteCanvas(target.id);
+      setCanvasHistory((current) => current.filter((canvas) => canvas.id !== target.id));
+      setConfirmDelete(null);
       setActionError('');
     } catch (err) {
       console.warn('[canvas-home] delete canvas failed:', err);
       setActionError(LABELS.deleteFailed);
+    } finally {
+      setDeleting(false);
     }
   };
 

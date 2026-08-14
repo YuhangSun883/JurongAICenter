@@ -14,6 +14,8 @@ export interface CanvasNode {
   resultUrl?: string;
   positionX?: number;
   positionY?: number;
+  /** 节点设置 JSON(如视频节点的 duration/resolution) */
+  settings?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -25,6 +27,14 @@ export interface CreateCanvasNodeRequest {
   content?: string;
   assetId?: string;
   upstreamIds?: string[];
+  /** 2026-08-10:创建节点时同步传坐标(后端没收到就默认 0,0 → 刷新堆左上角) */
+  positionX?: number;
+  positionY?: number;
+}
+
+export interface NodeConnection {
+  port: string;
+  nodeId: string;
 }
 
 export interface UpdateCanvasNodeRequest {
@@ -32,6 +42,15 @@ export interface UpdateCanvasNodeRequest {
   title?: string;
   content?: string;
   assetId?: string;
+  /** 2026-08-10:拖动结束同步位置到后端 */
+  positionX?: number;
+  positionY?: number;
+  /** 上游连接列表(多端口格式) */
+  upstreamIds?: NodeConnection[];
+  /** 下游连接列表(多端口格式) */
+  downstreamIds?: NodeConnection[];
+  /** 节点设置 JSON(视频节点的 duration/resolution 等) */
+  settings?: string;
 }
 
 export interface GenerateCanvasNodeRequest {
@@ -53,6 +72,14 @@ export interface GenerateCanvasNodeResponse {
   resultUrl?: string;
   creditsEstimated: number;
   createdNodeIds?: string[];
+  /** 2026-08-10 新增:任务失败时的具体原因(由后端从 CanvasTask.errorMessage 透传) */
+  failMessage?: string;
+}
+
+export interface GenerateVideoRequest {
+  nodeId: string;
+  duration?: number;
+  resolution?: string;
 }
 
 export interface CreateCanvasRequest {
@@ -104,6 +131,9 @@ export const canvasApi = {
   generateNode: (req: GenerateCanvasNodeRequest): Promise<GenerateCanvasNodeResponse> =>
     USE_MOCK ? mock.generateNode(req) : real.generateNode(req),
 
+  generateVideo: (req: GenerateVideoRequest): Promise<GenerateCanvasNodeResponse> =>
+    USE_MOCK ? mock.generateVideo(req) : real.generateVideo(req),
+
   getTask: (taskId: string): Promise<GenerateCanvasNodeResponse> =>
     USE_MOCK ? mock.getTask(taskId) : real.getTask(taskId),
 
@@ -127,4 +157,7 @@ export const canvasApi = {
 
   getNode: (nodeId: string): Promise<CanvasNode> =>
     USE_MOCK ? mock.getNode(nodeId) : real.getNode(nodeId),
+
+  deleteNode: (nodeId: string): Promise<void> =>
+    USE_MOCK ? mock.deleteNode(nodeId) : real.deleteNode(nodeId),
 };

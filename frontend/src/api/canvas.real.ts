@@ -8,6 +8,7 @@ import type {
   CreateCanvasRequest,
   GenerateCanvasNodeRequest,
   GenerateCanvasNodeResponse,
+  GenerateVideoRequest,
   UpdateCanvasRequest,
   UpdateCanvasNodeRequest,
   UploadToCanvasOptions,
@@ -30,6 +31,14 @@ export function generateNode(req: GenerateCanvasNodeRequest): Promise<GenerateCa
   return request<GenerateCanvasNodeResponse>(`${API}/nodes/${req.nodeId}/generate`, {
     method: 'POST',
     body: req,
+  });
+}
+
+/** 视频生成专用端点(图生视频):POST /nodes/{id}/generate-video */
+export function generateVideo(req: GenerateVideoRequest): Promise<GenerateCanvasNodeResponse> {
+  return request<GenerateCanvasNodeResponse>(`${API}/nodes/${req.nodeId}/generate-video`, {
+    method: 'POST',
+    body: { duration: req.duration ?? 9, resolution: req.resolution ?? '720P' },
   });
 }
 
@@ -67,6 +76,16 @@ export function getNode(nodeId: string): Promise<CanvasNode> {
 }
 
 /**
+ * 删除单个画布节点(后端会同时清理与之相关的 edge)。
+ * 用于前端"删除节点"操作,确保下次刷新节点不会回来。
+ */
+export async function deleteNode(nodeId: string): Promise<void> {
+  await request<{ nodeId: string; status: string }>(`${API}/nodes/${nodeId}`, {
+    method: 'DELETE',
+  });
+}
+
+/**
  * 本地上传文件到画布：自动建对应类型的画布节点。
  *
  * <p>后端按 mime/扩展名自动判断节点类型：
@@ -92,7 +111,7 @@ export async function uploadToCanvas(
   if (opts.positionX != null) fd.append('positionX', String(opts.positionX));
   if (opts.positionY != null) fd.append('positionY', String(opts.positionY));
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
   const token = getAccessToken();
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
