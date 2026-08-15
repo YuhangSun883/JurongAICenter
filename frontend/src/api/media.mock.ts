@@ -123,6 +123,21 @@ export async function renameAsset(id: number, name: string): Promise<MediaItem> 
   return delay({ ...a });
 }
 
+export async function patchAsset(
+  id: number,
+  payload: { name?: string; libraryId?: number | null }
+): Promise<MediaItem> {
+  const a = ASSETS.find((x) => x.id === id);
+  if (!a) throw new Error('素材不存在');
+  if (payload.name !== undefined) a.name = payload.name;
+  if (payload.libraryId != null) {
+    a.libraryId = payload.libraryId;
+    const lib = LIBS.find((l) => l.id === payload.libraryId);
+    if (lib) a.libraryName = lib.name;
+  }
+  return delay({ ...a });
+}
+
 export async function deleteAsset(id: number): Promise<void> {
   const idx = ASSETS.findIndex((x) => x.id === id);
   if (idx >= 0) ASSETS.splice(idx, 1);

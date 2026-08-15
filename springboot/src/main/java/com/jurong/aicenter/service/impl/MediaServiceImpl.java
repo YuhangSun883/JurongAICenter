@@ -3,12 +3,12 @@ package com.jurong.aicenter.service.impl;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.PageResult;
-import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.jurong.aicenter.dto.media.MediaAssetDto;
 import com.jurong.aicenter.dto.media.MediaAssetResponse;
 import com.jurong.aicenter.dto.media.MediaListQuery;
 import com.jurong.aicenter.dto.media.MediaRoleDto;
 import com.jurong.aicenter.dto.media.MediaUploadResponse;
+import com.jurong.aicenter.dto.media.PatchAssetRequest;
 import com.jurong.aicenter.entity.MediaAsset;
 import com.jurong.aicenter.entity.MediaLibrary;
 import com.jurong.aicenter.entity.MediaRole;
@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -52,6 +53,24 @@ public class MediaServiceImpl implements MediaService {
     private static final long MAX_IMAGE_BYTES = 20L * 1024 * 1024;
     private static final long MAX_VIDEO_BYTES = 200L * 1024 * 1024;
     private static final long MAX_AUDIO_BYTES = 50L * 1024 * 1024;
+
+    /**
+     * V26：预签名 URL 缓存。
+     * MinIO presign 出来的 URL 带 X-Amz-Date 时间戳，每次 listAssets 都生成新 URL，
+     * 浏览器眼里是"不同资源" → 永远不命中磁盘缓存。
+     * 这里用内存缓存同一 objectKey 在窗口内返回相同 URL，让浏览器能命中缓存。
+     * 窗口取 6 小时（远小于 MinIO 7 天上限 168h），到期后自动刷新。
+     */
+    private static final long PRESIGN_CACHE_HOURS = 6;
+    private static final class CachedPresign {
+        final String url;
+        final long expireAt; // System.currentTimeMillis()
+        CachedPresign(String url, long expireAt) {
+            this.url = url;
+            this.expireAt = expireAt;
+        }
+    }
+    private final ConcurrentHashMap<String, CachedPresign> presignCache = new ConcurrentHashMap<>();
 
     private static final Set<String> ALLOWED_IMAGE_MIME = Set.of(
         "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp", "image/bmp"
@@ -252,6 +271,68 @@ public class MediaServiceImpl implements MediaService {
                 libraryName = lib.getName();
             }
         }
+        return toResponse(asset, libraryName);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse patchAsset(Long userId, Long assetId, PatchAssetRequest request) {
+        if (request == null
+            || (request.getName() == null && request.getLibraryId() == null)) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "至少需要修改名称或所属库中的一项");
+        }
+
+        MediaAsset asset = mustGetOwnedAsset(userId, assetId);
+
+        // ============ 1. 改名称（可选） ============
+        if (request.getName() != null) {
+            String trimmed = request.getName().trim();
+            if (trimmed.isEmpty()) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM, "素材名称不能为空");
+            }
+            // 重名校验必须看"最终所在库"——如果同时改库，重名校验看目标库
+            Long dupCheckLibId = request.getLibraryId() != null
+                ? request.getLibraryId() : asset.getLibraryId();
+            if (!asset.getName().equals(trimmed)
+                && existsByNameInSameLibrary(userId, dupCheckLibId, trimmed, asset.getId())) {
+                throw new BusinessException(ErrorCode.MEDIA_ASSET_NAME_DUPLICATE,
+                    "目标库内已存在同名素材「" + trimmed + "」");
+            }
+            asset.setName(trimmed);
+        }
+
+        // ============ 2. 改所属库（可选） ============
+        if (request.getLibraryId() != null) {
+            Long targetLibId = request.getLibraryId();
+            if (targetLibId.equals(asset.getLibraryId())) {
+                // 移到原库：不报错但也不写盘
+                log.debug("[patchAsset] asset {} already in library {}, no-op", assetId, targetLibId);
+            } else {
+                MediaLibrary target = libraryRepository.selectById(targetLibId);
+                if (target == null || !target.getUserId().equals(userId)) {
+                    throw new BusinessException(ErrorCode.MEDIA_LIBRARY_NOT_FOUND, "目标资产库不存在或不属于当前用户");
+                }
+                if ("system-ai".equals(target.getType())) {
+                    throw new BusinessException(ErrorCode.MEDIA_ASSET_CANNOT_MOVE_TO_AI,
+                        "AI 生成结果库只接收 AI 产出，不能手工移入");
+                }
+                asset.setLibraryId(targetLibId);
+            }
+        }
+
+        asset.setUpdatedAt(LocalDateTime.now());
+        assetRepository.updateById(asset);
+
+        // 名称和库都更新后再做一次目标库重名校验（如果只改库不改名）
+        // 已经在前面统一处理了，这里无需重复
+
+        String libraryName = null;
+        if (asset.getLibraryId() != null) {
+            MediaLibrary lib = libraryRepository.selectById(asset.getLibraryId());
+            if (lib != null) libraryName = lib.getName();
+        }
+        log.info("[patchAsset] user={} asset={} newName={} newLib={}",
+            userId, assetId, asset.getName(), asset.getLibraryId());
         return toResponse(asset, libraryName);
     }
 
@@ -577,8 +658,24 @@ public class MediaServiceImpl implements MediaService {
         if (objectKey == null || objectKey.isBlank()) {
             return null;
         }
+        long now = System.currentTimeMillis();
+        // 命中缓存：URL 在 6 小时窗口内复用
+        CachedPresign cached = presignCache.get(objectKey);
+        if (cached != null && cached.expireAt > now) {
+            return cached.url;
+        }
         try {
-            return storageService.getPresignedUrl(objectKey, 24);
+            // V26：拉到 7 天（MinIO 默认最大支持 7 天 = 168 小时）。
+            // URL 7 天内稳定，浏览器可命中磁盘缓存。7 天后 URL 变，需重新拉一次。
+            // 配合前端 PRESIGN_CACHE_HOURS=6 缓存，6 小时内同 objectKey 复用同一 URL。
+            // 彻底解决需走方案 A：后端 stream URL + cookie 认证。
+            String url = storageService.getPresignedUrl(objectKey, 168);
+            // 仅在生成成功时入缓存（避免把 null 也存进去）
+            if (url != null) {
+                presignCache.put(objectKey, new CachedPresign(
+                    url, now + PRESIGN_CACHE_HOURS * 3600L * 1000L));
+            }
+            return url;
         } catch (Exception e) {
             log.warn("Generate presigned URL failed for object {}: {}", objectKey, e.getMessage());
             return null;

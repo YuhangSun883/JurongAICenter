@@ -20,14 +20,17 @@ import java.util.List;
  *
  * <p>端点列表：
  * <pre>
- *   GET    /api/media/libraries        列出我的所有库 — 见 MediaController.listLibraries()
- *   POST   /api/media/libraries        新建 custom 库
- *   PATCH  /api/media/libraries/{id}   重命名（系统库不可改）
- *   DELETE /api/media/libraries/{id}   删除 custom 库（连素材一起删）
+ *   GET    /api/media/libraries                       列出我的所有库 — 见 MediaController.listLibraries()
+ *   GET    /api/media/libraries/roots                 只列根库（V19）
+ *   GET    /api/media/libraries/{id}/children         列某库直接子库（V19）
+ *   GET    /api/media/libraries/{id}/breadcrumb       取某库面包屑（V19）
+ *   POST   /api/media/libraries                       新建 custom 库（可传 parentId 建子库）
+ *   PATCH  /api/media/libraries/{id}                  重命名（系统库不可改，父库不可改）
+ *   DELETE /api/media/libraries/{id}                  删除 custom 库（连子库、孙库、素材一起删）
  * </pre>
  *
- * <p>说明：GET 统一在 MediaController 里（那里也用到 libraries 列表）；
- * 本 controller 只负责写操作（创建/重命名/删除），与 MediaController 不冲突。
+ * <p>说明：GET 列表统一在 MediaController 里（那里也用到 libraries 列表）；
+ * 本 controller 只负责写操作（创建/重命名/删除）+ 父子库相关读操作。
  */
 @RestController
 @RequestMapping("/api/media/libraries")
@@ -35,6 +38,28 @@ import java.util.List;
 public class MediaLibraryController {
 
     private final MediaLibraryService libraryService;
+
+    @GetMapping("/roots")
+    public List<MediaLibraryResponse> listRoots(@AuthenticationPrincipal AuthenticatedUser user) {
+        requireUser(user);
+        return libraryService.listRootLibraries(user.id());
+    }
+
+    @GetMapping("/{id}/children")
+    public List<MediaLibraryResponse> listChildren(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id) {
+        requireUser(user);
+        return libraryService.listChildLibraries(user.id(), id);
+    }
+
+    @GetMapping("/{id}/breadcrumb")
+    public List<MediaLibraryResponse> getBreadcrumb(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable Long id) {
+        requireUser(user);
+        return libraryService.getBreadcrumb(user.id(), id);
+    }
 
     @PostMapping
     public MediaLibraryResponse create(

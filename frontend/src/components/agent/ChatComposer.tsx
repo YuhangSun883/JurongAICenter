@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, type DragEvent } from 'react';
-import { Plus, ArrowUp } from 'lucide-react';
+import { Plus, ArrowUp, X } from 'lucide-react';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
@@ -116,11 +116,20 @@ export function ChatComposer({
             {picked.map((m) => (
               <div
                 key={m.id}
-                className="relative h-14 w-14 overflow-hidden rounded-lg border border-bg-line"
+                className="group relative h-14 w-14 overflow-hidden rounded-lg border border-bg-line"
                 title={m.name}
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={m.url} alt={m.name} className="h-full w-full object-cover" />
+                {/* V26：删除按钮 —— 悬停时显示，点击从已选列表移除 */}
+                <button
+                  type="button"
+                  onClick={() => setPicked((current) => current.filter((item) => item.id !== m.id))}
+                  className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-black/60 text-white opacity-0 transition group-hover:opacity-100 hover:bg-red-500"
+                  title="移除"
+                >
+                  <X className="h-3 w-3" strokeWidth={2.5} />
+                </button>
               </div>
             ))}
             <button

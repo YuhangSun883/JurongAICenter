@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import {
   Search,
   Image as ImageIcon,
@@ -18,21 +19,35 @@ import {
   Play,
   Volume2,
   VolumeX,
+  ChevronRight,
+  CornerDownRight,
 } from 'lucide-react';
 import { mediaApi } from '@/api/media';
 import type { MediaItem, MediaLibrary, MediaType } from '@/types/media';
 import { cn } from '@/lib/utils';
 import { getAccessToken } from '@/lib/auth-store';
 import { VideoThumbnail } from '@/components/common/VideoThumbnail';
+import { LibraryTypeBadge, getLibraryTypeKey } from '@/components/common/MediaPickerDialog';
 
 type TypeFilter = 'all' | MediaType;
 type SortOrder = 'desc' | 'asc';
+// V25：来源筛选（按后端 MediaSource 字段）
+// - all       → 全部资产（不传 source）
+// - uploaded  → 我上传的
+// - ai-generated → AI 生成的
+type SourceFilter = 'all' | 'uploaded' | 'ai-generated';
 
 const TYPE_TABS: { key: TypeFilter; label: string; Icon?: typeof ImageIcon }[] = [
   { key: 'all', label: '全部' },
   { key: 'image', label: '图片', Icon: ImageIcon },
   { key: 'video', label: '视频', Icon: Film },
   { key: 'audio', label: '音频', Icon: Music2 },
+];
+
+const SOURCE_TABS: { key: SourceFilter; label: string }[] = [
+  { key: 'all', label: '全部资产' },
+  { key: 'uploaded', label: '我上传的' },
+  { key: 'ai-generated', label: 'AI生成的' },
 ];
 
 /**
@@ -64,9 +79,29 @@ function getStreamUrl(assetId: number): string {
 }
 
 export function AssetsView() {
+  // ================== V21：每库独立新页面（URL ?lib=<id>） ==================
+  // - 无 ?lib   → 资产首页（库卡片列表 + 系统库/我的资产）
+  // - ?lib=X    → 库 X 详情页（面包屑 + 素材网格 + 子库入口）
+  //   - X 是根库：显示「全部库 / 库名」
+  //   - X 是子库：拉祖先链，渲染全部面包屑
+  // ======================================================================
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const libIdParam = searchParams.get('lib');
+  const currentLibId = libIdParam ? Number(libIdParam) : null;
+
+  // 写回 URL：?lib=<id> 或移除
+  function navigateToLib(id: number | null) {
+    const params = new URLSearchParams(Array.from(searchParams.entries()));
+    if (id == null) params.delete('lib');
+    else params.set('lib', String(id));
+    const qs = params.toString();
+    router.replace(qs ? `/assets?${qs}` : '/assets');
+  }
+
   const [libs, setLibs] = useState<MediaLibrary[]>([]);
-  const [activeLibId, setActiveLibId] = useState<number | null>(null);
   const [type, setType] = useState<TypeFilter>('all');
+  const [source, setSource] = useState<SourceFilter>('all');
   const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
   const [keyword, setKeyword] = useState('');
   const [assets, setAssets] = useState<MediaItem[]>([]);
@@ -85,6 +120,8 @@ export function AssetsView() {
 
   // 视频播放器
   const [playingVideo, setPlayingVideo] = useState<MediaItem | null>(null);
+  // 2026-08-15：图片/音频点击预览弹窗（视频走 VideoPlayerModal）
+  const [previewingAsset, setPreviewingAsset] = useState<MediaItem | null>(null);
 
   // 上传
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -97,23 +134,32 @@ export function AssetsView() {
     return list;
   };
 
+  // 挂载时拉一次（V21：去掉以前的"自动选上传库"逻辑，URL 决定视图）
   useEffect(() => {
-    refreshLibs().then((list) => {
-      const uploaded = list.find((l) => l.type === 'system-uploaded') ?? list[0];
-      if (uploaded) setActiveLibId(uploaded.id);
-    });
+    refreshLibs();
   }, []);
 
-  const activeLib = useMemo(
-    () => libs.find((l) => l.id === activeLibId) ?? null,
-    [libs, activeLibId]
+  // 2026-08-15 V21：先做 URL → 视图派生
+  const isHome = currentLibId == null;
+  const currentLib = useMemo(
+    () => (currentLibId == null ? null : libs.find((l) => l.id === currentLibId) ?? null),
+    [libs, currentLibId]
   );
+
+  // 2026-08-15 V21：activeLib 跟随 URL
+  // - 详情页 ?lib=X  → activeLib = X（看 X 的素材）
+  // - 首页         → activeLib = 系统库「我的资产」（顶部入库选中态）
+  const activeLib = useMemo(() => {
+    if (currentLib) return currentLib;
+    return libs.find((l) => l.type === 'system-uploaded') ?? null;
+  }, [currentLib, libs]);
+  const activeLibId = activeLib?.id ?? null;
 
   const isAILib = activeLib?.type === 'system-ai';
   // AI 库不允许上传
   const canUpload = !!activeLib && !isAILib;
 
-  // 拉取素材
+  // 拉取素材（V21：URL ?lib 变化时重拉；首页默认展示「我的资产」跨库汇总）
   useEffect(() => {
     if (activeLibId == null) return;
     setLoading(true);
@@ -122,6 +168,7 @@ export function AssetsView() {
       .listAssets({
         libraryId: queryLibId,
         type: type === 'all' ? undefined : type,
+        source: source === 'all' ? undefined : source,
         keyword: keyword || undefined,
         page: 1,
         pageSize: 60,
@@ -136,7 +183,7 @@ export function AssetsView() {
         setSelected(new Set());
       })
       .finally(() => setLoading(false));
-  }, [activeLibId, type, sortOrder, keyword, activeLib?.type]);
+  }, [activeLibId, isHome, type, source, sortOrder, keyword, activeLib]);
 
   // 切换库时清空选择
   useEffect(() => {
@@ -144,12 +191,59 @@ export function AssetsView() {
     setSelecting(false);
   }, [activeLibId]);
 
-  async function handleSaveLib(payload: { name: string; description: string }) {
+  // 2026-08-15 V21：URL ?lib=X 时，拉取祖先链作为面包屑
+  // - 根库：面包屑 = [该库]
+  // - 子库：面包屑 = [根库, ...中间祖先, 当前库]
+  const [breadcrumb, setBreadcrumb] = useState<MediaLibrary[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    if (currentLibId == null) {
+      setBreadcrumb([]);
+      return;
+    }
+    (async () => {
+      try {
+        const list = await mediaApi.getLibraryBreadcrumb(currentLibId);
+        if (!cancelled) setBreadcrumb(list);
+      } catch (e) {
+        if (!cancelled) setBreadcrumb([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [currentLibId]);
+
+  // 2026-08-15 V21：当前 ?lib=X 时，列出 X 的直接子库（在库详情页显示）
+  const childLibs = useMemo(() => {
+    if (currentLibId == null) return [];
+    return libs
+      .filter((l) => l.parentId === currentLibId)
+      .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id);
+  }, [libs, currentLibId]);
+
+  async function handleSaveLib(payload: {
+    name: string;
+    description: string;
+    bizType?: string;
+    authPurpose?: string;
+    authExpireAt?: string;
+    parentId?: number | null;
+  }) {
     if (editingLib) {
-      await mediaApi.renameLibrary(editingLib.id, payload);
+      // 编辑模式：只支持改名/描述/授权信息，parentId 不可改（与后端一致）
+      const { parentId: _ignored, ...rest } = payload;
+      // bizType 强转：CreateLibraryRequest.bizType 是窄类型，rest 里是宽 string
+      await mediaApi.renameLibrary(editingLib.id, { ...rest, bizType: rest.bizType as any });
     } else {
-      const lib = await mediaApi.createLibrary(payload);
-      setActiveLibId(lib.id);
+      const lib = await mediaApi.createLibrary({
+        name: payload.name,
+        description: payload.description,
+        bizType: payload.bizType as any,
+        authPurpose: payload.authPurpose,
+        authExpireAt: payload.authExpireAt,
+        parentId: payload.parentId ?? undefined,
+      });
+      // V21：新建后跳到新库页面（每库独立新页面）
+      navigateToLib(lib.id);
     }
     await refreshLibs();
     setShowCreateLib(false);
@@ -160,9 +254,10 @@ export function AssetsView() {
     if (lib.type !== 'custom') return;
     if (!confirm(`确定删除资产库「${lib.name}」？库内所有素材将一并删除。`)) return;
     await mediaApi.deleteLibrary(lib.id);
-    const list = await refreshLibs();
-    if (activeLibId === lib.id) {
-      setActiveLibId(list[0]?.id ?? null);
+    await refreshLibs();
+    if (currentLibId === lib.id) {
+      // 当前页面库被删 → 回首页
+      navigateToLib(null);
     }
   }
 
@@ -213,10 +308,36 @@ export function AssetsView() {
     setEditingAsset(asset);
   }
 
-  async function handleSaveAssetName(name: string) {
+  /**
+   * 2026-08-15：编辑资产保存
+   * - name 没变 + libraryId 没变 → 直接关闭
+   * - 只改 name → PATCH { name }
+   * - 只改 libraryId → PATCH { libraryId }
+   * - 都改 → PATCH { name, libraryId }
+   * 任意字段没变就不传（节省 payload + 避免误触发后端重名校验）
+   */
+  async function handleSaveAssetEdit(payload: { name: string; libraryId: number | null }) {
     if (!editingAsset) return;
-    const updated = await mediaApi.renameAsset(editingAsset.id, name);
+    const oldName = editingAsset.name;
+    const oldLibId = editingAsset.libraryId ?? null;
+    const patch: { name?: string; libraryId?: number } = {};
+    if (payload.name !== oldName) patch.name = payload.name;
+    if (payload.libraryId !== oldLibId) patch.libraryId = payload.libraryId ?? undefined;
+    if (Object.keys(patch).length === 0) {
+      setEditingAsset(null);
+      return;
+    }
+    const updated = await mediaApi.patchAsset(editingAsset.id, patch);
+    // 把更新后的素材同步进当前 assets 列表
     setAssets((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+    // 如果换了库，刷新一下 assetCount；素材若已不在当前活动库内，从列表移除
+    if (patch.libraryId != null && patch.libraryId !== oldLibId) {
+      await refreshLibs();
+      const queryId = getQueryLibraryId(activeLib);
+      if (queryId != null && queryId !== patch.libraryId) {
+        setAssets((prev) => prev.filter((a) => a.id !== editingAsset.id));
+      }
+    }
   }
 
   async function handleDownloadAsset(asset: MediaItem) {
@@ -266,37 +387,111 @@ export function AssetsView() {
     });
   }
 
-  const systemLibs = libs.filter((l) => l.type !== 'custom');
-  const customLibs = libs.filter((l) => l.type === 'custom');
+  // 2026-08-15 V21：当前 ?lib 决定页面模式
+  // - 无 ?lib   → 首页：系统库（我的资产、AI）+ 所有自定义根库卡片
+  // - ?lib=X    → 库详情页：显示 X 的素材网格 + 子库入口；卡片区展示 X 的直接子库
+  // isHome / currentLib 已在更早派生，这里直接用
+
+  // 当前层展示的库：
+  // - 首页：parentId == null 的根库（系统 + 自定义）
+  // - 详情页：currentLibId 的直接子库
+  const libsAtCurrentLevel = useMemo(() => {
+    if (isHome) {
+      return libs
+        .filter((l) => l.parentId == null)
+        .sort((a, b) => {
+          const aSys = String(a.type).startsWith('system-') ? 0 : 1;
+          const bSys = String(b.type).startsWith('system-') ? 0 : 1;
+          if (aSys !== bSys) return aSys - bSys;
+          return (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id;
+        });
+    }
+    return childLibs;
+  }, [libs, isHome, childLibs]);
+
+  // 详情页：当前库就是父库（用于 LibraryDialog 传参 + 「新建子库」标识）
+  const currentParent = isHome ? null : currentLib;
+
+  // 系统默认库拆 2 类：
+  // - system-uploaded（我的资产）：首页不显示卡片，素材区直接展示其跨库汇总
+  // - system-ai（AI 生成结果）：首页显示卡片，作为只读库入口
+  // 详情页：所有 system-* 库都排除（不允许建系统库的子库，业务上也不需要）
+  const systemLibs = isHome
+    ? libsAtCurrentLevel.filter((l) => l.type === 'system-ai')
+    : [];
+  const customLibs = libsAtCurrentLevel.filter((l) => l.type === 'custom');
 
   return (
-    <div className="mx-auto w-full max-w-[1200px] px-4 pb-32 pt-6 sm:px-6">
-      {/* 标题 */}
-      <div className="mb-5 flex items-center justify-between">
-        <h1 className="text-xl font-bold text-[#111318]">我的资产</h1>
-      </div>
+    <div className="mx-auto w-full max-w-[1600px] px-6 pb-32 pt-6 sm:px-8 lg:px-10">
+      {/* 2026-08-15 V21：面包屑（始终置顶，首页不显示，详情页 = 返回我的资产 / 祖先 / 当前） */}
+      {!isHome && (
+        <div className="mb-2 flex items-center gap-1.5 text-[13px] text-[#5f6876]">
+          <button
+            type="button"
+            onClick={() => navigateToLib(null)}
+            className="rounded px-1.5 py-0.5 transition hover:bg-[#f1f5f9] hover:text-[#1673ff]"
+          >
+            返回我的资产
+          </button>
+          {breadcrumb.map((b, i) => {
+            const isLast = i === breadcrumb.length - 1;
+            return (
+              <span key={b.id} className="flex items-center gap-1.5">
+                <ChevronRight className="h-3.5 w-3.5 text-[#cbd5e1]" />
+                {isLast ? (
+                  <span className="rounded px-1.5 py-0.5 font-medium text-[#111318]">{b.name}</span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => navigateToLib(b.id)}
+                    className="rounded px-1.5 py-0.5 transition hover:bg-[#f1f5f9] hover:text-[#1673ff]"
+                  >
+                    {b.name}
+                  </button>
+                )}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 大标题：当前库名（首页 = 「我的资产」） */}
+      <h1 className="mb-5 text-xl font-bold text-[#111318]">
+        {isHome ? '我的资产' : currentLib?.name ?? '未命名库'}
+      </h1>
 
       {/* 资产库入口卡片 */}
       <div className="mb-7 flex flex-wrap gap-4">
-        {/* 新建资产库 */}
-      <button
-        type="button"
-        onClick={() => {
-          setEditingLib(null);
-          setShowCreateLib(true);
-        }}
-        className="group w-[180px] text-left transition-transform hover:-translate-y-0.5"
-      >
-        <div className="grid aspect-[3/2] w-full place-items-center rounded-xl border border-dashed border-[#cbd5e1] bg-white transition group-hover:border-[#1673ff]">
-          <div className="grid h-[58px] w-[58px] place-items-center rounded-[16px] bg-[#f7f7f8] text-[#5f6876] transition group-hover:bg-[#eaf3ff] group-hover:text-[#1673ff]">
-            <IconFolderPlus className="h-8 w-8" />
-          </div>
-        </div>
-        <div className="mt-2.5 text-[13.5px] font-medium text-[#111318]">新建资产库</div>
-        <div className="mt-0.5 text-xs text-[#8a909b]">自定义管理素材</div>
-      </button>
+        {/* 2026-08-15 V24：系统库不可作为父库。
+            - 首页：currentParent=null → 始终显示"新建资产库"（建根库）
+            - 详情页且 currentParent 是 custom → 显示"新建子库"
+            - 详情页且 currentParent 是 system-* → 隐藏"新建子库"按钮 */}
+        {(!currentParent || currentParent.type === 'custom') && (
+          <button
+            type="button"
+            onClick={() => {
+              setEditingLib(null);
+              setShowCreateLib(true);
+            }}
+            className="group w-[180px] text-left transition-transform hover:-translate-y-0.5"
+          >
+            <div className="grid aspect-[3/2] w-full place-items-center rounded-xl border border-dashed border-[#cbd5e1] bg-white transition group-hover:border-[#1673ff]">
+              <div className="grid h-[58px] w-[58px] place-items-center rounded-[16px] bg-[#f7f7f8] text-[#5f6876] transition group-hover:bg-[#eaf3ff] group-hover:text-[#1673ff]">
+                <IconFolderPlus className="h-8 w-8" />
+              </div>
+            </div>
+            <div className="mt-2.5 text-[13.5px] font-medium text-[#111318]">
+              {currentParent ? '新建子库' : '新建资产库'}
+            </div>
+            <div className="mt-0.5 truncate text-xs text-[#8a909b]">
+              {currentParent
+                ? `归到「${currentParent.name}」下`
+                : '自定义管理素材'}
+            </div>
+          </button>
+        )}
 
-        {/* 系统默认库 */}
+        {/* 系统默认库（仅首页展示） */}
         {systemLibs.map((lib) => {
           const isAI = lib.type === 'system-ai';
           return (
@@ -305,19 +500,21 @@ export function AssetsView() {
               lib={lib}
               isAI={isAI}
               isActive={lib.id === activeLibId}
-              onClick={() => setActiveLibId(lib.id)}
+              onClick={() => navigateToLib(lib.id)}
             />
           );
         })}
 
-        {/* 自定义库（支持编辑/删除） */}
+        {/* 自定义库：首页=根库；详情页=子库；点击 = 跳到该库的新页面 */}
         {customLibs.map((lib) => (
           <LibraryCard
             key={lib.id}
             lib={lib}
             isAI={false}
             isActive={lib.id === activeLibId}
-            onClick={() => setActiveLibId(lib.id)}
+            // V21：每库独立新页面。点根库/子库卡片都跳到 /assets?lib=<id>，
+            // URL 变化驱动面包屑 + 素材列表重新加载
+            onClick={() => navigateToLib(lib.id)}
             onEdit={() => {
               setEditingLib(lib);
               setShowCreateLib(true);
@@ -352,6 +549,30 @@ export function AssetsView() {
             );
           })}
         </div>
+
+        {/* V25：来源 Tab（AI 库下只有 AI 生成的，分类无意义，隐藏整组） */}
+        {!isAILib && (
+          <div className="flex items-center gap-0 rounded-[10px] border border-[#edf0f4] bg-white p-[3px] shadow-[0_10px_24px_rgba(25,31,45,0.05)]">
+            {SOURCE_TABS.map((t) => {
+              const active = source === t.key;
+              return (
+                <button
+                  key={t.key}
+                  type="button"
+                  onClick={() => setSource(t.key)}
+                  className={cn(
+                    'inline-flex h-[30px] items-center gap-1.5 rounded-[7px] px-3 text-[12.5px] font-medium transition',
+                    active
+                      ? 'bg-[#eaf3ff] text-[#006cff]'
+                      : 'text-[#5f6876] hover:bg-[#f7f7f8] hover:text-[#111318]'
+                  )}
+                >
+                  {t.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {/* 搜索 */}
         <div className="relative min-w-[180px] max-w-[280px] flex-1">
@@ -394,7 +615,7 @@ export function AssetsView() {
               )}
             >
               <Check className="h-3.5 w-3.5" />
-              {selecting ? '取消选择' : '选择'}
+              {selecting ? '取消选择' : '批量操作'}
             </button>
           )}
         </div>
@@ -424,7 +645,7 @@ export function AssetsView() {
         <>
           {assets.length === 0 ? (
             <div className="relative min-h-[60vh]">
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
                 {canUpload && (
                   <button
                     type="button"
@@ -453,7 +674,7 @@ export function AssetsView() {
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
           {/* 首位 + 添加卡片（AI 库不允许添加） */}
           {canUpload && (
             <button
@@ -486,6 +707,11 @@ export function AssetsView() {
               onDelete={() => handleDeleteAsset(a)}
               onDownload={() => handleDownloadAsset(a)}
               onPlayVideo={(asset) => setPlayingVideo(asset)}
+              onPreview={(asset) => {
+                // 视频走专用的播放器（带控制条），图片/音频走全屏预览
+                if (asset.type === 'video') setPlayingVideo(asset);
+                else setPreviewingAsset(asset);
+              }}
             />
           ))}
             </div>
@@ -528,6 +754,10 @@ export function AssetsView() {
           mode={editingLib ? 'edit' : 'create'}
           initial={editingLib}
           libs={libs}
+          // 2026-08-15 V19：父库
+          // - 编辑模式：null（父库不可改）
+          // - 新建：currentParent（根层为 null 建根库；子层为当前父库，建在其下）
+          parent={editingLib ? null : currentParent}
           onClose={() => {
             setShowCreateLib(false);
             setEditingLib(null);
@@ -536,14 +766,15 @@ export function AssetsView() {
         />
       )}
 
-      {/* 资产编辑弹窗（改名） */}
+      {/* 资产编辑弹窗（改名 + 换库） */}
       {editingAsset && (
         <AssetEditDialog
           asset={editingAsset}
           assets={assets}
+          libraries={libs}
           currentLibId={activeLibId}
           onClose={() => setEditingAsset(null)}
-          onSave={handleSaveAssetName}
+          onSave={handleSaveAssetEdit}
         />
       )}
 
@@ -554,6 +785,14 @@ export function AssetsView() {
           onClose={() => setPlayingVideo(null)}
         />
       )}
+
+      {/* 2026-08-15：图片/音频点击预览弹窗（视频走 VideoPlayerModal） */}
+      {previewingAsset && (
+        <AssetPreviewModal
+          asset={previewingAsset}
+          onClose={() => setPreviewingAsset(null)}
+        />
+      )}
     </div>
   );
 }
@@ -562,47 +801,114 @@ function LibraryDialog({
   mode,
   initial,
   libs,
+  parent,
   onClose,
   onSave,
 }: {
   mode: 'create' | 'edit';
   initial: MediaLibrary | null;
   libs: MediaLibrary[];
+  /**
+   * 2026-08-15 V19：当前层父库（仅 create 模式有意义）
+   * - null：根层新建，库类型可选
+   * - 非空：在该父库下建子库
+   *   - bizType 自动锁定为父库 bizType（普通/虚拟人/真人）
+   *   - 真人库子库继续强制要求 authPurpose / authExpireAt
+   * 编辑模式忽略此参数（不允许改父库）
+   */
+  parent: MediaLibrary | null;
   onClose: () => void;
-  onSave: (payload: { name: string; description: string }) => Promise<void>;
+  onSave: (payload: {
+    name: string;
+    description: string;
+    bizType?: string;
+    authPurpose?: string;
+    authExpireAt?: string;
+    parentId?: number | null;
+  }) => Promise<void>;
 }) {
+  // 锁定逻辑（V19+V22）：
+  // - 编辑模式：沿用 initial.bizType（父库不可改）
+  // - 新建子库：父库是 virtual_human/real_person → 锁定为父类型（业务约束），
+  //   父库是 normal → 不锁，可选 normal/virtual_human/real_person
+  // - 新建根库：默认 normal，可自由选
+  const initialBiz = (() => {
+    if (initial?.bizType) return String(initial.bizType);
+    if (parent?.bizType) {
+      const pb = String(parent.bizType);
+      if (pb === 'virtual_human' || pb === 'real_person') return pb;
+    }
+    return 'normal';
+  })();
   const [name, setName] = useState(initial?.name ?? '');
   const [description, setDescription] = useState(initial?.description ?? '');
+  // V18 业务类型（编辑模式下沿用原有值，新建有 parent 时锁定为 parent 值，默认 normal）
+  const [bizType, setBizType] = useState<string>(initialBiz);
+  const [authPurpose, setAuthPurpose] = useState<string>(initial?.authPurpose ?? '');
+  const [authExpireAt, setAuthExpireAt] = useState<string>(initial?.authExpireAt ?? '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 预校验：是否与已有资产库重名（排除正在编辑的那个）
+  // 2026-08-15 V19：当前 dialog 是建子库？
+  const isSubLibrary = mode === 'create' && parent != null;
+  // 父库类型锁定（V22）：
+  // - 仅在父库是 virtual_human/real_person 时锁定（业务约束）
+  // - 普通库下建子库不锁，可自由选 bizType
+  // - 编辑模式：父库不可改（initialBiz 已锁定初值）
+  const parentIsRestricted = parent?.bizType
+    ? (String(parent.bizType) === 'virtual_human' || String(parent.bizType) === 'real_person')
+    : false;
+  const bizTypeLocked = (mode === 'create' && isSubLibrary && parentIsRestricted) || mode === 'edit';
+  // 同级重名校验：建根库 → 排除 parentId=null 的同级；建子库 → 排除 parentId=parent.id 的同级
   const isDuplicate = useMemo(() => {
     const trimmed = name.trim();
     if (!trimmed) return false;
-    // 从全局 libs 中找同名项
+    const targetParentId = isSubLibrary ? parent!.id : null;
     const dup = libs.some(
-      (l) => l.name === trimmed && (!initial || l.id !== initial.id)
+      (l) =>
+        l.name === trimmed
+        && (l.parentId ?? null) === (targetParentId ?? null)
+        && (!initial || l.id !== initial.id)
     );
     return dup;
-  }, [name, libs, initial]);
+  }, [name, libs, initial, isSubLibrary, parent]);
+
+  // 真人库校验：授权用途 + 有效期都必填
+  const isRealPerson = bizType === 'real_person';
+  const authIncomplete = isRealPerson && (!authPurpose.trim() || !authExpireAt);
 
   async function handleSubmit() {
     const trimmed = name.trim();
     if (!trimmed) return;
     if (isDuplicate) {
-      setError(`已存在同名资产库「${trimmed}」，请换个名称`);
+      setError(`同级已存在同名资产库「${trimmed}」，请换个名称`);
+      return;
+    }
+    if (authIncomplete) {
+      setError('真人库必须填写授权用途说明和授权有效期');
       return;
     }
     setError(null);
     setSaving(true);
     try {
-      await onSave({ name: trimmed, description: description.trim() });
+      await onSave({
+        name: trimmed,
+        description: description.trim(),
+        bizType,
+        authPurpose: isRealPerson ? authPurpose.trim() : undefined,
+        authExpireAt: isRealPerson ? authExpireAt : undefined,
+        parentId: isSubLibrary ? parent!.id : null,
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // 后端 7001 / 通用错误都显示
       if (msg.includes('已存在') || msg.includes('duplicate') || msg.includes('重名')) {
-        setError(`已存在同名资产库「${trimmed}」，请换个名称`);
+        setError(`同级已存在同名资产库「${trimmed}」，请换个名称`);
+      } else if (msg.includes('子库类型') || msg.includes('7007')) {
+        setError('子库类型必须与父库一致');
+      } else if (msg.includes('系统库') && msg.includes('父库')) {
+        setError('系统库不能作为父库');
+      } else if (msg.includes('父库不存在')) {
+        setError('父库不存在或已被删除');
       } else {
         setError(msg || '保存失败');
       }
@@ -623,11 +929,11 @@ function LibraryDialog({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-[440px] overflow-hidden rounded-2xl bg-white shadow-[0_20px_60px_rgba(0,0,0,0.15)]"
+        className="w-[480px] overflow-hidden rounded-2xl bg-white shadow-[0_20px_60px_rgba(0,0,0,0.15)]"
       >
         <div className="flex items-center justify-between px-6 pb-3 pt-5">
           <h3 className="text-base font-semibold text-[#111318]">
-            {mode === 'create' ? '新建资产库' : '编辑资产库'}
+            {mode === 'create' ? (isSubLibrary ? '新建子库' : '新建资产库') : '编辑资产库'}
           </h3>
           <button
             onClick={onClose}
@@ -638,6 +944,19 @@ function LibraryDialog({
         </div>
 
         <div className="px-6 pb-6">
+          {/* 2026-08-15 V19：父库提示（仅建子库时） */}
+          {isSubLibrary && parent && (
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-[#eaf3ff] bg-[#f5f9ff] px-3 py-2 text-[12.5px] text-[#1673ff]">
+              <CornerDownRight className="h-3.5 w-3.5" />
+              <span>
+                将作为子库归到
+                <span className="mx-1 font-medium text-[#111318]">「{parent.name}」</span>
+                下
+              </span>
+              <LibraryTypeBadge typeKey={getLibraryTypeKey(parent)} />
+            </div>
+          )}
+
           {/* 名称 */}
           <label className="mb-1.5 block text-[12.5px] font-medium text-[#5f6876]">
             资产库名称 <span className="text-[#dc2626]">*</span>
@@ -646,7 +965,7 @@ function LibraryDialog({
             autoFocus
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例如：商品素材 / 角色参考"
+            placeholder={isSubLibrary ? `例如：${parent?.name}-子分类` : '例如：商品素材 / 角色参考'}
             className={cn(
               'h-10 w-full rounded-lg border bg-white px-3 text-[13px] outline-none transition',
               isDuplicate || error
@@ -654,17 +973,82 @@ function LibraryDialog({
                 : 'border-[#edf0f4] focus:border-[#1673ff] focus:shadow-[0_0_0_3px_#eaf3ff]'
             )}
           />
-          {/* 重名/错误提示 */}
           {isDuplicate && !error && (
             <div className="mt-1.5 flex items-center gap-1 text-[12px] text-[#dc2626]">
               <Info className="h-3.5 w-3.5" />
-              已存在同名资产库，请换个名称
+              {isSubLibrary
+                ? `「${parent?.name}」下已存在同名子库，请换个名称`
+                : '已存在同名资产库，请换个名称'}
             </div>
           )}
-          {error && (
-            <div className="mt-1.5 flex items-center gap-1 text-[12px] text-[#dc2626]">
-              <Info className="h-3.5 w-3.5" />
-              {error}
+
+          {/* V18: 资产库业务类型（普通 / 虚拟人 / 真人） */}
+          <label className="mb-1.5 mt-4 flex items-center gap-1 text-[12.5px] font-medium text-[#5f6876]">
+            资产库类型
+            {bizTypeLocked && (
+              <span className="ml-1 rounded bg-[#f1f5f9] px-1.5 py-0.5 text-[10px] font-normal text-[#5f6876]">
+                已锁定（与父库一致）
+              </span>
+            )}
+          </label>
+          <div className="flex gap-2">
+            {[
+              { key: 'normal', label: '普通' },
+              { key: 'virtual_human', label: '虚拟人' },
+              { key: 'real_person', label: '真人' },
+            ].map((opt) => {
+              const active = bizType === opt.key;
+              const disabled = bizTypeLocked && !active;
+              return (
+                <button
+                  key={opt.key}
+                  type="button"
+                  disabled={disabled}
+                  onClick={() => !disabled && setBizType(opt.key)}
+                  className={cn(
+                    'inline-flex h-9 flex-1 items-center justify-center rounded-lg border text-[12.5px] font-medium transition',
+                    active
+                      ? 'border-[#1673ff] bg-[#eaf3ff] text-[#006cff]'
+                      : disabled
+                        ? 'cursor-not-allowed border-[#edf0f4] bg-[#f7f7f8] text-[#cbd5e1]'
+                        : 'border-[#edf0f4] bg-white text-[#5f6876] hover:bg-[#f7f7f8] hover:text-[#111318]'
+                  )}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* 真人库专属：授权用途 + 授权有效期 */}
+          {isRealPerson && (
+            <div className="mt-4 space-y-3 rounded-lg border border-[#fde68a] bg-[#fffbeb] p-3.5">
+              <div className="text-[12px] font-medium text-[#92400e]">
+                真人库需填写授权信息
+              </div>
+              <div>
+                <label className="mb-1 block text-[12px] font-medium text-[#5f6876]">
+                  授权用途说明 <span className="text-[#dc2626]">*</span>
+                </label>
+                <textarea
+                  value={authPurpose}
+                  onChange={(e) => setAuthPurpose(e.target.value)}
+                  placeholder="可填写入库可使用素材的授权说明"
+                  rows={2}
+                  className="w-full resize-none rounded-lg border border-[#edf0f4] bg-white px-3 py-2 text-[12.5px] leading-relaxed outline-none focus:border-[#1673ff] focus:shadow-[0_0_0_3px_#eaf3ff]"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-[12px] font-medium text-[#5f6876]">
+                  素材有效期限 <span className="text-[#dc2626]">*</span>
+                </label>
+                <input
+                  type="date"
+                  value={authExpireAt}
+                  onChange={(e) => setAuthExpireAt(e.target.value)}
+                  className="h-9 w-full rounded-lg border border-[#edf0f4] bg-white px-3 text-[12.5px] outline-none focus:border-[#1673ff] focus:shadow-[0_0_0_3px_#eaf3ff]"
+                />
+              </div>
             </div>
           )}
 
@@ -677,9 +1061,16 @@ function LibraryDialog({
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             placeholder="简单描述这个资产库的用途（可选）"
-            rows={3}
+            rows={2}
             className="w-full resize-none rounded-lg border border-[#edf0f4] bg-white px-3 py-2 text-[13px] leading-relaxed outline-none focus:border-[#1673ff] focus:shadow-[0_0_0_3px_#eaf3ff]"
           />
+
+          {error && (
+            <div className="mt-3 flex items-center gap-1 text-[12px] text-[#dc2626]">
+              <Info className="h-3.5 w-3.5" />
+              {error}
+            </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 border-t border-[#edf0f4] bg-[#fafbfc] px-6 py-3.5">
@@ -691,7 +1082,7 @@ function LibraryDialog({
           </button>
           <button
             onClick={handleSubmit}
-            disabled={!name.trim() || saving || isDuplicate}
+            disabled={!name.trim() || saving || isDuplicate || authIncomplete}
             className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-[#1673ff] px-4 text-[13px] font-medium text-white hover:bg-[#006cff] disabled:opacity-50"
           >
             <Check className="h-3.5 w-3.5" />
@@ -706,12 +1097,15 @@ function LibraryDialog({
 function AssetEditDialog({
   asset,
   assets,
+  libraries = [],
   currentLibId,
   onClose,
   onSave,
 }: {
   asset: MediaItem;
   assets: MediaItem[];
+  /** 2026-08-15：当前用户的所有库，供"修改所属库"下拉用 */
+  libraries?: MediaLibrary[];
   /**
    * 当前查看的 libraryId：用于定位"同库"范围
    * - undefined/null：表示"我的资产"视图（所有素材的并集，含未归库的 null 库）
@@ -719,45 +1113,56 @@ function AssetEditDialog({
    */
   currentLibId?: number | null;
   onClose: () => void;
-  onSave: (name: string) => Promise<void>;
+  /** 2026-08-15：保存回调同时收 name 和 libraryId */
+  onSave: (payload: { name: string; libraryId: number | null }) => Promise<void>;
 }) {
   const [name, setName] = useState(asset.name);
+  /** 2026-08-15：目标库（默认沿用 asset 当前库） */
+  const [targetLibId, setTargetLibId] = useState<number | null>(asset.libraryId ?? null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 重名预校验：与"当前视图同库"内其他素材比较（排除自己）
+  // 候选库：排除 system-ai（AI 库只能装 AI 产出，不能手工移入）
+  const candidateLibs = useMemo(
+    () => libraries.filter((l) => l.type !== 'system-ai'),
+    [libraries]
+  );
+
+  // 重名预校验：与"目标库"内其他素材比较（排除自己）
   const isDuplicate = useMemo(() => {
     const trimmed = name.trim();
     if (!trimmed) return false;
     return assets.some(
-      (a) => a.id !== asset.id && a.name === trimmed
+      (a) =>
+        a.id !== asset.id
+        && a.libraryId === targetLibId
+        && a.name === trimmed
     );
-  }, [name, assets, asset.id]);
+  }, [name, assets, asset.id, targetLibId]);
 
+  // 切换 name / targetLibId 时清错误
   useEffect(() => {
     setError(null);
-  }, [name]);
+  }, [name, targetLibId]);
 
   async function handleSubmit() {
     const trimmed = name.trim();
     if (!trimmed) return;
-    if (trimmed === asset.name) {
-      onClose();
-      return;
-    }
     if (isDuplicate) {
-      setError(`当前库内已存在同名素材「${trimmed}」，请换个名称`);
+      setError(`目标库「${candidateLibs.find((l) => l.id === targetLibId)?.name ?? ''}」内已存在同名素材，请换个名称`);
       return;
     }
     setError(null);
     setSaving(true);
     try {
-      await onSave(trimmed);
+      await onSave({ name: trimmed, libraryId: targetLibId });
       onClose();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes('已存在') || msg.includes('duplicate') || msg.includes('重名')) {
-        setError(`当前库内已存在同名素材「${trimmed}」，请换个名称`);
+        setError(`目标库内已存在同名素材「${trimmed}」，请换个名称`);
+      } else if (msg.includes('AI 生成结果') || msg.includes('system-ai')) {
+        setError(msg);
       } else {
         setError(msg || '保存失败');
       }
@@ -834,8 +1239,46 @@ function AssetEditDialog({
             />
           )}
 
-          {/* 名称 */}
+          {/* 2026-08-15：所属库选择（可换库） */}
           <label className="mb-1.5 block text-[12.5px] font-medium text-[#5f6876]">
+            所属资产库
+          </label>
+          <div className="flex items-center gap-2">
+            <select
+              value={targetLibId == null ? '' : String(targetLibId)}
+              onChange={(e) => setTargetLibId(e.target.value === '' ? null : Number(e.target.value))}
+              className="h-10 flex-1 rounded-lg border border-[#edf0f4] bg-white px-3 text-[13px] outline-none focus:border-[#1673ff] focus:shadow-[0_0_0_3px_#eaf3ff]"
+            >
+              {targetLibId == null && (
+                <option value="" disabled>
+                  未归库
+                </option>
+              )}
+              {candidateLibs.map((l) => {
+                const key = getLibraryTypeKey(l);
+                const tag = key === 'ai' ? 'AI' : key === 'mine' ? '我的' : key === 'virtual_human' ? '虚拟人' : key === 'real_person' ? '真人' : '普通';
+                return (
+                  <option key={l.id} value={String(l.id)}>
+                    【{tag}】{l.name}
+                  </option>
+                );
+              })}
+            </select>
+            {(() => {
+              const cur = candidateLibs.find((l) => l.id === targetLibId);
+              if (!cur) return null;
+              return <LibraryTypeBadge typeKey={getLibraryTypeKey(cur)} />;
+            })()}
+          </div>
+          {asset.libraryId !== targetLibId && targetLibId != null && (
+            <div className="mt-1.5 flex items-center gap-1 text-[12px] text-[#1673ff]">
+              <Info className="h-3.5 w-3.5" />
+              素材将移动到新库
+            </div>
+          )}
+
+          {/* 名称 */}
+          <label className="mb-1.5 mt-4 block text-[12.5px] font-medium text-[#5f6876]">
             资产名称 <span className="text-[#dc2626]">*</span>
           </label>
           <input
@@ -858,7 +1301,7 @@ function AssetEditDialog({
           {isDuplicate && !error && (
             <div className="mt-1.5 flex items-center gap-1 text-[12px] text-[#dc2626]">
               <Info className="h-3.5 w-3.5" />
-              当前库内已存在同名素材，请换个名称
+              目标库内已存在同名素材，请换个名称
             </div>
           )}
           {error && (
@@ -906,6 +1349,13 @@ function LibraryCard({
   onDelete?: () => void;
 }) {
   const canManage = !!(onEdit || onDelete);
+  // V18 业务类型
+  const biz = lib.bizType ?? 'normal';
+  const isVirtualHuman = biz === 'virtual_human';
+  const isRealPerson = biz === 'real_person';
+  // 真人库认证状态
+  const authOk = isRealPerson && lib.authStatus === 'valid';
+  const authExpired = isRealPerson && lib.authStatus === 'expired';
   return (
     <div className="group w-[180px] text-left transition-transform hover:-translate-y-0.5">
       <div
@@ -917,13 +1367,42 @@ function LibraryCard({
             ? 'bg-gradient-to-br from-[#eaf3ff] to-[#dfeaff] text-[#1673ff]'
             : lib.type === 'system-uploaded'
               ? 'bg-gradient-to-br from-[#dfeaff] to-[#cfe0ff] text-[#1673ff]'
-              : 'bg-gradient-to-br from-[#7c8cff] to-[#5b9aff] text-white'
+              : isRealPerson
+                ? 'bg-gradient-to-br from-[#fde68a] to-[#fbbf24] text-[#92400e]'
+                : isVirtualHuman
+                  ? 'bg-gradient-to-br from-[#a78bfa] to-[#7c3aed] text-white'
+                  : 'bg-gradient-to-br from-[#7c8cff] to-[#5b9aff] text-white'
         )}
       >
-        {/* 左上：AI 标签 */}
-        {isAI && (
-          <div className="absolute left-2 top-2 rounded bg-white/85 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-[#1673ff] backdrop-blur-sm">
-            AI
+        {/* 左上：标签组（AI / 虚拟人 / 真人 / 认证状态） */}
+        <div className="absolute left-2 top-2 flex flex-col gap-1">
+          {isAI && <LibraryTypeBadge typeKey="ai" />}
+          {!isAI && isVirtualHuman && <LibraryTypeBadge typeKey="virtual_human" />}
+          {!isAI && isRealPerson && <LibraryTypeBadge typeKey="real_person" />}
+          {!isAI && !isVirtualHuman && !isRealPerson && lib.type === 'custom' && (
+            <LibraryTypeBadge typeKey="normal" />
+          )}
+        </div>
+
+        {/* 右上：真人库认证状态 */}
+        {isRealPerson && (
+          <div className="absolute right-2 top-2">
+            {authOk && (
+              <div className="flex items-center gap-1 rounded bg-[#10b981] px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                <span className="h-1.5 w-1.5 rounded-full bg-white" />
+                已认证
+              </div>
+            )}
+            {authExpired && (
+              <div className="rounded bg-[#dc2626] px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                已过期
+              </div>
+            )}
+            {!authOk && !authExpired && (
+              <div className="rounded bg-white/85 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-[#92400e] backdrop-blur-sm">
+                未认证
+              </div>
+            )}
           </div>
         )}
 
@@ -933,6 +1412,10 @@ function LibraryCard({
             <IconAiSparkle className="h-9 w-9" />
           ) : lib.type === 'system-uploaded' ? (
             <IconLibraryAll className="h-9 w-9" />
+          ) : isRealPerson ? (
+            <IconPerson className="h-9 w-9" />
+          ) : isVirtualHuman ? (
+            <IconUserCircle className="h-9 w-9" />
           ) : (
             <IconFolder className="h-9 w-9" />
           )}
@@ -944,44 +1427,67 @@ function LibraryCard({
         </div>
 
         {/* 右下：操作按钮组（hover 显示） */}
-        {canManage && (
-          <div className="absolute bottom-2 right-2 flex items-center gap-1.5 opacity-0 transition group-hover:opacity-100">
-            {onEdit && (
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onEdit();
-                }}
-                title="编辑"
-                className="grid h-7 w-7 place-items-center rounded-lg bg-black/55 text-white backdrop-blur-sm transition hover:bg-[#1673ff]"
-              >
-                <Pencil className="h-3.5 w-3.5" />
-              </button>
-            )}
-            {onDelete && (
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                }}
-                title="删除"
-                className="grid h-7 w-7 place-items-center rounded-lg bg-black/55 text-white backdrop-blur-sm transition hover:bg-[#dc2626]"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
-        )}
+        <div className="absolute bottom-2 right-2 flex items-center gap-1.5">
+          {canManage && (
+            <div className="flex items-center gap-1.5 opacity-0 transition group-hover:opacity-100">
+              {onEdit && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEdit();
+                  }}
+                  title="编辑"
+                  className="grid h-7 w-7 place-items-center rounded-lg bg-black/55 text-white backdrop-blur-sm transition hover:bg-[#1673ff]"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+              )}
+              {onDelete && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete();
+                  }}
+                  title="删除"
+                  className="grid h-7 w-7 place-items-center rounded-lg bg-black/55 text-white backdrop-blur-sm transition hover:bg-[#dc2626]"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       <div onClick={onClick} className="mt-2.5 flex cursor-pointer items-center gap-1.5">
         <span className="truncate text-[13.5px] font-medium text-[#111318]">{lib.name}</span>
+        {lib.hasChildren && (
+          <span
+            title="该库下有子库"
+            className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-[#eaf3ff] px-1.5 py-[1px] text-[10px] font-medium text-[#1673ff]"
+          >
+            <CornerDownRight className="h-2.5 w-2.5" />
+            子库
+          </span>
+        )}
       </div>
       <div className="mt-0.5 truncate text-xs text-[#8a909b]">
         {lib.description ||
-          (isAI ? 'AI 创作产出' : isAllAssetsView(lib) ? '所有素材' : '自建分类')}
+          (isAI
+            ? 'AI 创作产出'
+            : isAllAssetsView(lib)
+              ? '所有素材'
+              : isRealPerson
+                ? authOk
+                  ? '已认证真人库'
+                  : authExpired
+                    ? '授权已过期'
+                    : '待认证真人库'
+                : isVirtualHuman
+                  ? '虚拟人素材库'
+                  : '自建分类')}
       </div>
     </div>
   );
@@ -1000,6 +1506,7 @@ function AssetCard({
   onDelete,
   onDownload,
   onPlayVideo,
+  onPreview,
 }: {
   asset: MediaItem;
   selecting: boolean;
@@ -1009,10 +1516,12 @@ function AssetCard({
   onDelete: () => void;
   onDownload: () => void;
   onPlayVideo: (asset: MediaItem) => void;
+  /** 2026-08-15：非选择态下点击图片/音频卡片 → 打开预览弹窗 */
+  onPreview: (asset: MediaItem) => void;
 }) {
   return (
     <div
-      onClick={selecting ? onToggleSelect : undefined}
+      onClick={selecting ? onToggleSelect : () => onPreview(asset)}
       className={cn(
         'group relative cursor-pointer overflow-hidden rounded-xl border border-[#edf0f4] bg-white shadow-[0_10px_24px_rgba(25,31,45,0.05)] transition hover:-translate-y-0.5 hover:border-[#cbd5e1] hover:shadow-[0_16px_34px_rgba(25,31,45,0.08)]',
         selected && 'border-[#1673ff] shadow-[0_0_0_2px_#eaf3ff]'
@@ -1031,8 +1540,10 @@ function AssetCard({
           />
         ) : asset.type === 'video' ? (
           <VideoThumbnail
-            assetId={asset.id}
+            url={asset.url}
             onPlay={() => onPlayVideo(asset)}
+            // 2026-08-15：多选态下点击应触发选择，不触发播放
+            disabled={selecting}
           />
         ) : (
           <div className="grid h-full w-full place-items-center">
@@ -1042,17 +1553,18 @@ function AssetCard({
         <div className="absolute right-2 top-2 rounded bg-black/75 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur-sm">
           {asset.type === 'image' ? '图片' : asset.type === 'video' ? '视频' : '音频'}
         </div>
+        {/* AI 徽章：固定左上，不随选择态跳动 */}
         {asset.source === 'ai-generated' && (
           <div className="absolute left-2 top-2 rounded bg-[#1673ff] px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-white">
             AI
           </div>
         )}
 
-        {/* 选择 checkbox */}
+        {/* 选择 checkbox：放左下角，避开左上 AI 徽章和右上类型标签 */}
         {selecting && (
           <div
             className={cn(
-              'absolute left-2 top-2 grid h-5 w-5 place-items-center rounded-md border-2 transition',
+              'absolute bottom-2 left-2 grid h-5 w-5 place-items-center rounded-md border-2 transition',
               selected
                 ? 'border-[#1673ff] bg-[#1673ff] text-white'
                 : 'border-white bg-white/70 backdrop-blur-sm'
@@ -1182,7 +1694,7 @@ function VideoPlayerModal({
 function SkeletonGrid({ canUpload, selecting }: { canUpload: boolean; selecting: boolean }) {
   const count = selecting ? 10 : 9;
   return (
-    <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+    <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
       {canUpload && (
         <div className="aspect-[4/3] animate-pulse rounded-xl border border-dashed border-[#e0e2e7] bg-white" />
       )}
@@ -1342,5 +1854,153 @@ function IconFolderPlus({ className }: { className?: string }) {
       <path d="M12 8v8" strokeWidth="1.75" />
       <path d="M8 12h8" strokeWidth="1.75" />
     </svg>
+  );
+}
+
+/** 真人库：人物剪影（带头肩的简化像） */
+function IconPerson({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {/* 头 */}
+      <circle cx="12" cy="8" r="3.5" fill="currentColor" fillOpacity="0.18" />
+      {/* 肩 */}
+      <path
+        d="M5 19.5a7 7 0 0 1 14 0"
+        fill="currentColor"
+        fillOpacity="0.12"
+      />
+    </svg>
+  );
+}
+
+/** 虚拟人库：用户圆圈 + 装饰光环（区别于真人） */
+function IconUserCircle({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {/* 外圈 */}
+      <circle cx="12" cy="12" r="8.5" fill="currentColor" fillOpacity="0.1" />
+      {/* 头 */}
+      <circle cx="12" cy="10" r="2.8" fill="currentColor" fillOpacity="0.22" />
+      {/* 肩部弧线 */}
+      <path d="M6.5 18.5a5.5 5.5 0 0 1 11 0" />
+    </svg>
+  );
+}
+
+/* ============= 图片/音频点击预览弹窗 ============= */
+function AssetPreviewModal({
+  asset,
+  onClose,
+}: {
+  asset: MediaItem;
+  onClose: () => void;
+}) {
+  // ESC 关闭
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[1200] flex items-center justify-center bg-black/80 p-6 backdrop-blur-sm"
+      onClick={onClose}
+      role="dialog"
+      aria-modal="true"
+    >
+      {/* 顶部信息条 */}
+      <div
+        className="pointer-events-none absolute left-1/2 top-6 z-10 flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-full bg-black/60 px-5 py-2 text-white backdrop-blur-md"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <span className="text-[12px] font-medium uppercase tracking-wider text-white/70">
+          {asset.type === 'image' ? '图片预览' : '音频预览'}
+        </span>
+        <span className="h-3 w-px bg-white/30" />
+        <span className="truncate text-[13px] font-medium">{asset.name}</span>
+        {asset.source === 'ai-generated' && (
+          <span className="rounded-full bg-[#1673ff] px-2 py-0.5 text-[10px] font-semibold">
+            AI
+          </span>
+        )}
+        {asset.libraryName && (
+          <span className="rounded-full bg-white/15 px-2 py-0.5 text-[11px]">
+            {asset.libraryName}
+          </span>
+        )}
+      </div>
+
+      {/* 关闭按钮 */}
+      <button
+        type="button"
+        onClick={onClose}
+        className="absolute right-6 top-6 z-10 grid h-10 w-10 place-items-center rounded-full bg-black/60 text-white backdrop-blur-md transition hover:bg-black/80"
+        aria-label="关闭预览"
+      >
+        <X className="h-5 w-5" />
+      </button>
+
+      {/* 内容区：点击自身不关闭（避免图片点击穿透） */}
+      <div
+        className="relative flex max-h-[88vh] max-w-[92vw] items-center justify-center"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {asset.type === 'image' ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={asset.url}
+            alt={asset.name}
+            className="max-h-[88vh] max-w-[92vw] rounded-lg object-contain shadow-[0_30px_80px_rgba(0,0,0,0.5)]"
+          />
+        ) : asset.type === 'audio' ? (
+          <div className="flex w-[480px] flex-col items-center gap-6 rounded-2xl bg-white p-10 shadow-[0_30px_80px_rgba(0,0,0,0.5)]">
+            <div className="grid h-24 w-24 place-items-center rounded-full bg-gradient-to-br from-[#eaf3ff] to-[#cfe0ff] text-[#1673ff]">
+              <Music2 className="h-12 w-12" strokeWidth={1.5} />
+            </div>
+            <div className="text-center">
+              <div className="truncate text-[15px] font-medium text-[#111318]">{asset.name}</div>
+              {asset.libraryName && (
+                <div className="mt-1 text-[12px] text-[#8a909b]">{asset.libraryName}</div>
+              )}
+            </div>
+            <audio
+              src={asset.url}
+              controls
+              autoPlay
+              className="w-full"
+            />
+          </div>
+        ) : null}
+      </div>
+
+      {/* 底部操作提示 */}
+      <div className="pointer-events-none absolute bottom-6 left-1/2 -translate-x-1/2 text-[11px] text-white/60">
+        点击任意空白处或按 ESC 关闭
+      </div>
+    </div>
   );
 }
