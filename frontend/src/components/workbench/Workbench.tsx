@@ -52,7 +52,7 @@ const MODEL_META: Record<VideoModel, { description: string }> = {
 };
 const ASPECTS: AspectRatio[] = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const RESOLUTIONS: Resolution[] = ['480p', '720p', '1080p'];
-const DURATIONS: Duration[] = [5, 10, 15, 30];
+const DURATIONS: Duration[] = [5, 10, 15];
 const AI_VIDEO_MAX_REFS = 15;
 
 const SLOT_META = [
@@ -1292,7 +1292,7 @@ function SettingsCard({
               aria-label="视频时长"
               type="range"
               min={4}
-              max={30}
+              max={15}
               step={1}
               value={duration}
               onChange={(event) => setDuration(Number(event.target.value) as Duration)}

@@ -13,7 +13,7 @@ const MODELS: VideoModel[] = [
 ];
 const ASPECTS: AspectRatio[] = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const RES: Resolution[] = ['480p', '720p', '1080p'];
-const DURATIONS: Duration[] = [5, 10, 15, 30];
+const DURATIONS: Duration[] = [5, 10, 15];
 
 export function VideoSettings() {
   const {

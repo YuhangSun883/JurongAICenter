@@ -140,7 +140,7 @@ public class VideoGenerationController {
         }
         GenerateResponse resp = videoGenerationService.submitImageToVideo(
             principal.id(), fileBytes, file.getOriginalFilename(), file.getContentType(),
-            prompt, duration, resolution);
+            prompt, mapToValidDuration(duration), resolution);
         log.info("[I2V-REQ] 图生视频任务已提交: userId={}, jobId={}, status={}, taskId={}",
             principal.id(), resp.getJobId(), resp.getStatus(), resp.getComfyuiPromptId());
         return resp;
@@ -221,7 +221,7 @@ public class VideoGenerationController {
             filenames,
             mimeTypes,
             prompt,
-            duration,
+            mapToValidDuration(duration),
             resolution,
             sourceVideoUrl
         );
@@ -300,7 +300,7 @@ public class VideoGenerationController {
         }
 
         GenerateResponse resp = videoGenerationService.submitMultiImageToVideoByReferences(
-            principal.id(), fileBytesList, aliases, prompt, duration, resolution);
+            principal.id(), fileBytesList, aliases, prompt, mapToValidDuration(duration), resolution);
         log.info("[MI2V-REF-REQ] 多图生视频(references[])任务已提交: userId={}, jobId={}, status={}, taskId={}",
             principal.id(), resp.getJobId(), resp.getStatus(), resp.getComfyuiPromptId());
         return resp;
@@ -414,7 +414,7 @@ public class VideoGenerationController {
                 "所有参考图 URL 下载都失败(请检查 URL 是否公网可访问)");
         }
 
-        int duration = body.duration == null ? 4 : body.duration;
+        int duration = mapToValidDuration(body.duration == null ? 4 : body.duration);
         String resolution = body.resolution == null || body.resolution.isBlank() ? "480p" : body.resolution();
 
         GenerateResponse resp = videoGenerationService.submitVideoFromVideoWithReferences(
@@ -457,10 +457,11 @@ public class VideoGenerationController {
     }
 
     /**
-     * 校验时长，合法值 1-600 秒，默认 4。
+     * AI 视频前台最大支持 15 秒；超过 15 秒统一按 15 秒提交，低于 4 秒按 4 秒提交。
      */
     private int mapToValidDuration(int duration) {
-        if (duration < 1 || duration > 600) return 4;
+        if (duration < 4) return 4;
+        if (duration > 15) return 15;
         return duration;
     }
 }
