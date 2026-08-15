@@ -13,6 +13,7 @@ import {
   Maximize2,
   Mic2,
   Minimize2,
+  Music,
   Package,
   PanelRightClose,
   Play,
@@ -34,6 +35,8 @@ import { videoApi } from '@/api/video';
 import { mediaApi } from '@/api/media';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import { ReferenceMediaThumbnail } from '@/components/common/ReferenceMediaThumbnail';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { cn } from '@/lib/utils';
 import { promptApi, type UserPromptResult } from '@/api/prompt';
@@ -147,6 +150,7 @@ export function Workbench() {
   const [previewTab, setPreviewTab] = useState<'preview' | 'favorites'>('preview');
   const [favorites, setFavorites] = useState<FavoriteVideo[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [referencePreview, setReferencePreview] = useState<ReferenceMedia | null>(null);
   const savePopoverRef = useRef<HTMLDivElement>(null);
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const {
@@ -576,23 +580,20 @@ export function Workbench() {
                 selectedReferences.map((reference, index) => (
                   <div
                     key={reference.id}
-                    className="group/ref relative h-[60px] w-[60px] flex-none overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3]"
-                    title={reference.name}
+                    onClick={() => setReferencePreview(reference)}
+                    className="group/ref relative h-[60px] w-[60px] flex-none cursor-pointer overflow-hidden rounded-lg bg-white shadow-[0_8px_20px_rgba(21,25,36,0.06)] ring-1 ring-[#eff0f3] transition hover:ring-[#4d73ff]/40"
+                    title={`${reference.name}（点击预览）`}
                   >
-                    {reference.type === 'audio' ? (
-                      <div className="grid h-full w-full place-items-center bg-[#f3f5ff]">
-                        <Mic2 className="h-5 w-5 text-[#7892ff]" />
-                      </div>
-                    ) : (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={reference.url} alt={reference.name} className="h-full w-full object-cover" />
-                    )}
+                    <ReferenceMediaThumbnail media={reference} />
                     <span className="absolute left-1 top-1 grid h-4 min-w-4 place-items-center rounded-full bg-black/65 px-1 text-[10px] font-semibold leading-4 text-white">
                       {index + 1}
                     </span>
                     <button
                       type="button"
-                      onClick={() => setSelectedReferences((current) => current.filter((item) => item.id !== reference.id))}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setSelectedReferences((current) => current.filter((item) => item.id !== reference.id));
+                      }}
                       className="absolute right-1 top-1 hidden h-4 w-4 place-items-center rounded-full bg-black/55 text-[10px] leading-none text-white group-hover/ref:grid"
                       aria-label={`移除 ${reference.name}`}
                     >
@@ -937,6 +938,9 @@ export function Workbench() {
         showMockAssets={false}
         max={remainingReferenceSlots}
       />
+
+      {/* 参考素材预览弹窗(图片/视频/音频) — 点击已选缩略图时全屏播放 */}
+      <MediaPreviewDialog media={referencePreview} onClose={() => setReferencePreview(null)} />
 
       {/* 我的提示词弹窗 */}
       {showPromptsDialog && (

@@ -1546,8 +1546,28 @@ function AssetCard({
             disabled={selecting}
           />
         ) : (
-          <div className="grid h-full w-full place-items-center">
-            <Music2 className="h-9 w-9 text-[#cbd5e1]" strokeWidth={1.5} />
+          // 音频卡片占位图:紫色渐变 + 白色圆盘 + 底部声波条
+          <div className="relative h-full w-full overflow-hidden bg-gradient-to-br from-[#7c5cff] via-[#6f4cff] to-[#5b3fe0]">
+            {/* 装饰:左上柔光圆斑 */}
+            <div className="absolute -left-6 -top-6 h-24 w-24 rounded-full bg-white/15 blur-2xl" />
+            {/* 装饰:右下柔光圆斑 */}
+            <div className="absolute -bottom-8 -right-8 h-28 w-28 rounded-full bg-white/10 blur-2xl" />
+            {/* 居中白色圆盘 + 音频图标 */}
+            <div className="absolute inset-0 flex items-center justify-center">
+              <div className="grid h-16 w-16 place-items-center rounded-full bg-white/95 shadow-[0_8px_20px_rgba(0,0,0,0.18)]">
+                <Music2 className="h-8 w-8 text-[#6f4cff]" strokeWidth={2} />
+              </div>
+            </div>
+            {/* 底部声波条 */}
+            <div className="absolute bottom-4 left-0 right-0 flex items-end justify-center gap-1 px-6">
+              {[10, 18, 14, 22, 16, 12, 20, 14].map((h, i) => (
+                <span
+                  key={i}
+                  className="w-1 rounded-full bg-white/55"
+                  style={{ height: `${h}px` }}
+                />
+              ))}
+            </div>
           </div>
         )}
         <div className="absolute right-2 top-2 rounded bg-black/75 px-2 py-0.5 text-[11px] font-medium text-white backdrop-blur-sm">

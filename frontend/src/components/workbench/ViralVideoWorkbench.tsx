@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import { useMediaPicker } from '@/contexts/MediaPickerContext';
 import type { PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
 
 interface QueueTask {
   id: string;
@@ -39,6 +40,8 @@ export function ViralVideoWorkbench() {
   const [audio, setAudio] = useState<PickedMedia | null>(null);
   const [selectedResultIds, setSelectedResultIds] = useState<string[]>([]);
   const [tasks, setTasks] = useState<QueueTask[]>([]);
+  /** 预览素材(视频/音频) */
+  const [preview, setPreview] = useState<PickedMedia | null>(null);
 
   function openVideoPicker() {
     openMediaPicker({
@@ -163,12 +166,17 @@ export function ViralVideoWorkbench() {
                 {videos.length > 0 ? (
                   <div className="mt-2 space-y-1.5">
                     {videos.map((video) => (
-                      <div key={video.id} className="flex items-center gap-2 rounded-lg border border-[#e4e5e9] bg-white px-2.5 py-1.5">
+                      <div
+                        key={video.id}
+                        onClick={() => setPreview(video)}
+                        className="flex cursor-pointer items-center gap-2 rounded-lg border border-[#e4e5e9] bg-white px-2.5 py-1.5 transition hover:border-[#9aaef8]"
+                        title={`${video.name}（点击预览）`}
+                      >
                         <Video className="h-3.5 w-3.5 flex-none text-[#7b8cff]" />
                         <span className="min-w-0 flex-1 truncate text-[11px] font-medium">{video.name}</span>
                         <button
                           type="button"
-                          onClick={() => setVideos((current) => current.filter((item) => item.id !== video.id))}
+                          onClick={(e) => { e.stopPropagation(); setVideos((current) => current.filter((item) => item.id !== video.id)); }}
                           className="grid h-5 w-5 place-items-center rounded text-[#9ca2ad] hover:bg-[#f3f4f6]"
                           aria-label={`移除 ${video.name}`}
                         >
@@ -208,12 +216,24 @@ export function ViralVideoWorkbench() {
                 <div className="flex min-h-[112px] items-center justify-center rounded-lg border border-[#e4e5e9] bg-[#fbfbfc] px-3">
                   {segments.length > 0 ? (
                     <div className="grid w-full grid-cols-2 gap-1.5">
-                      {segments.map((segment) => (
-                        <div key={segment.id} className="flex items-center gap-1.5 rounded-md border border-[#e8ebf1] bg-white px-2 py-2 text-[10px]">
-                          <Film className="h-3 w-3 flex-none text-[#7b8cff]" />
-                          <span className="min-w-0 truncate">{segment.name}</span>
-                        </div>
-                      ))}
+                      {segments.map((segment) => {
+                        const sourceVideo = videos.find((v) => v.url === segment.sourceUrl);
+                        return (
+                          <button
+                            type="button"
+                            key={segment.id}
+                            onClick={() => {
+                              if (sourceVideo) setPreview(sourceVideo);
+                            }}
+                            disabled={!sourceVideo}
+                            className="flex items-center gap-1.5 rounded-md border border-[#e8ebf1] bg-white px-2 py-2 text-[10px] transition hover:border-[#9aaef8] disabled:cursor-default"
+                            title={sourceVideo ? `${segment.name}（点击预览源视频）` : segment.name}
+                          >
+                            <Film className="h-3 w-3 flex-none text-[#7b8cff]" />
+                            <span className="min-w-0 truncate text-left">{segment.name}</span>
+                          </button>
+                        );
+                      })}
                     </div>
                   ) : (
                     <p className="text-center text-xs font-medium text-[#747b86]">
@@ -239,12 +259,16 @@ export function ViralVideoWorkbench() {
               >
                 <div className="flex min-h-[56px] items-center justify-center rounded-lg border border-[#e4e5e9] bg-[#fbfbfc] px-3">
                   {audio ? (
-                    <div className="flex w-full items-center gap-2 rounded-md bg-white px-2.5 py-2 text-xs">
+                    <div
+                      onClick={() => setPreview(audio)}
+                      className="flex w-full cursor-pointer items-center gap-2 rounded-md bg-white px-2.5 py-2 text-xs transition hover:ring-2 hover:ring-[#9aaef8]/40"
+                      title={`${audio.name}（点击预览）`}
+                    >
                       <AudioLines className="h-4 w-4 flex-none text-[#7b8cff]" />
                       <span className="min-w-0 flex-1 truncate font-medium">{audio.name}</span>
                       <button
                         type="button"
-                        onClick={() => setAudio(null)}
+                        onClick={(e) => { e.stopPropagation(); setAudio(null); }}
                         className="grid h-5 w-5 place-items-center rounded text-[#9ca2ad] hover:bg-[#f3f4f6]"
                         aria-label="移除音频"
                       >
@@ -329,6 +353,9 @@ export function ViralVideoWorkbench() {
           </aside>
         </div>
       </main>
+
+      {/* 素材预览弹窗(视频/音频) */}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

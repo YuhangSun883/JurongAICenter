@@ -6,6 +6,8 @@ import { useWorkbenchStore } from '@/store/workbench';
 import { nanoid } from 'nanoid';
 import type { ReferenceMedia } from '@/types/video';
 import { cn } from '@/lib/utils';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import { ReferenceMediaThumbnail } from '@/components/common/ReferenceMediaThumbnail';
 
 const TABS = [
   { key: 'video', label: '视频', icon: VideoIcon },
@@ -21,6 +23,7 @@ export function MediaPicker() {
   const remove = useWorkbenchStore((s) => s.removeReference);
   const inputRef = useRef<HTMLInputElement>(null);
   const [tab, setTab] = useState<TabKey>('video');
+  const [preview, setPreview] = useState<ReferenceMedia | null>(null);
   const limit = 3;
   const reached = references.length >= limit;
 
@@ -92,33 +95,21 @@ export function MediaPicker() {
       {references.length > 0 && (
         <ul className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
           {references.map((r) => (
-            <li key={r.id} className="group relative overflow-hidden rounded-xl border border-bg-line bg-bg-soft/60">
-              {r.type === 'image' ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={r.url} alt={r.name} className="h-24 w-full object-cover" />
-              ) : r.type === 'video' ? (
-                <video
-                  src={r.url}
-                  className="h-24 w-full object-cover"
-                  muted
-                  playsInline
-                  preload="metadata"
-                  onLoadedMetadata={(e) => {
-                    const v = e.currentTarget;
-                    if (v.currentTime < 0.1) v.currentTime = 0.1;
-                  }}
-                />
-              ) : (
-                <div className="grid h-24 place-items-center text-xs text-fg-muted">
-                  <Music className="h-6 w-6" />
-                </div>
-              )}
+            <li
+              key={r.id}
+              onClick={() => setPreview(r)}
+              className="group relative cursor-pointer overflow-hidden rounded-xl border border-bg-line bg-bg-soft/60 transition hover:ring-2 hover:ring-brand/40"
+            >
+              <ReferenceMediaThumbnail media={r} />
               <div className="px-2 py-1.5">
                 <div className="truncate text-xs text-fg">@{r.token}</div>
                 <div className="truncate text-[10px] text-fg-subtle">{r.name}</div>
               </div>
               <button
-                onClick={() => remove(r.id)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  remove(r.id);
+                }}
                 className="absolute right-1.5 top-1.5 grid h-6 w-6 place-items-center rounded-full bg-black/60 text-white opacity-0 transition group-hover:opacity-100"
               >
                 <X className="h-3.5 w-3.5" />
@@ -127,6 +118,7 @@ export function MediaPicker() {
           ))}
         </ul>
       )}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }

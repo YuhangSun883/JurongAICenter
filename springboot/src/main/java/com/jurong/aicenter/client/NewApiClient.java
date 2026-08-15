@@ -2219,4 +2219,196 @@ private byte[] decodeDataUri(String dataUri) {
             return "NewAPI 调用失败:" + s;
         }
     }
+
+    // ========================================================================
+    // 2026-08-15 新增:画质增强 — 严格按 v2v 视频生视频开发参考 §三
+    //   POST /v1/videos, JSON body, references[] 传视频 URL
+    //   doubao-seedance-2.0 接受 video reference 后会基于原视频重新生成
+    //   一段更清晰的视频(模型本身是生成模型,实际效果是"重生成 + 提升"，
+    //   不是真正的超分,但 NewAPI 中转站目前没有专用超分端点)。
+    // ========================================================================
+
+    /**
+     * 画质增强 — 提交视频画质增强任务
+     *
+     * <p>按 v2v 文档 §三 references[] 协议:
+     * <pre>
+     * {
+     *   "model": "doubao-seedance-2.0",
+     *   "prompt": "...",
+     *   "references": [{"media_type": "video", "url": "https://..."}],
+     *   "resolution": "1080p",
+     *   "seconds": "4",
+     *   "audio": true   // 仅 "1080P · 原画 · 有声" 传 true,其余 false
+     * }
+     * </pre>
+     *
+     * @param videoUrl    源视频公网 URL(必须是 aicoming 内部或公网可 GET 的 URL,
+     *                    文档 §五:参考 URL 用签名临时链接会因排队期 URL 过期导致
+     *                    "400 参考图不可访问")
+     * @param version     "标准版" / "专业版"
+     * @param setting     "1080P · AIGC · 无" / "720P · AIGC · 无" / "1080P · 原画 · 有声"
+     *                    映射规则:
+     *                    <ul>
+     *                      <li>setting 以 "720P" 开头 → resolution=720p, audio=false</li>
+     *                      <li>setting 含 "原画"      → resolution=1080p, audio=true (保留原音)</li>
+     *                      <li>其他 (默认)            → resolution=1080p, audio=false</li>
+     *                    </ul>
+     * @return SubmitResult(taskId, url)
+     */
+    public SubmitResult submitEnhanceVideo(String videoUrl, String version, String setting) {
+        if (videoUrl == null || videoUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "videoUrl 不能为空");
+        }
+        if (!videoUrl.startsWith("http://") && !videoUrl.startsWith("https://")
+            && !videoUrl.startsWith("asset://")) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                "videoUrl 必须是 http/https/asset://, got=" + videoUrl);
+        }
+
+        // 1. 根据 setting 解析 resolution + audio 标志
+        String resolution;
+        boolean preserveAudio;
+        if (setting != null && setting.startsWith("720P")) {
+            resolution = "720p";
+            preserveAudio = false;
+        } else if (setting != null && setting.contains("原画")) {
+            resolution = "1080p";
+            preserveAudio = true;
+        } else {
+            // 默认: 1080P · AIGC · 无
+            resolution = "1080p";
+            preserveAudio = false;
+        }
+
+        // 2. 构造 prompt
+        StringBuilder promptSb = new StringBuilder();
+        promptSb.append("视频画质增强任务。请把这段参考视频的画面质量提升至 ").append(resolution)
+            .append(" 高清,保持原视频的人物动作、场景构图、镜头运动、风格色调和背景音乐。");
+        if ("专业版".equals(version)) {
+            promptSb.append("增强细节:锐化边缘、消除压缩噪点、修复低光照区域、提升人物皮肤质感、")
+                .append("增强纹理细节(头发、布料、植被),保持画面自然不浮夸。");
+        } else {
+            promptSb.append("在保持原内容的基础上提升整体清晰度。");
+        }
+        if (preserveAudio) {
+            promptSb.append("保留原视频的音轨(包括人声、配乐、环境音)。");
+        }
+        // 英文补充,提升模型理解
+        promptSb.append(" Ultra HD ").append(resolution)
+            .append(" video upscaling and quality enhancement. ")
+            .append("Preserve the original motion, composition, characters, and visual style. ")
+            .append("Reference video: @视频 1");
+        String prompt = promptSb.toString();
+
+        // 3. 构造 body — 严格按 v2v 文档 §三
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", "doubao-seedance-2.0");
+        body.put("prompt", prompt);
+        Map<String, Object> reference = new HashMap<>();
+        reference.put("media_type", "video");
+        reference.put("url", videoUrl);
+        body.put("references", java.util.List.of(reference));
+        body.put("resolution", resolution);
+        // 文档 §二:seconds 必须是字符串 "4",不能是整数
+        body.put("seconds", "4");
+        // 文档 §二:audio 控制输出是否带音频
+        //   "1080P · AIGC · 无"     → audio=false (无音轨)
+        //   "720P  · AIGC · 无"     → audio=false
+        //   "1080P · 原画 · 有声"  → audio=true  (保留参考视频原音)
+        // 仅 doubao-seedance-2.0 支持,fast 模型不带音频
+        body.put("audio", preserveAudio);
+
+        log.info("[Enhancer] submitEnhanceVideo START: videoUrl={}, version={}, setting={}, "
+                + "resolution={}, preserveAudio={}",
+            videoUrl, version, setting, resolution, preserveAudio);
+
+        long submitStart = System.currentTimeMillis();
+        JsonNode response = null;
+        Exception submitException = null;
+        try {
+            // 复用 submitVideoByAssetRefList 已验证的 exchangeToMono 模式
+            // 4xx 也能解析 body,识别"queued 占位响应"
+            response = webClientBuilder.baseUrl(videoBaseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .exchangeToMono(clientResponse -> {
+                    int status = clientResponse.statusCode().value();
+                    if (status >= 200 && status < 300) {
+                        return clientResponse.bodyToMono(JsonNode.class);
+                    }
+                    if (status >= 400) {
+                        return clientResponse.bodyToMono(String.class)
+                            .defaultIfEmpty("")
+                            .map(bodyStr -> {
+                                log.warn("[Enhancer] /v1/videos HTTP {} body={}",
+                                    status, bodyStr.length() < 500 ? bodyStr : bodyStr.substring(0, 500) + "...");
+                                try {
+                                    if (bodyStr != null && !bodyStr.isBlank()) {
+                                        return new ObjectMapper().readTree(bodyStr);
+                                    }
+                                } catch (Exception parseEx) {
+                                    log.warn("[Enhancer] body 不是 JSON: {}", parseEx.getMessage());
+                                }
+                                return null;
+                            });
+                    }
+                    return clientResponse.bodyToMono(JsonNode.class);
+                })
+                .timeout(Duration.ofSeconds(600))
+                .block();
+        } catch (Exception e) {
+            submitException = e;
+            log.error("[Enhancer] submitEnhanceVideo 异常: {} ({}ms)", e.getMessage(),
+                System.currentTimeMillis() - submitStart);
+        }
+
+        if (submitException != null) {
+            if (submitException instanceof BusinessException) throw (BusinessException) submitException;
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, submitException.getMessage());
+        }
+        if (response == null) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (enhance) 返回空响应");
+        }
+
+        // 检测 queued 占位响应
+        String respStatus = response.path("status").asText("");
+        String respId = response.path("id").asText("");
+        String respTaskId = response.path("task_id").asText("");
+        if ((respId.isEmpty() && respTaskId.isEmpty())
+            && ("queued".equalsIgnoreCase(respStatus) || "pending".equalsIgnoreCase(respStatus))) {
+            log.warn("[Enhancer] aicoming-proxy 返回 queued 占位响应 (id/task_id=null)");
+            throw new BusinessException(ErrorCode.NEWAPI_REQUEST_INVALID,
+                "aicoming 上游已入队但 id 尚未生成 (status=" + respStatus + "),请稍后重试或查询");
+        }
+
+        // 提取 task_id (优先 id 字段,与 submitVideoByAssetRefList 保持一致)
+        String taskId = response.path("id").asText(response.path("task_id").asText(""));
+        if ("none".equalsIgnoreCase(taskId) || "null".equalsIgnoreCase(taskId)) {
+            log.warn("[Enhancer] aicoming-proxy 返回占位 taskId='{}'", taskId);
+            taskId = "";
+        }
+        if (taskId.isEmpty()) {
+            log.error("[Enhancer] /v1/videos 响应缺少 id/task_id: {}", response);
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (enhance) 响应格式错误,缺少 id/task_id");
+        }
+
+        // 尝试从响应里直接拿 url(同步返回场景)
+        String directUrl = null;
+        JsonNode topUrlNode = response.get("url");
+        if (topUrlNode != null && topUrlNode.isTextual() && !topUrlNode.asText().isBlank()) {
+            directUrl = topUrlNode.asText();
+        } else if (response.path("metadata").path("url").isTextual()) {
+            directUrl = response.path("metadata").path("url").asText();
+        }
+
+        log.info("[Enhancer] submitEnhanceVideo 成功: taskId={}, directUrl={}, 耗时 {}ms",
+            taskId, directUrl, System.currentTimeMillis() - submitStart);
+        return new SubmitResult(taskId, directUrl);
+    }
 }

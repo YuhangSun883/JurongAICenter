@@ -3,11 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Upload, X, Search,
+  Upload, X, Search, Eye,
   Check, ShieldCheck, Trash2, Loader2, Music, ChevronDown, ChevronRight, CornerDownRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddMaterialCard } from './AddMaterialCard';
+import { MediaPreviewDialog } from './MediaPreviewDialog';
 import { mediaApi } from '@/api/media';
 import type { MediaAsset, MediaLibrary, MediaRole, MediaRoleCategory } from '@/types/media';
 
@@ -210,6 +211,8 @@ export function MediaPickerDialog({
   const [roleCategory, setRoleCategory] = useState<string>('all');
   /** 待删除的素材 id（弹确认弹窗用） */
   const [pendingRemoveId, setPendingRemoveId] = useState<string | null>(null);
+  /** 预览素材 */
+  const [preview, setPreview] = useState<PickedMedia | null>(null);
 
   /** ============ 真实 API 数据 ============ */
   const [libraries, setLibraries] = useState<MediaLibrary[]>([]);
@@ -463,6 +466,7 @@ export function MediaPickerDialog({
               onToggle={toggle}
               onUpload={handleUploadFiles}
               onAskRemove={(id) => setPendingRemoveId(id)}
+              onPreview={(m) => setPreview(m)}
               uploadedFiles={uploadedFiles}
               libraries={libraries}
               currentLibId={currentLibId}
@@ -481,6 +485,7 @@ export function MediaPickerDialog({
               keyword={keyword} setKeyword={setKeyword}
               pickedIds={pickedIds} onToggle={toggle}
               roles={filteredRoles}
+              onPreview={(m) => setPreview(m)}
             />
           )}
         </div>
@@ -540,6 +545,9 @@ export function MediaPickerDialog({
           </div>
         </div>
       )}
+
+      {/* 素材预览弹窗 */}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
     </div>,
     document.body
   );
@@ -547,7 +555,7 @@ export function MediaPickerDialog({
 
 /* ============= 我的资产视图 ============= */
 function AssetsView({
-  tab, setTab, source, setSource, keyword, setKeyword, pickedIds, onToggle, onUpload, onAskRemove,
+  tab, setTab, source, setSource, keyword, setKeyword, pickedIds, onToggle, onUpload, onAskRemove, onPreview,
   uploadedFiles, libraries, currentLibId, onChangeLibrary,
   assets, assetsLoading, assetsPage, assetsTotal, onChangePage, accept,
 }: {
@@ -558,6 +566,7 @@ function AssetsView({
   onToggle: (id: string) => void;
   onUpload: (files: FileList | null) => void | Promise<void>;
   onAskRemove: (id: string) => void;
+  onPreview: (m: PickedMedia) => void;
   uploadedFiles: PickedMedia[];
   libraries: MediaLibrary[];
   currentLibId: number | null;
@@ -750,10 +759,8 @@ function AssetsView({
             />
 
             {/* 用户已上传但尚未入库的素材（本地 blob URL） */}
-            {/* 已通过服务器上传的素材会同时出现在 assets 中，这里需要去重 */}
             {showUploaded && uploadedFiles
               .filter((u) => u.type === tabToType[tab])
-              .filter((u) => !assetUrls.has(u.url))
               .map((a) => {
                 const selected = pickedIds.has(a.id);
                 return (
@@ -779,9 +786,7 @@ function AssetsView({
                       }}
                     />
                   ) : a.type === 'audio' ? (
-                    <div className="grid h-full w-full place-items-center bg-bg-soft text-fg-muted">
-                      <Music className="h-6 w-6" />
-                    </div>
+                    <AudioThumbCompact />
                   ) : (
                     <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
                   )}
@@ -790,6 +795,19 @@ function AssetsView({
                         <Check className="h-3 w-3" />
                       </span>
                     )}
+                    {/* 预览按钮(hover 才显示,与删除/选中互不冲突) */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onPreview({ id: a.id, type: a.type, url: a.url, name: a.name });
+                      }}
+                      className="absolute right-1.5 bottom-7 grid h-5 w-5 place-items-center rounded-full bg-black/60 text-white opacity-0 transition hover:bg-brand group-hover:opacity-100"
+                      aria-label="预览素材"
+                      title="预览"
+                    >
+                      <Eye className="h-3 w-3" />
+                    </button>
                     <button
                       type="button"
                       onClick={(e) => { e.stopPropagation(); onAskRemove(a.id); }}
@@ -832,9 +850,7 @@ function AssetsView({
                       }}
                     />
                   ) : a.type === 'audio' ? (
-                    <div className="grid h-full w-full place-items-center bg-bg-soft text-fg-muted">
-                      <Music className="h-6 w-6" />
-                    </div>
+                    <AudioThumbCompact />
                   ) : (
                     <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
                   )}
@@ -843,6 +859,19 @@ function AssetsView({
                       <Check className="h-3 w-3" />
                     </span>
                   )}
+                  {/* 预览按钮(hover 才显示) */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onPreview({ id: String(a.id), type: a.type as 'image' | 'video' | 'audio', url: a.url, name: a.name });
+                    }}
+                    className="absolute right-1.5 bottom-7 grid h-5 w-5 place-items-center rounded-full bg-black/60 text-white opacity-0 transition hover:bg-brand group-hover:opacity-100"
+                    aria-label="预览素材"
+                    title="预览"
+                  >
+                    <Eye className="h-3 w-3" />
+                  </button>
                   <div className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-2 py-1 text-[10px] text-white">
                     {a.name}
                   </div>
@@ -888,7 +917,7 @@ function AssetsView({
 
 /* ============= 角色库视图 ============= */
 function RolesView({
-  categories, category, setCategory, keyword, setKeyword, pickedIds, onToggle, roles,
+  categories, category, setCategory, keyword, setKeyword, pickedIds, onToggle, roles, onPreview,
 }: {
   categories: MediaRoleCategory[];
   category: string;
@@ -896,6 +925,7 @@ function RolesView({
   keyword: string; setKeyword: (s: string) => void;
   pickedIds: Set<string>; onToggle: (id: string) => void;
   roles: MediaRole[];
+  onPreview: (m: PickedMedia) => void;
 }) {
   const filtered = keyword.trim()
     ? roles.filter((r) => r.name.includes(keyword.trim()))
@@ -958,6 +988,19 @@ function RolesView({
                     <span className="absolute bottom-2 right-2 grid h-5 w-5 place-items-center rounded-full bg-emerald-500 text-white shadow-soft">
                       <ShieldCheck className="h-3 w-3" />
                     </span>
+                    {/* 预览按钮(hover 才显示) */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onPreview({ id: String(r.id), type: 'image', url: r.imageUrl, name: r.name });
+                      }}
+                      className="absolute right-2 top-2 grid h-6 w-6 place-items-center rounded-full bg-black/60 text-white opacity-0 transition hover:bg-brand group-hover:opacity-100"
+                      aria-label="预览角色"
+                      title="预览"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                    </button>
                   </div>
                   <div className="px-2 py-1.5">
                     <div className="truncate text-xs text-fg">{r.name}</div>
@@ -972,5 +1015,29 @@ function RolesView({
         )}
       </div>
     </>
+  );
+}
+
+/** 音频缩略图:紫色渐变 + 白色圆盘 + 底部声波条(紧凑版,用于弹窗小卡片) */
+function AudioThumbCompact() {
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-gradient-to-br from-[#7c5cff] via-[#6f4cff] to-[#5b3fe0]">
+      <div className="absolute -left-3 -top-3 h-12 w-12 rounded-full bg-white/15 blur-xl" />
+      <div className="absolute -bottom-4 -right-4 h-14 w-14 rounded-full bg-white/10 blur-xl" />
+      <div className="absolute inset-0 flex items-center justify-center">
+        <div className="grid h-9 w-9 place-items-center rounded-full bg-white/95 shadow-[0_4px_12px_rgba(0,0,0,0.2)]">
+          <Music className="h-4 w-4 text-[#6f4cff]" strokeWidth={2.5} />
+        </div>
+      </div>
+      <div className="absolute bottom-2 left-0 right-0 flex items-end justify-center gap-[3px] px-3">
+        {[6, 10, 8, 14, 9, 7, 12, 8].map((h, i) => (
+          <span
+            key={i}
+            className="w-[2px] rounded-full bg-white/55"
+            style={{ height: `${h}px` }}
+          />
+        ))}
+      </div>
+    </div>
   );
 }

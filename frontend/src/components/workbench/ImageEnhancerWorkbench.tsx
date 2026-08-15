@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Check,
@@ -16,6 +16,12 @@ import {
 } from 'lucide-react';
 import { useMediaPicker } from '@/contexts/MediaPickerContext';
 import type { PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import {
+  submitEnhance,
+  getEnhanceJob,
+  type EnhancerJobResponse,
+} from '@/api/enhancer.real';
 
 type EnhancerVersion = '标准版' | '专业版';
 type VideoSetting = '1080P · AIGC · 无' | '720P · AIGC · 无' | '1080P · 原画 · 有声';
@@ -23,7 +29,13 @@ type VideoSetting = '1080P · AIGC · 无' | '720P · AIGC · 无' | '1080P · �
 interface QueueTask {
   id: string;
   name: string;
-  status: 'queued' | 'running';
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  /** 增强后的视频 URL（status=completed 时有值） */
+  outputUrl?: string;
+  /** 错误信息（status=failed 时有值） */
+  errorMessage?: string;
+  /** 源视频 URL（用于预览区回显） */
+  sourceUrl?: string;
 }
 
 const VERSION_OPTIONS: EnhancerVersion[] = ['标准版', '专业版'];
@@ -33,12 +45,32 @@ const VIDEO_SETTING_OPTIONS: VideoSetting[] = [
   '1080P · 原画 · 有声',
 ];
 
+/** 终态:不再轮询 */
+const TERMINAL_STATUSES = new Set(['completed', 'succeeded', 'success', 'failed', 'error', 'cancelled']);
+/** 进行中:显示"生成中" */
+const RUNNING_STATUSES = new Set(['running', 'processing', 'in_progress']);
+
 export function ImageEnhancerWorkbench() {
   const { openMediaPicker } = useMediaPicker();
   const [selectedVideo, setSelectedVideo] = useState<PickedMedia | null>(null);
   const [version, setVersion] = useState<EnhancerVersion>('标准版');
   const [videoSetting, setVideoSetting] = useState<VideoSetting>('1080P · AIGC · 无');
   const [tasks, setTasks] = useState<QueueTask[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  /** 预览素材(成片) */
+  const [preview, setPreview] = useState<PickedMedia | null>(null);
+
+  // 记录每个任务的轮询定时器,组件卸载或任务取消时清理
+  const pollTimersRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    // 组件卸载时清理所有轮询定时器,避免内存泄漏
+    return () => {
+      pollTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pollTimersRef.current.clear();
+    };
+  }, []);
 
   function openVideoPicker() {
     openMediaPicker({
@@ -58,26 +90,104 @@ export function ImageEnhancerWorkbench() {
     setSelectedVideo(null);
     setVersion('标准版');
     setVideoSetting('1080P · AIGC · 无');
+    setErrorBanner(null);
   }
 
-  function startTask() {
-    if (!selectedVideo) return;
+  function updateTask(taskId: string, patch: Partial<QueueTask>) {
+    setTasks((current) => current.map((t) => (t.id === taskId ? { ...t, ...patch } : t)));
+  }
 
-    const task: QueueTask = {
-      id: `${Date.now()}`,
+  function scheduleNextPoll(taskId: string) {
+    // 轮询间隔 4 秒,与后端约定一致
+    const timerId = window.setTimeout(() => pollOnce(taskId), 4000);
+    pollTimersRef.current.set(taskId, timerId);
+  }
+
+  async function pollOnce(taskId: string) {
+    pollTimersRef.current.delete(taskId);
+    try {
+      const job: EnhancerJobResponse = await getEnhanceJob(taskId);
+      const status = (job.status || '').toLowerCase();
+
+      if (TERMINAL_STATUSES.has(status)) {
+        if (status === 'completed' || status === 'succeeded' || status === 'success') {
+          updateTask(taskId, {
+            status: 'completed',
+            outputUrl: job.outputUrl,
+          });
+        } else {
+          updateTask(taskId, {
+            status: 'failed',
+            errorMessage: job.errorMessage || `任务失败 (status=${job.status})`,
+          });
+        }
+        return;
+      }
+
+      if (RUNNING_STATUSES.has(status)) {
+        updateTask(taskId, { status: 'running' });
+      } else {
+        // queued / pending / 其它中间态都视为排队
+        updateTask(taskId, { status: 'queued' });
+      }
+      // 继续轮询
+      scheduleNextPoll(taskId);
+    } catch (err) {
+      console.error('[Enhancer] 轮询失败', taskId, err);
+      const message = err instanceof Error ? err.message : String(err);
+      updateTask(taskId, {
+        status: 'failed',
+        errorMessage: `轮询失败: ${message}`,
+      });
+    }
+  }
+
+  async function startTask() {
+    if (!selectedVideo || submitting) return;
+    setErrorBanner(null);
+
+    // 临时 ID,提交成功后会用后端返回的 taskId 替换
+    const tempId = `pending-${Date.now()}`;
+    const initialTask: QueueTask = {
+      id: tempId,
       name: selectedVideo.name,
       status: 'queued',
+      sourceUrl: selectedVideo.url,
     };
-    setTasks((current) => [task, ...current]);
-    window.setTimeout(() => {
+    setTasks((current) => [initialTask, ...current]);
+    setSubmitting(true);
+
+    try {
+      const resp = await submitEnhance({
+        videoUrl: selectedVideo.url,
+        version,
+        setting: videoSetting,
+      });
+      if (!resp || !resp.taskId) {
+        throw new Error('后端未返回 taskId');
+      }
+      // 用真实 taskId 替换 tempId
       setTasks((current) =>
-        current.map((item) => (item.id === task.id ? { ...item, status: 'running' } : item))
+        current.map((t) => (t.id === tempId ? { ...t, id: resp.taskId } : t)),
       );
-    }, 500);
+      // 立即开始轮询
+      scheduleNextPoll(resp.taskId);
+    } catch (err) {
+      console.error('[Enhancer] 提交失败', err);
+      const message = err instanceof Error ? err.message : String(err);
+      // 移除临时任务
+      setTasks((current) => current.filter((t) => t.id !== tempId));
+      setErrorBanner(`提交失败: ${message}`);
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   const queuedCount = tasks.filter((task) => task.status === 'queued').length;
   const runningCount = tasks.filter((task) => task.status === 'running').length;
+  const completedCount = tasks.filter((task) => task.status === 'completed').length;
+  const failedCount = tasks.filter((task) => task.status === 'failed').length;
+  const latestOutput = tasks.find((task) => task.status === 'completed')?.outputUrl;
 
   return (
     <div className="min-h-screen bg-[#f7f7f8] pl-[72px] text-[#1d222b]">
@@ -159,15 +269,20 @@ export function ImageEnhancerWorkbench() {
               />
             </div>
 
-            <div className="m-3">
+            <div className="m-3 space-y-2">
+              {errorBanner ? (
+                <div className="rounded-lg border border-[#f3c5c5] bg-[#fdecec] px-3 py-2 text-xs text-[#b03434]">
+                  {errorBanner}
+                </div>
+              ) : null}
               <button
                 type="button"
-                disabled={!selectedVideo}
+                disabled={!selectedVideo || submitting}
                 onClick={startTask}
                 className="flex h-10 w-full items-center justify-center gap-3 rounded-lg bg-[#20242b] text-sm font-semibold text-white transition hover:bg-[#111318] disabled:bg-[#8b8b8b]"
               >
                 <Sparkles className="h-4 w-4" />
-                开始增强
+                {submitting ? '提交中…' : '开始增强'}
                 <span className="text-xs font-medium opacity-80">预计 -- 积分</span>
               </button>
             </div>
@@ -181,8 +296,35 @@ export function ImageEnhancerWorkbench() {
               </button>
             </div>
             <div className="grid min-h-0 flex-1 place-items-center p-8">
-              {selectedVideo ? (
-                <video src={selectedVideo.url} controls className="max-h-full max-w-full rounded-xl bg-black shadow-sm" />
+              {latestOutput ? (
+                <div className="flex w-full flex-col items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setPreview({ id: 'latest-output', type: 'video', url: latestOutput, name: '增强后成片' })}
+                    className="block cursor-pointer transition hover:opacity-90"
+                    title="点击全屏预览"
+                  >
+                    <video
+                      src={latestOutput}
+                      controls
+                      className="max-h-full max-w-full rounded-xl bg-black shadow-sm"
+                    />
+                  </button>
+                  <a
+                    href={latestOutput}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] text-[#4f7cff] hover:underline"
+                  >
+                    在新窗口打开
+                  </a>
+                </div>
+              ) : selectedVideo ? (
+                <video
+                  src={selectedVideo.url}
+                  controls
+                  className="max-h-full max-w-full rounded-xl bg-black shadow-sm"
+                />
               ) : (
                 <div className="text-center text-[#747b86]">
                   <Video className="mx-auto mb-6 h-10 w-10 stroke-[1.7]" />
@@ -199,30 +341,39 @@ export function ImageEnhancerWorkbench() {
                 收起
               </button>
             </div>
-            <div className="mx-3 grid grid-cols-2 rounded-lg border border-[#e4e5e9] bg-white py-2 text-center">
+            <div className="mx-3 grid grid-cols-4 rounded-lg border border-[#e4e5e9] bg-white py-2 text-center">
               <div>
                 <div className="text-[10px] text-[#9ca2ad]">排队中</div>
-                <div className="text-xl font-semibold leading-6">{queuedCount}</div>
+                <div className="text-base font-semibold leading-6">{queuedCount}</div>
               </div>
               <div>
                 <div className="text-[10px] text-[#9ca2ad]">生成中</div>
-                <div className="text-xl font-semibold leading-6">{runningCount}</div>
+                <div className="text-base font-semibold leading-6">{runningCount}</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-[#9ca2ad]">已完成</div>
+                <div className="text-base font-semibold leading-6 text-[#18a06b]">{completedCount}</div>
+              </div>
+              <div>
+                <div className="text-[10px] text-[#9ca2ad]">失败</div>
+                <div className="text-base font-semibold leading-6 text-[#b03434]">{failedCount}</div>
               </div>
             </div>
             <div className="mt-3 space-y-2 px-3">
               {tasks.map((task) => (
-                <div key={task.id} className="rounded-lg border border-[#e4e5e9] bg-white p-2">
-                  <div className="flex items-center gap-1.5 text-[10px] text-[#747b86]">
-                    <span className="h-1.5 w-1.5 rounded-full bg-[#4f7cff]" />
-                    {task.status === 'queued' ? '排队中' : '生成中'}
-                  </div>
-                  <p className="mt-1 truncate text-xs font-medium">{task.name}</p>
-                </div>
+                <TaskCard
+                  key={task.id}
+                  task={task}
+                  onPreview={(m) => setPreview(m)}
+                />
               ))}
             </div>
           </aside>
         </div>
       </main>
+
+      {/* 素材预览弹窗(成片) */}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }
@@ -251,6 +402,40 @@ function GuideItem({
         <span className="mt-0.5 block text-[10px] leading-4 text-[#8b929d]">{children}</span>
       </span>
     </li>
+  );
+}
+
+function TaskCard({ task, onPreview }: { task: QueueTask; onPreview: (m: PickedMedia) => void }) {
+  // 不同状态显示不同颜色的小圆点 + 文案
+  const statusMeta: Record<QueueTask['status'], { label: string; dot: string; text: string }> = {
+    queued: { label: '排队中', dot: 'bg-[#a4aab5]', text: 'text-[#747b86]' },
+    running: { label: '生成中', dot: 'bg-[#4f7cff]', text: 'text-[#4f7cff]' },
+    completed: { label: '已完成', dot: 'bg-[#18a06b]', text: 'text-[#18a06b]' },
+    failed: { label: '失败', dot: 'bg-[#b03434]', text: 'text-[#b03434]' },
+  };
+  const meta = statusMeta[task.status];
+
+  return (
+    <div className="rounded-lg border border-[#e4e5e9] bg-white p-2">
+      <div className={`flex items-center gap-1.5 text-[10px] ${meta.text}`}>
+        <span className={`h-1.5 w-1.5 rounded-full ${meta.dot}`} />
+        {meta.label}
+      </div>
+      <p className="mt-1 truncate text-xs font-medium text-[#1d222b]">{task.name}</p>
+      {task.status === 'failed' && task.errorMessage ? (
+        <p className="mt-1 line-clamp-2 text-[10px] text-[#b03434]">{task.errorMessage}</p>
+      ) : null}
+      {task.status === 'completed' && task.outputUrl ? (
+        <button
+          type="button"
+          onClick={() => onPreview({ id: task.id, type: 'video', url: task.outputUrl!, name: task.name })}
+          className="mt-1 block truncate text-left text-[10px] text-[#4f7cff] hover:underline"
+          title="点击全屏预览成片"
+        >
+          预览成片 ▶
+        </button>
+      ) : null}
+    </div>
   );
 }
 

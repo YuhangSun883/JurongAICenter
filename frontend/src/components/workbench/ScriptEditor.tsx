@@ -6,7 +6,10 @@ import { useWorkbenchStore } from '@/store/workbench';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import { ReferenceMediaThumbnail } from '@/components/common/ReferenceMediaThumbnail';
 import { cn } from '@/lib/utils';
+import type { ReferenceMedia } from '@/types/video';
 
 /**
  * AI 视频脚本编辑器：
@@ -28,6 +31,7 @@ export function ScriptEditor() {
   const [showSuggest, setShowSuggest] = useState(false);
   const [query, setQuery] = useState('');
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [preview, setPreview] = useState<ReferenceMedia | null>(null);
 
   const MAX_REFS = 15;
 
@@ -118,12 +122,7 @@ export function ScriptEditor() {
             key={r.id}
             className="group/ref relative h-20 w-20 flex-none overflow-hidden rounded-xl border border-bg-line bg-bg-soft"
           >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={r.url}
-              alt={r.name}
-              className="h-full w-full object-cover"
-            />
+            <ReferenceMediaThumbnail media={r} />
             <button
               type="button"
               onClick={() => removeReference(r.id)}

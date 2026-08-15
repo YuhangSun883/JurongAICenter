@@ -4,6 +4,8 @@ import { useState, type DragEvent } from 'react';
 import { Plus, ArrowUp, X } from 'lucide-react';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import { ReferenceMediaThumbnail } from '@/components/common/ReferenceMediaThumbnail';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { mediaApi } from '@/api/media';
 import { cn } from '@/lib/utils';
@@ -39,6 +41,7 @@ export function ChatComposer({
   const [dragOver, setDragOver] = useState(false);
   const [picked, setPicked] = useState<PickedMedia[]>([]);
   const [open, setOpen] = useState(false);
+  const [preview, setPreview] = useState<PickedMedia | null>(null);
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const remainingPickSlots = Math.max(0, AGENT_MAX_REFS - picked.length);
 
@@ -116,32 +119,19 @@ export function ChatComposer({
             {picked.map((m) => (
               <div
                 key={m.id}
-                className="group relative h-14 w-14 overflow-hidden rounded-lg border border-bg-line bg-[#f1f5f9]"
-                title={m.name}
+                onClick={() => setPreview(m)}
+                className="group relative h-14 w-14 cursor-pointer overflow-hidden rounded-lg border border-bg-line bg-[#f1f5f9]"
+                title={`${m.name}（点击预览）`}
               >
-                {/* V26+：视频类型用 <video> 标签取首帧,图片用 <img>。
-                   之前不管类型都用 <img>,视频文件被当成图片加载 → 一直破图。 */}
-                {m.type === 'video' ? (
-                  <video
-                    src={m.url}
-                    className="h-full w-full object-cover"
-                    muted
-                    playsInline
-                    preload="metadata"
-                    onLoadedData={(e) => {
-                      // 加载完元数据后跳到第 0.1s 截一帧作为缩略图,避免黑屏
-                      const v = e.currentTarget;
-                      v.currentTime = 0.1;
-                    }}
-                  />
-                ) : (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={m.url} alt={m.name} className="h-full w-full object-cover" />
-                )}
+                {/* 统一走 ReferenceMediaThumbnail：按 type 分支渲染（image/video/audio） */}
+                <ReferenceMediaThumbnail media={m} />
                 {/* V26：删除按钮 —— 悬停时显示，点击从已选列表移除 */}
                 <button
                   type="button"
-                  onClick={() => setPicked((current) => current.filter((item) => item.id !== m.id))}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPicked((current) => current.filter((item) => item.id !== m.id));
+                  }}
                   className="absolute right-0.5 top-0.5 grid h-4 w-4 place-items-center rounded-full bg-black/60 text-white opacity-0 transition group-hover:opacity-100 hover:bg-red-500"
                   title="移除"
                 >
@@ -230,6 +220,9 @@ export function ChatComposer({
         showMockAssets={false}
         max={remainingPickSlots}
       />
+
+      {/* 素材预览弹窗:点击已选缩略图时全屏播放图片/视频/音频 */}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
     </>
   );
 }
