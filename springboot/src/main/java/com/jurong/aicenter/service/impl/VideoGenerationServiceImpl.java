@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.client.AicomingAssetsClient;
 import com.jurong.aicenter.client.NewApiClient;
+import com.jurong.aicenter.client.NewApiClient.SubmitResult;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.dto.video.VideoOptions;
 import com.jurong.aicenter.entity.Job;
@@ -77,14 +78,18 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         TEMPLATE_TEXT_TO_VIDEO, TEMPLATE_IMAGE_TO_VIDEO, TEMPLATE_MULTI_IMAGE_TO_VIDEO
     );
 
+    // 2026-08-14 FIX:pollRunningVideoJobs 空结果时打日志,排查时能看到调度器在跑
+    //  (2 秒一次 INFO 日志,在生产环境不构成噪声,因为 GenerationServiceImpl.pollRunningJobs
+    //  早就有 log.debug 类似的 tick 日志)
+
     // ============================================================
     // 提交接口
     // ============================================================
 
     @Override
     public GenerateResponse submitImageToVideo(Long userId,
-                                               byte[] fileBytes, String filename, String contentType,
-                                               String prompt, int duration, String resolution) {
+                                              byte[] fileBytes, String filename, String contentType,
+                                              String prompt, int duration, String resolution) {
         // 组装 VideoOptions 并委托到 submitInternal
         VideoOptions options = VideoOptions.builder()
             .duration(duration)
@@ -312,11 +317,16 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         return submitInternal(userId, TEMPLATE_TEXT_TO_VIDEO, prompt, options, null, null);
     }
 
+
+
+
     @Override
     public GenerateResponse submitMultiImageToVideo(Long userId, String prompt,
                                                     List<byte[]> imageBytesList, VideoOptions options) {
         return submitInternal(userId, TEMPLATE_MULTI_IMAGE_TO_VIDEO, prompt, options, imageBytesList, null);
     }
+
+
 
     /**
      * 统一的提交逻辑：建 job → 调 NewAPI 提交 → 标 RUNNING。
@@ -385,11 +395,30 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
                     }
                     taskId = newApiClient.submitMultiImageToVideo(prompt, imageBytesList, options);
                 } else {
-                    // 图生视频
-                    if (imageBytesList == null || imageBytesList.isEmpty()) {
-                        throw new BusinessException(ErrorCode.INVALID_PARAM, "图生视频需要参考图");
+                    // 图生视频(image-to-video)
+                    // 2026-08-14 FIX:支持 asset_url 路径。
+                    //   CanvasVideoGenService.submitImageToVideoByAssetUrl() 走这条路径,
+                    //   它把 asset://xxx 拼到 prompt 末尾,不传 imageBytesList。
+                    //   之前直接抛"图生视频需要参考图",导致视频生成失败。
+                    //   修复:从 prompt 里提取 asset_url,调 submitVideoByAssetRef。
+                    if (imageBytesList != null && !imageBytesList.isEmpty()) {
+                        // 字节流路径:走 multipart 提交
+                        taskId = newApiClient.submitMultiImageToVideo(prompt, imageBytesList, options);
+                    } else {
+                        // asset_url 路径:从 prompt 末尾提取 asset:// 引用
+                        String assetUrl = extractAssetUrlFromPrompt(prompt);
+                        if (assetUrl == null || assetUrl.isBlank()) {
+                            throw new BusinessException(ErrorCode.INVALID_PARAM,
+                                "图生视频需要参考图:未传入 imageBytesList 且 prompt 中未找到 asset:// 引用");
+                        }
+                        log.info("[VIDEO-SUBMIT] 走 asset_url 路径: assetUrl={}, duration={}, resolution={}",
+                            assetUrl, options.getDuration(), options.getResolution());
+                        SubmitResult sr = newApiClient.submitVideoByAssetRef(
+                            prompt, assetUrl,
+                            options.getDuration(),
+                            options.getResolution() == null ? "480p" : options.getResolution());
+                        taskId = sr.taskId();
                     }
-                    taskId = newApiClient.submitMultiImageToVideo(prompt, imageBytesList, options);
                 }
                 log.info("[VIDEO-SUBMIT] jobId={} → NewAPI taskId={} (attempt {}/{})",
                     job.getId(), taskId, attempt, maxAttempts);
@@ -459,6 +488,22 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
         return new GenerateResponse(job.getId(), job.getStatus(), taskId);
     }
 
+    /**
+     * 2026-08-14 NEW:从 prompt 文本中提取 asset:// 引用。
+     *   CanvasVideoGenService.submitImageToVideoByAssetUrl() 会把 asset://xxx 拼到
+     *   prompt 末尾(如 ". 参考图: asset://aic_xxx"),submitInternal 这里走 asset_url 路径
+     *   时需要把它解析出来传给 NewApiClient.submitVideoByAssetRef()。
+     *
+     * @return 找到的 asset_url(如 "asset://aic_xxx"),没找到返回 null
+     */
+    private static String extractAssetUrlFromPrompt(String prompt) {
+        if (prompt == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("asset://[a-zA-Z0-9_]+")
+            .matcher(prompt);
+        return m.find() ? m.group() : null;
+    }
+
     // ============================================================
     // 异步轮询
     // ============================================================
@@ -483,13 +528,20 @@ public class VideoGenerationServiceImpl implements VideoGenerationService {
             log.error("[VIDEO-POLL] 查询 RUNNING job 失败", e);
             return;
         }
-        if (runningJobs.isEmpty()) return;
-
-        if (runningJobs.size() >= 5) {
-            log.info("[VIDEO-POLL] 发现 {} 个 RUNNING job", runningJobs.size());
-        } else {
-            log.debug("[VIDEO-POLL] 发现 {} 个 RUNNING job", runningJobs.size());
+        if (runningJobs.isEmpty()) {
+            // 2026-08-14 FIX:之前静默 return,导致排查时看不到调度器到底有没有跑
+            //   (job 276 提交后 5 秒立刻 FAILED 但日志里没任何 [VIDEO-POLL] 记录)。
+            //   改为 INFO,每 2 秒打一次(便于排查 + 实际生产有其它日志刷屏,不会成为噪声瓶颈)。
+            log.info("[VIDEO-POLL] tick, 当前没有 RUNNING 视频 job (template IN {})",
+                VIDEO_TEMPLATE_IDS);
+            return;
         }
+
+        // 2026-08-14 FIX:之前 < 5 个走 log.debug,默认日志级别 INFO 不输出,
+        //   导致 scheduling-1 跑过 job 273 但完全没日志,看不到 markFailed 的原因。
+        //   改为统一 log.info,排查时能看清 @Scheduled 调度。
+        log.info("[VIDEO-POLL] 发现 {} 个 RUNNING job: {}", runningJobs.size(),
+            runningJobs.stream().map(Job::getId).collect(java.util.stream.Collectors.toList()));
         for (Job job : runningJobs) {
             try {
                 processOneVideoJob(job);

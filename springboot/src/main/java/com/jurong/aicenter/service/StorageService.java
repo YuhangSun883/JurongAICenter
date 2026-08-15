@@ -45,6 +45,8 @@ public interface StorageService {
 
     String getPresignedUrl(String objectKey, int expiryHours);
 
+
+
     /**
      * 2026-08-13 新增:MinIO 兜底轮询 - 按前缀列对象
      *
@@ -55,9 +57,13 @@ public interface StorageService {
     List<String> listObjectsByPrefix(String prefix, boolean recursive);
 
     /**
-     * 按 objectKey 打开对象输入流（调用方负责关闭）
+     * 2026-08-14 新增:获取 MinIO 对象的输入流(给 MediaController 流式读取用)。
+     * 调用方负责关闭 InputStream。
+     *
+     * @param objectKey MinIO 对象 key
+     * @return InputStream
      */
-    InputStream getFileStream(String objectKey);
+    java.io.InputStream getFileStream(String objectKey);
 
     /**
      * uploadAiMedia 的返回体

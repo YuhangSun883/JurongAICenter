@@ -6,6 +6,8 @@ import com.jurong.aicenter.dto.video.VideoOptions;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.*;
@@ -20,6 +22,8 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import java.io.IOException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -34,6 +38,8 @@ import java.util.Map;
  * 背景：ComfyUI 节点的 JurongImageToVideo 在 save_video_file 阶段偶发失败，
  * 导致 outputs 为空，Spring Boot 端拿不到 video_path。
  * 此接口允许手动补救：传入 NewAPI task_id → 查状态 → 拿 URL → 下载上传到 MinIO。
+ *
+ * 2026-08-15 merge: 恢复 @Slf4j 注解（本地环境 lombok 注解处理正常）。
  */
 @Slf4j
 @Component
@@ -386,6 +392,144 @@ public class NewApiClient {
     }
 
     /**
+     * 2026-08-14 改造:支持多模态(图片)
+     *   - userContent 可以是 String(纯文本,旧用法)或 List(Map<String,Object>)(OpenAI 多模态格式)
+     *   - 多模态格式:content = [{type:"text", text:"..."}, {type:"image_url", image_url:{url:"..."}}, ...]
+     *   - 由调用方负责拼多模态 content 数组(本方法不感知图片,只负责转发)
+     *
+     * <p>协议:与 chatCompletion 相同,body 多一个 "stream": true;
+     *      响应变成 SSE 格式,每行 "data: {...}" 是一个增量,直到 "data: [DONE]" 结束。
+     *
+     * @param onToken 每收到一段 token 时调用(可能 1-3 个字)
+     */
+    public void chatCompletionStream(
+            String model, String systemPrompt, Object userContent,
+            int maxTokens, java.util.function.Consumer<String> onToken) throws IOException {
+
+        // 1) 构造 messages
+        //   - system content 仍是 String
+        //   - user content 由调用方传,可以是 String 或 List(Map)
+        List<Map<String, Object>> messages = new ArrayList<>(2);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        // 2026-08-14:user content 改 Object(Map.of 不支持 null,改用 HashMap)
+        Map<String, Object> userMsg = new HashMap<>();
+        userMsg.put("role", "user");
+        userMsg.put("content", userContent == null ? "" : userContent);
+        messages.add(userMsg);
+
+        // 2) body 关键差异:stream: true
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("max_tokens", maxTokens);
+        body.put("temperature", 0.7);
+        body.put("stream", true);
+
+        // 3) JDK HttpClient 发请求(项目里 downloadAsDataUri 已有先例 line 955)
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .build();
+
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/v1/chat/completions"))
+                .header("Authorization", "Bearer " + token)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                        objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(180))
+                .build();
+
+        try {
+            java.net.http.HttpResponse<java.io.InputStream> resp = client.send(
+                    request, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+
+            // 4) 非 200 直接抛
+            if (resp.statusCode() != 200) {
+                String errBody = new String(resp.body().readAllBytes(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                log.error("NewAPI stream failed: {} {}", resp.statusCode(), errBody);
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "LLM 流式调用失败:" + resp.statusCode());
+            }
+
+            // 5) 按行解析 SSE
+            // 2026-08-14 临时调试:把 NewAPI 原始 SSE 响应 dump 到日志(前 20 行)
+            StringBuilder rawDump = new StringBuilder();
+            int dumpLineCount = 0;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(resp.body(),
+                            java.nio.charset.StandardCharsets.UTF_8))) {
+                String line;  // 2026-08-14 修复:漏声明导致编译错误
+                int chunkIdx = 0;
+                while ((line = reader.readLine()) != null) {
+                    if (dumpLineCount < 20) {
+                        rawDump.append(line).append("\n");
+                        dumpLineCount++;
+                    }
+                    if (!line.startsWith("data: ")) continue;
+                    String payload = line.substring(6).trim();
+                    if (payload.isEmpty() || "[DONE]".equals(payload)) continue;
+
+                    try {
+                        JsonNode node = objectMapper.readTree(payload);
+                        JsonNode delta = node.path("choices").path(0).path("delta");
+                        String token = delta.path("content").asText("");
+                        if (token.isEmpty()) continue;
+
+                        // 2026-08-14 兜底:某些 NewAPI 中转的 bug 会把
+                        //   "data: " 前缀塞进 delta.content 字段(应该只在 SSE 行上,不在 content 里)
+                        //   实际表现:前端看到 "data: 好 data: 的..." 这种串字符
+                        //   而存进数据库的 LLM 真实输出是干净的(刷新页面后看到的是正常故事)
+                        //   说明每个 chunk 的 content 都是 "data: <text>" 形式
+                        //   - 先 strip 开头的 "data: "(最常见)
+                        //   - 再 strip 末尾残留的(防御)
+                        //   注:极端情况 LLM 真要输出 "data: " 字面量会被误剥,但概率极低,可接受
+                        if (token.startsWith("data: ")) {
+                            token = token.substring("data: ".length());
+                        } else if (token.startsWith("data:")) {
+                            // String.trimStart() 是 Java 21+,JDK 17 不可用
+                            // 改用 replaceFirst 去前导空格
+                            token = token.substring("data:".length()).replaceFirst("^\\s+", "");
+                        }
+                        if (token.endsWith("data: ")) {
+                            token = token.substring(0, token.length() - "data: ".length());
+                        }
+                        if (token.endsWith("data:")) {
+                            token = token.substring(0, token.length() - "data:".length());
+                        }
+
+                        if (token.isEmpty()) continue;
+
+                        // 调试:头 3 个 chunk 打 INFO log,确认 NewAPI 实际返回格式
+                        if (chunkIdx < 3) {
+                            log.info("[NewAPI-stream] chunk#{} raw='{}' cleaned='{}'",
+                                    chunkIdx, line, token);
+                            chunkIdx++;
+                        }
+
+                        onToken.accept(token);
+                    } catch (Exception e) {
+                        // 单 chunk 解码失败不致命,继续读
+                        log.debug("SSE chunk parse failed: {}", e.getMessage());
+                    }
+                }
+            }
+            // 2026-08-14 dump NewAPI 原始 SSE 响应(前 20 行)
+            log.info("=== NewAPI raw SSE dump (first {} lines) ===\n{}",
+                    dumpLineCount, rawDump);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("NewAPI chatCompletionStream failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    /**
      * 多模态 chat completion（支持图片理解）。
      *
      * <p>调用 /v1/chat/completions，传 user message 时使用 OpenAI 多模态格式：
@@ -483,7 +627,7 @@ public class NewApiClient {
         }
     }
 
-    // downloadAsDataUri 已在文件下方定义（line 1019 附近），直接复用。
+
 
     /**
      * 调 NewAPI /v1/videos（走 aicoming-video-proxy），multipart 单图直传。
@@ -532,27 +676,38 @@ public class NewApiClient {
                               String imageMime, int duration, String resolution,
                               java.util.List<String> additionalImageUrls) {
         try {
+            // 2026-08-13 FIX:补齐方法体内需要的局部变量
+            VideoOptions options = VideoOptions.builder()
+                .duration(duration)
+                .resolution(resolution)
+                .build();
+            String useResolution = (resolution != null && !resolution.isBlank())
+                ? resolution.toLowerCase() : "480p";
+            List<byte[]> imageFiles = (imageBytes != null && imageBytes.length > 0)
+                ? List.of(imageBytes) : null;
+
             MultipartBodyBuilder builder = new MultipartBodyBuilder();
             builder.part("model", "doubao-seedance-2.0");
             builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(duration));
+            builder.part("duration", String.valueOf(options.getDuration()));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
-            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
+            builder.part("resolution", useResolution);
 
             // 主图(如果有 bytes)走 multipart input_reference
-            if (imageBytes != null && imageBytes.length > 0) {
-                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
-                final String mime = imageMime != null ? imageMime : "image/png";
+            if (imageFiles != null && !imageFiles.isEmpty()) {
+                byte[] firstImageBytes = imageFiles.get(0);
+                final String fname = "canvas_input.png";
+                final String mime = "image/png";
                 // 2026-08-13 FIX: 同步发 image/input_reference/image_url 3 个字段名(模仿 Python api_client.submit_video)
                 // 原因:aicoming-proxy 8/13 改了期望字段名,只发 input_reference 会被忽略
-                ByteArrayResource imgResource1 = new ByteArrayResource(imageBytes) {
+                ByteArrayResource imgResource1 = new ByteArrayResource(firstImageBytes) {
                     @Override public String getFilename() { return fname; }
                 };
-                ByteArrayResource imgResource2 = new ByteArrayResource(imageBytes) {
+                ByteArrayResource imgResource2 = new ByteArrayResource(firstImageBytes) {
                     @Override public String getFilename() { return fname; }
                 };
-                ByteArrayResource imgResource3 = new ByteArrayResource(imageBytes) {
+                ByteArrayResource imgResource3 = new ByteArrayResource(firstImageBytes) {
                     @Override public String getFilename() { return fname; }
                 };
                 builder.part("image", imgResource1, MediaType.parseMediaType(mime));
@@ -596,14 +751,14 @@ public class NewApiClient {
                     "NewAPI /v1/videos (multi) 返回空响应");
             }
 
-            String taskId = response.path("task_id").asText(response.path("id").asText(""));
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
             if (taskId.isEmpty()) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI /v1/videos (multi) 响应缺 id/task_id: " + response);
             }
             log.info("NewAPI /v1/videos (multi) task submitted: {} (primary={}B, additionalUrls={})",
                 taskId,
-                imageBytes != null ? imageBytes.length : 0,
+                (imageFiles != null && !imageFiles.isEmpty() ? imageFiles.get(0).length : 0),
                 additionalImageUrls);
             return new SubmitResult(taskId, null);
         } catch (BusinessException e) {
@@ -664,10 +819,11 @@ public class NewApiClient {
             String useResolution = (options.getResolution() != null && !options.getResolution().isBlank())
                 ? options.getResolution().toLowerCase() : "480p";
             int duration = options.getDuration();
+            int useDuration = duration;
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(duration));
+            builder.part("duration", String.valueOf(useDuration));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
             builder.part("resolution", useResolution);
@@ -748,8 +904,11 @@ public class NewApiClient {
             // 2026-08-10 修复:优先用 task_id(NewAPI 真实任务 ID)而不是 id(任务包装 ID)。
             // 之前用 id,但 NewAPI /v1/videos/{id} 接口可能只认 task_id,导致后续 poll 一直 404,
             // 然后被 markFailed 误判任务不存在。
-            // NewAPI 兼容 OpenAI Sora API,这两个字段语义不同:id 是请求包装 ID,task_id 才是 NewAPI 内部真实任务 ID。
-            String taskId = response.path("task_id").asText(response.path("id").asText(""));
+            // 2026-08-14 FIX:按 v3.0 接口手册"用 id 字段轮询,不要用 task_id"修正:
+            //   id 是 NewAPI 中转站暴露给客户端的"请求 id",在 GET /v1/videos/{id} 时中转站做 ID 翻译,
+            //   同一个 token 创建 + 同一个 token 轮询时,**id 字段是中转站自身持久化的**,
+            //   而 task_id 是 aicoming 上游内部字段(中转站不暴露给客户端),用 task_id 轮询会 400 not_found。
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
             if (taskId.isEmpty()) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI /v1/videos 响应格式错误, 缺少 id/task_id:" + response);
@@ -758,7 +917,7 @@ public class NewApiClient {
                 taskId,
                 validImages.size(),
                 validImages.isEmpty() ? 0 : validImages.get(0).length,
-                duration, useResolution);
+                useDuration, useResolution);
             // 2026-08-11 修复:submit 响应里常常已含 video url(同步返回 + task_id 同一响应)。
             // 之前不提取就丢了,只能等 poll 30 秒后取到 → 如果 poll 出现 400 索引延迟就会被误判 FAILED。
             // 现在提取后,即使后续 poll 失败,job 也已保存 url,前端能直接播放。
@@ -1086,6 +1245,7 @@ public class NewApiClient {
         }
         return cleaned;
     }
+
     /**
      * 快速健康检查 —— 检测 NewAPI 服务是否可用
      * <p>
@@ -1205,12 +1365,25 @@ public class NewApiClient {
      * 上游会报 400 "image is required"，已废弃。
      * 手册中图生图只支持单张 image 字段，多张引用图时仅使用第一张。
      *
-     * @param prompt          生成提示词
-     * @param referenceImages 引用图片列表（base64 data URI 格式，如 data:image/png;base64,...）
+     * <p>依据 2026-08-13 18:38 实测:聚融中转站 /v1/images/generations 实际支持以下字段:
+     * <pre>
+     *   "images": ["asset://aic_人物id", "asset://aic_衣服id"]  # 推荐(数组)
+     *   "image":  ["url1","url2"]                                # 也支持(数组)
+     *   "image":  "url"                                          # 单图(降级)
+     * </pre>
+     * 实测 2 张 asset:// 图成功生成(上游 200, 2.2 MB 图片),耗时约 60s。
+     * client timeout 必须 ≥ 120s(实测 i2i 生成约 60s)。
+     *
+     * <p>流程:
+     *   (1) 遍历 referenceImages,每张 base64 → uploadAssetByMultipart → pollUntilActive
+     *   (2) POST /v1/images/generations body={model, prompt, images:[asset_url...], n:1}
+     *
+     * @param prompt          生成提示词(描述清楚每张参考图的角色: "图1穿图2的衣服...")
+     * @param referenceImages 引用图片列表(base64 data URI),至少 1 张;上游图应放第一张
      * @param size            图片尺寸
      * @param quality         图片质量
-     * @param style           图片风格
-     * @return 生成的图片（base64 data URI 格式或 URL）
+     * @param style           图片风格(中转站暂不识别, 仅留接口签名)
+     * @return 生成的图片(URL)
      */
     public String editImage(String prompt, List<String> referenceImages,
                             String size, String quality, String style) {
@@ -1301,16 +1474,16 @@ public class NewApiClient {
                 .block();
 
             if (response == null) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑返回为空（响应为 null）");
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑返回为空(响应为 null)");
             }
 
             // 4. 解析响应（与文生图同一套逻辑）
             return parseImageGenerationResponse(response, prompt, "editImage");
         } catch (Exception e) {
-            // 2026-08-13 FIX: 用 instanceof pattern matching,避免 throw e 编译错误 (Java 21 严格)
             if (e instanceof BusinessException be) throw be;
             if (e instanceof org.springframework.web.client.HttpClientErrorException he) {
-                log.error("NewAPI /v1/images/edits failed: {} {}", he.getStatusCode(), he.getResponseBodyAsString());
+                log.error("NewAPI /v1/images/generations failed: {} body={}",
+                    he.getStatusCode(), he.getResponseBodyAsString());
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI 调用失败:" + he.getStatusCode() + " " + he.getStatusText());
             }
@@ -1875,7 +2048,11 @@ public class NewApiClient {
         }
         log.info("│  [NewAPI-DEBUG] 响应: fields=[{}]", collectFieldNames(response));
         log.info("│  [NewAPI-DEBUG] 响应 body(前 1000 字符): {}", response.toString().length() < 1000 ? response.toString() : response.toString().substring(0, 1000) + "...");
-        String taskId = response.path("task_id").asText(response.path("id").asText(""));
+        // 2026-08-14 FIX:按 v3.0 接口手册"用 id 字段轮询,不要用 task_id"修正。
+        //   之前 task_id 优先导致存到 job.comfyuiPromptId 的值,后续 @Scheduled 调
+        //   pollVideo(task_id) 拿到 400 task_not_exist → markFailed → 视频生成失败。
+        //   改:优先取 id 字段(task_id 仅作为兜底)。
+        String taskId = response.path("id").asText(response.path("task_id").asText(""));
         // 2026-08-13 18:30 修复:NewAPI 3000 中转站对部分模型(如 doubao-seedance-2.0)返回
         //   {"id":"none", "task_status":"submitted", ...} 占位响应。
         //   "none" 字符串非空,会被误当成真 taskId 存到 job,后续 poll 404。

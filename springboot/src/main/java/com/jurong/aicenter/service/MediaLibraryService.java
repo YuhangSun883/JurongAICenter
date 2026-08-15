@@ -3,52 +3,70 @@ package com.jurong.aicenter.service;
 import com.jurong.aicenter.dto.media.CreateLibraryRequest;
 import com.jurong.aicenter.dto.media.MediaLibraryResponse;
 import com.jurong.aicenter.dto.media.RenameLibraryRequest;
+import com.jurong.aicenter.entity.MediaLibrary;
 
 import java.util.List;
 
 public interface MediaLibraryService {
 
     /**
-     * 鍒楀嚭褰撳墠鐢ㄦ埛鎵€鏈夎祫浜у簱锛堝惈 2 涓郴缁熷簱 + custom 搴擄級
+     * 列出当前用户所有资产库（含 2 个系统库 + custom 库）。
+     * 2026-08-15 V19 调整：默认返回全部（含子库），并填充 hasChildren。
+     * 前端如果只需要根库，可改调 listRootLibraries。
      */
     List<MediaLibraryResponse> listLibraries(Long userId);
 
     /**
-     * 鏂板缓 custom 璧勪骇搴擄紙绯荤粺搴撲笉鍙墜鍔ㄥ垱寤猴級
+     * 2026-08-15 V19: 只列根库（parent_id IS NULL）。
+     */
+    List<MediaLibraryResponse> listRootLibraries(Long userId);
+
+    /**
+     * 2026-08-15 V19: 列某父库下直接子库。
+     */
+    List<MediaLibraryResponse> listChildLibraries(Long userId, Long parentId);
+
+    /**
+     * 2026-08-15 V19: 取某库面包屑（root → ... → 自己），按 depth 从远到近。
+     */
+    List<MediaLibraryResponse> getBreadcrumb(Long userId, Long libraryId);
+
+    /**
+     * 新建 custom 资产库（系统库不可手动创建）。V19 起支持 parentId。
      */
     MediaLibraryResponse createLibrary(Long userId, CreateLibraryRequest request);
 
     /**
-     * 閲嶅懡鍚嶈祫浜у簱锛堢郴缁熷簱涓嶅彲閲嶅懡鍚嶏級
+     * 重命名资产库（系统库不可重命名）。V19 起父库不可改。
      */
     MediaLibraryResponse renameLibrary(Long userId, Long libraryId, RenameLibraryRequest request);
 
     /**
-     * 鍒犻櫎 custom 璧勪骇搴擄紝杩炲悓搴撳唴绱犳潗 + MinIO 瀵硅薄
+     * 删除 custom 资产库，连同本库及所有后代库的素材一起删。
+     * 系统库不能删。V19 起递归删除整棵子树。
      */
     void deleteLibrary(Long userId, Long libraryId);
 
     /**
-     * 娉ㄥ唽鏃惰皟鐢細鍒涘缓 2 涓郴缁熼粯璁ゅ簱锛堜簨鍔″唴锛?
+     * 注册时调用：创建 2 个系统默认库（事务内）
      */
     void createDefaultLibraries(Long userId);
 
     /**
-     * 鎷跨敤鎴风殑"AI 鐢熸垚缁撴灉"搴?
+     * 取用户的"AI 生成结果"库
      */
-    com.jurong.aicenter.entity.MediaLibrary getAiLibrary(Long userId);
+    MediaLibrary getAiLibrary(Long userId);
 
     /**
-     * 鎷跨敤鎴风殑"鎴戠殑璧勪骇"搴擄紱娌℃湁鍒欒嚜鍔ㄥ缓涓€涓?
+     * 取用户的"我的资产"库；没有则自动建一个
      */
-    com.jurong.aicenter.entity.MediaLibrary getOrCreateUploadLibrary(Long userId);
-    default com.jurong.aicenter.entity.MediaLibrary getUploadLibrary(Long userId) {
+    MediaLibrary getOrCreateUploadLibrary(Long userId);
+    default MediaLibrary getUploadLibrary(Long userId) {
         return getOrCreateUploadLibrary(userId);
     }
 
-
     /**
-     * 鎷跨敤鎴烽涓?custom 搴擄紙鎸?sort_order 鎺掑簭锛夛紱娌℃湁鍒欏缓涓€涓?"鏈垎绫?
+     * 取用户第一个 custom 库（按 sort_order 排序）；没有则建一个"未分类"
      */
-    com.jurong.aicenter.entity.MediaLibrary getOrCreateDefaultCustom(Long userId);
+    MediaLibrary getOrCreateDefaultCustom(Long userId);
 }

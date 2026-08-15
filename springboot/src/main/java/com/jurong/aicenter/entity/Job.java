@@ -28,7 +28,9 @@ public class Job {
      *   与 ComfyUI prompt_id 无关。
      *   未来重构应迁移到 {@code newapiTaskId} 字段,保持向后兼容。
      */
-    @Deprecated
+    // 2026-08-14:移除 @Deprecated 注解,避免 Lombok 把注解复制到自动生成的 getter/setter 上,
+    //   导致调用方 (VideoGenerationServiceImpl 等) 编译报"已过时"警告。
+    //   字段语义仍按 NewAPI task_id 使用,后续重构再迁移到新字段。
     private String comfyuiPromptId;
 
     /** PENDING / RUNNING / COMPLETED / FAILED / CANCELLED */

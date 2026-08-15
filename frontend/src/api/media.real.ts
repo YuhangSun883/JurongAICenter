@@ -21,6 +21,37 @@ export async function listLibraries(): Promise<MediaLibrary[]> {
   return res ?? [];
 }
 
+/**
+ * 2026-08-15 V19：只列根库（parent_id IS NULL）
+ * 用于首屏加载时只显示顶层库，避免重复展示子库
+ */
+export async function listRootLibraries(): Promise<MediaLibrary[]> {
+  const res = await request<MediaLibrary[]>(`${API}/libraries/roots`);
+  return res ?? [];
+}
+
+/**
+ * 2026-08-15 V19：列某父库下直接子库
+ * - 父库 id=0 或不合法：返回空数组
+ * - 返回按 sort_order ASC, id ASC
+ */
+export async function listChildLibraries(parentId: number): Promise<MediaLibrary[]> {
+  if (!parentId || parentId <= 0) return [];
+  const res = await request<MediaLibrary[]>(`${API}/libraries/${parentId}/children`);
+  return res ?? [];
+}
+
+/**
+ * 2026-08-15 V19：取某库面包屑（root → ... → 当前）
+ * - 返回按从远到近的顺序，第一项是根库，最后一项是当前库
+ * - 如果 id 不存在或不属于当前用户，返回空数组
+ */
+export async function getLibraryBreadcrumb(libraryId: number): Promise<MediaLibrary[]> {
+  if (!libraryId || libraryId <= 0) return [];
+  const res = await request<MediaLibrary[]>(`${API}/libraries/${libraryId}/breadcrumb`);
+  return res ?? [];
+}
+
 export async function createLibrary(req: CreateLibraryRequest): Promise<MediaLibrary> {
   return request<MediaLibrary>(`${API}/libraries`, { method: 'POST', body: req });
 }
@@ -54,6 +85,22 @@ export async function renameAsset(id: number, name: string): Promise<MediaItem> 
   return request<MediaItem>(`${API}/assets/${id}`, {
     method: 'PATCH',
     body: { name } as PatchAssetRequest,
+  });
+}
+
+/**
+ * 2026-08-15：通用 PATCH 资产。
+ * - 只传 name：等价于重命名
+ * - 只传 libraryId：把素材搬到目标库
+ * - 都传：同时改名+搬库
+ */
+export async function patchAsset(
+  id: number,
+  payload: { name?: string; libraryId?: number | null }
+): Promise<MediaItem> {
+  return request<MediaItem>(`${API}/assets/${id}`, {
+    method: 'PATCH',
+    body: payload as PatchAssetRequest,
   });
 }
 

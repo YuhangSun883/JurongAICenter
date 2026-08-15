@@ -8,6 +8,7 @@ import type {
   GenerateVideoScriptResponse,
   ListTasksQuery,
   ListTasksResponse,
+  TaskStatus,
   VideoTask,
 } from '@/types/video';
 
