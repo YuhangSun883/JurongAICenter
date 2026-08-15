@@ -61,6 +61,17 @@ newapi:
   token: ${NEWAPI_TOKEN:}
 
 # ============================================================
+# 独立后台首个管理员初始化
+# 只写 console_admins 表，不会修改前台 users 用户密码。
+# 线上第一次启动前设置 CONSOLE_ADMIN_EMAIL / CONSOLE_ADMIN_PASSWORD 即可。
+# ============================================================
+console:
+  bootstrap:
+    email: ${CONSOLE_ADMIN_EMAIL:}
+    password: ${CONSOLE_ADMIN_PASSWORD:}
+    display-name: ${CONSOLE_ADMIN_DISPLAY_NAME:超级管理员}
+
+# ============================================================
 # aicoming-video-proxy 配置（素材库 CRUD 走这里 :8080）
 # 文档 §3 明说：素材上传不走 new-api（:3000 会 404），必须直连 proxy
 # 默认指向雨云 192.140.163.161:8080，部署时通过环境变量覆盖

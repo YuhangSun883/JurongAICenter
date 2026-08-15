@@ -164,6 +164,7 @@ export function MediaPickerDialog({
 
   // ============ 派生 ============
   const showUploadedHere = activeTopTab === 'assets' && (source === '全部' || source === '我上传的');
+  const assetUrls = new Set(assets.map((asset) => asset.url).filter(Boolean));
   const visiblePickedCount =
     (showUploadedHere
       ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id)).length
@@ -498,7 +499,7 @@ function AssetsView({
             {/* 已通过服务器上传的素材会同时出现在 assets 中，这里需要去重 */}
             {showUploaded && uploadedFiles
               .filter((u) => u.type === tabToType[tab])
-              .filter((u) => !assets.some((a) => a.url === u.url))
+              .filter((u) => !assetUrls.has(u.url))
               .map((a) => {
                 const selected = pickedIds.has(a.id);
                 return (

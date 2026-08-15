@@ -885,11 +885,22 @@ public class NewApiClient {
             // aicoming 只接受小写 resolution（480p/720p/1080p/4k）
             String useResolution = (options.getResolution() != null && !options.getResolution().isBlank())
                 ? options.getResolution().toLowerCase() : "480p";
-            int useDuration = options.getDuration();
+            int useDuration = options.getDuration() <= 0 ? 4 : options.getDuration();
+            byte[] imageBytes = null;
+            if (imageFiles != null) {
+                for (byte[] file : imageFiles) {
+                    if (file != null && file.length > 0) {
+                        imageBytes = file;
+                        break;
+                    }
+                }
+            }
+            String imageFilename = "input_reference.png";
+            String imageMime = "image/png";
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(options.getDuration()));
+            builder.part("duration", String.valueOf(useDuration));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
             builder.part("resolution", useResolution);
