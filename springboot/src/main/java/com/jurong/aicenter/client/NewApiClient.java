@@ -80,9 +80,6 @@ public class NewApiClient {
     }
 
 
-    // 2026-08-09 显式 log 字段(替代 @Slf4j,兼容 lombok 不跑的环境)
-    private static final Logger log = LoggerFactory.getLogger(NewApiClient.class);
-
     // 2026-08-09 14:32 静态 ObjectMapper(解析 gpt-5.5 返回的 JSON 数组)
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -651,9 +648,9 @@ public class NewApiClient {
      * @param imageFiles    多张上游图片（每张发 3 个字段名：image / input_reference / image_url 兼容 doubao / aicoming-proxy）。
      *                      文生视频传 null，内部用占位图。
      * @param options       视频生成参数（duration / resolution / ratio / audio / watermark / seed / model）
-     * @return              NewAPI 返回的 task_id
+     * @return              SubmitResult（taskId + 可能含直接返回的 video URL）
      */
-    public String submitVideo(String prompt, List<byte[]> imageFiles, VideoOptions options) {
+    public SubmitResult submitVideo(String prompt, List<byte[]> imageFiles, VideoOptions options) {
         if (options == null) {
             options = VideoOptions.builder().build();
         }
@@ -664,29 +661,47 @@ public class NewApiClient {
             // aicoming 只接受小写 resolution（480p/720p/1080p/4k）
             String useResolution = (options.getResolution() != null && !options.getResolution().isBlank())
                 ? options.getResolution().toLowerCase() : "480p";
+            int duration = options.getDuration();
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
             builder.part("duration", String.valueOf(duration));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
-            builder.part("resolution", resolution == null ? "480p" : resolution.toLowerCase());
+            builder.part("resolution", useResolution);
             // ratio / watermark 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐏忓繘姊洪崨濠庢畷濠电偛锕ら锝囨嫚濞村顫嶅┑鈽嗗灦閺€閬嶅棘閳ь剟姊绘担鍛婂暈婵炶绠撳畷鎴﹀礋椤掍礁寮块梺闈涚箞閸婃牠鍩涢幋鐐电闁煎ジ顤傞崵娆愵殽閻愭惌娈滈柡宀€鍠栭獮鏍ㄦ媴閾忚姣囬梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁煕閻樺疇澹樻い顓炴喘楠炲洭顢橀悩娈垮晭闂備礁鎲￠悷銉┧囨潏銊︽珷妞ゅ繐鐗婇崑鍌炴煏閸繍妲归柣鎾卞劦閺岋繝宕堕埡浣风捕婵炲瓨绮嶆竟鍡欐閹炬剚鍚嬮柛鈩冪懃閳峰矂姊洪崫鍕効缂佺粯绻傞悾鐑藉醇閺囩倣銊╂煏婢诡垰鍊诲Λ顖炴⒒閸屾瑨鍏岀紒顕呭灦楠炴劗鎷犵憗浣告惈椤粓鍩€椤掍椒绻嗛柣銏㈩焾缁€瀣亜閺嶃劍鐨戦柣銈傚亾闂傚倷绀侀幉锟犲箰閻戣姤鍤勯柟顖滃閹冲瞼绱撻崒姘偓鎼佸磹妞嬪孩濯奸柡灞诲劚绾惧鏌熼崜褏甯涢柣鎾存礋閺岀喐瀵肩€涙ɑ閿梺鍝勵儑閸犳牠寮婚敐澶婄閻庨潧鎲￠崚娑㈡⒑閸濆嫭婀扮紒瀣灴閳ワ箓濡搁埡浣哄姦濡炪倖甯掗崐濠氭儗閸℃褰掓晲閸偅缍堝┑鐐叉噽婵炩偓闁哄瞼鍠撶槐鎺楀閻樺磭浜堕梻浣虹帛閹稿鎮烽敃鍌毼﹂柛鏇ㄥ灠缁秹鏌嶈閸撶喎顕ｉ崨濠勭瘈婵﹩鍘煎▓宀勬⒑缁夊棗瀚峰▓鏇㈡煟閹惧鎳勯柕鍥у瀵噣宕掑☉娆戝涧闂備胶鎳撻崯鍨洪銏犺摕闁绘柨鍚嬮幆鐐淬亜閹扳晛鈧鎮￠埀顒勬⒒娴ｅ摜锛嶇紒顕呭灦楠炴垿宕堕鍌氱ウ闂佸綊鍋婇崢浠嬪磿閻旀悶浜滈柡鍐ㄥ€婚幗鍌涗繆椤愩垹顏╅柍瑙勫灴閹晠宕归锝嗙槑濠电姵顔栭崰姘跺礂濮椻偓婵℃挳宕掗悙鏉戠檮婵犮垹鍘滈弲顏嗙礊娴ｅ摜鏆﹂柕濞炬櫅缁狙囨煙鐎电顎撶紒閬嶄憾濮婄粯鎷呴崨濠傛殘缂備礁顑嗛崹鍧楀箖濞差亜惟闁宠桨鑳堕弻褍鈹戦悩缁樻锭妞ゆ垵妫濋幃陇绠涘☉姘絼闂佹悶鍎滅仦钘夊闂備線鈧偛鑻晶顖涚箾閼碱剙鏋涙鐐茬箻楠炲鏁傞挊澶夌盎闂備胶顭堢换妤呭磻閹版澘鍌ㄦい蹇撶墛閳锋垿鏌涢幘鏉戠祷濞存粍绻勭槐鎺旀嫚閼碱儷銏ゅ础闁秵鐓曟繝闈涘閸斻倗鐥幆褋鍋㈤柡宀嬬到閳诲酣骞囬钘夋珣婵犵數鍋犻婊呯不閹捐绠栭柨鐔哄Т閸楁娊鏌ｉ弮鍌滅瘈缂併劏顕ч—鍐Χ閸℃ê鏆楅梺鍝ュТ闁帮綁骞冨鈧俊鐑藉煛閸屾粌骞愰梺璇插嚱缂嶅棝宕滃▎鎾冲嚑闁瑰濮风壕鑲╃磽娴ｈ鐒芥繛鎻掝嚟閳ь剝顫夊ú鏍Χ閹间礁绠栭柕蹇嬪€曠粻褰掓煟閹邦厼顎滄俊鍓ь焾閳规垿鎮╅幇浣告櫛闂佸摜濮甸悧鐘诲极閸愵喖惟闁靛鍨洪悗娲⒑閹稿海绠撴繛灞傚€濆畷鐟扳攽閸モ晝顔曢梺绯曞墲閿氶柣蹇ュ閳ь剝顫夊ú鏍囬悽绋胯摕闁哄洨鍠撶粻鍓ф喐瀹ュ鍤愭い鏍仜閺嬩線鏌ｉ幘宕囧哺闁衡偓娴犲鐓ユ繛鎴灻鈺伱瑰鍐﹀仮闁哄本绋掔换娑㈠垂椤旂懓浜炬繝闈涙閺嗭箓鏌曡箛瀣偓鏍磻閸屾侗娈介柣鎰版涧閺嬫垶淇婇悙鎵煓闁靛棔绀侀～婊堝焵椤掍焦鍙忛柍褜鍓熼弻鏇＄疀閺囩倫銉╂煏閸剛鐣垫慨濠勭帛閹峰懏绗熼娑欐殲闂備浇顫夊鎸庣閻愰潧鍨濆┑鐘宠壘缁狅綁鏌ｅΟ鍏兼毄闁绘帒銈搁弻锝嗘償椤栨粎校闂佺顑勯悞锔剧矉瀹ュ拋鐓ラ柛顐ゅ枔閸樻悂鎮楅獮鍨姎闁哥噥鍋呮穱濠冪鐎ｎ偆鍘介梺闈涱煭缁犳垿鎮橀敃鍌涚厪闁搞儜鍐句純濡ょ姷鍋為…鍥焵椤掍胶鈯曢懣褍霉閻橆喖鐏╅柍瑙勫灴椤㈡瑧娑甸柨瀣毎婵犵绱曢崑妯煎垝濞嗘挻鍋樻い鏇楀亾妤犵偛娲、姗€鎮㈠畡鏉课ら梻鍌欑閸熷潡鎮橀崼銉ョ柧婵犲﹤鎳夐崑鎾愁潩椤愩倗鐓撳┑顔硷功缁垶骞忛崨顔剧懝妞ゆ牗绋掗弳鐐寸節閻㈤潧浠滈柟鍐茬箰鐓ら柣鏃囧亹瀹撲線鏌熼幍顔碱暭闁搞倖甯￠弻鏇㈠醇濠靛洤绐涢梺缁樺笒濞硷繝骞冨Δ鍛祦闁割煈鍠栨慨搴☆渻閵堝繒绱伴柛妤€鍟块悾鐑藉箛閻楀牏鍙嗛柣搴祷閸斿鑺辨繝姘拺闁荤喓澧楅幆鍫㈢磼婢跺﹦鍩ｉ挊婵嬫煥閺冨牊鏆滈柛瀣尭閳绘捇宕归鐣屼邯闂備浇顕х换鎴犳崲閸儱鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜鹃梺缁樻惈缁绘繈寮诲☉銏犵労闁告劗鍋撻悾鍏肩箾鐎电袥闁哄懏鐩崺鐐哄箣閿旇棄鈧兘鏌ｉ幇顒€甯ㄩ柛瀣尵閳ь剨缍嗛崜姘暦閸欏绡€闂傚牊绋掗ˉ鐘绘煛閸☆參妾柕鍥у楠炲洭濡搁敃鈧妯衡攽閻愬弶鈻曞ù婊冪埣瀵偊宕掗悙瀵稿幈濠电偞鍨靛畷顒勬倶閻樻剚娈?Python api_client.py
 
-            if (imageBytes != null && imageBytes.length > 0) {
-                // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨鑺ャ亜閺冨洤袚閻忓骏闄勭换婵嬪焵椤掍胶鐟归柍褜鍓欓～蹇涙惞閸︻厾锛滃┑鈽嗗灠濞存碍绂嶅鍡欎航濠电姷鏁告慨鏉懨洪妶鍥ь棜闁秆勵殘閸欐捇鏌涢妷锝呭闁愁垱娲熼弻锝夊箻鐎靛憡鍒涢梺璇″枟椤ㄥ﹪寮幇鏉跨＜婵炴垶鐟цぐ鍥╃磽閸屾瑧鍔嶉柛鏃€鐗曡灋闁告劦鍠栭拑鐔兼煃閵夈儳锛嶉柡鍡楁閺屽秷顧侀柛鎾跺枎閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸炬慨瀵哥矈閿曞倹鈷戠痪顓炴噺瑜把呯磼閻樺啿鐏╃紒顔款嚙閳藉鈻庡鍕泿闂備礁婀遍崕銈夊垂閻㈢鐒垫い鎺嗗亾闁硅姤绮撳顐︻敋閳ь剙鐣风粙璇炬梹鎷呴崣澶婎伜婵犵數鍋犻幓顏嗗緤娴犲绠熼柨鐔哄Т缁犵喓绱掔€ｎ亞姘ㄩ柡鈧懞銉ｄ簻闁哄啫娲よ缂傚倸绉甸崹鍧楀箺閸洘鍊烽悗闈涙憸閻﹀牓姊婚崒姘卞濞撴碍顨婂畷鏇＄疀濞戞瑧鍙冮梺鍛婂姦娴滄粓寮搁幋鐘电＜缂備焦顭囧ú瀛橆殽閻愬樊鍎忛柍璇叉唉缁犳盯寮村顓炰簼闂傚倸鍊烽懗鍓佸垝椤栨粍鏆滄俊銈傚亾妞ゎ亜鍟粋鎺斺偓锝庝海閹芥洖鈹戦悙鏉戠仧闁搞劌婀辩划璇测槈閵忊€斥偓鍫曟煟閹邦垱纭剧悮姘舵⒑闂堚晝鎮奸柡鍜佸亞濡叉劙骞掑Δ浣镐汗闂佸憡鍔曞鍓佹嫚閻愭祴鏀芥い鏃傘€嬮崝鐔虹磼椤曞懎鐏︽鐐茬箻瀹曘劑寮堕幋婵堢崺濠电姷鏁告慨鎾疮椤愶箑绀堥柛顭戝亞缁♀偓缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簻椤忣參鏌＄仦鏂よ含闁轰焦鍔欏畷銊╊敍濞戞瑯鍟庨梻鍌欑閹碱偄煤閵忋倕鍨傛繛宸簻绾惧鏌曟繛褍鎳愰敍婊堟煟鎼搭垳绉甸柛妯恒偢瀹曟繈鎮介崨濠勫幍闂佸吋浜介崕鑼矆鐎ｎ偅鍙忓┑鐘插暞閵囨繃淇婇銏犳殭闁宠棄顦板蹇涘煛娴ｆ劅顏堟⒒閸屾瑨鍏屾い顓炵墢閳ь剙鐏氱敮鈥崇暦娴兼潙鍐€鐟滃秶绮婇锔解拻濞达絿顭堥ˉ蹇涙煕鐎ｎ亝顥㈢€规洑鍗抽獮姗€宕滄担椋庣憹濠德板€х徊浠嬪疮椤栫偞鍋傞柡鍥ュ灪閻撳啴鏌嶆潪鎵槮妤犵偞蓱閵囧嫯绠涢幘璺侯杸闂佺锕ら悥濂稿蓟瀹ュ浼犻柛鏇ㄥ墮濞呫倝姊虹紒妯诲鞍婵炲弶顭囬幑銏犫槈閵忕姴鑰垮┑鈽嗗灠閹碱偊锝炴惔锝囩＝濞达絽鎼牎濡炪値鍘煎ú銊ノｉ幇鏉跨闁规儳顕粔鍫曟⒑闂堟侗鐓紒鐘冲灴濡嫬顓兼径瀣ф嫼闂佽崵鍠愬妯何ｆ繝姘厵闁惧浚鍋撻懓鎸庮殽閻愭彃鏆ｆ鐐叉椤︽挳鏌￠崱妤侇棦闁哄苯绉烽¨渚€鏌涢幘瀵搞€掓俊鍙夊姇閳诲酣骞樼€电濮搁柣搴＄畭閸庡崬螞瀹€鍕闁惧繐婀辩壕钘夈€掑顒佹悙闁诲繆鍓濈换娑㈠矗婢规繍浜崺銏狀吋婢跺﹤鑰垮┑鐐村灦閻熝囧储閽樺鏀介幒鎶藉磹閹剧粯鍤勯柛顐ｆ礃閸庢鈧厜鍋撻柛鏇ㄥ墰閸橀亶姊洪崷顓炲妺闁圭鎽滅划顓㈠箳濡や胶鍘撻柣鐘叉处閻擄繝宕ｉ崟顒夋闁绘劕寮堕崰妯汇亜閵忊槅娈滅€规洘甯掗…銊╁川椤撶姰鍋婇梻鍌氬€搁崐宄懊归崶顒夋晪鐟滄柨鐣峰▎鎾村仼鐎光偓閳ь剛绮堟繝鍥ㄧ厱闁斥晛鍟伴埥澶岀磼閳ь剟宕奸悢铏诡啎闂佺懓鐡ㄩ悷銉╂倶椤忓牊鐓曢幖绮规闊剟鏌＄仦鍓ф创妞ゃ垺娲熼幃鈺呭箵閹烘埈娼ラ梻鍌欑劍婵炲﹪寮ㄩ柆宥呭瀭闁秆勵殔閽冪喐绻涢幋鐐冩艾危閸喐鍙忔俊銈傚亾闁绘妫欑€靛ジ骞囬鐘电槇濠电偛鐗嗛悘婵嗏枍濞嗘垹纾奸柣妯哄暱閻忓瓨绻濋埀顒佹媴缁洘鏂€闂佺粯顭堥婊冾啅閵夆晜鍊垫慨妯煎帶濞呭秹鏌熼姘辩劯妤犵偞甯掕灃濞达絽鎼獮宥嗕繆閻愵亜鈧牕煤閺嶎灛娑樷槈濮橆剙袣闂侀€炲苯澧摶鏍煟濮椻偓濞佳勭濠婂嫨浜滈柟瀛樼箥濡偓閻庢鍣崑濠傜暦閹烘埈鐓ラ柛鏇ㄥ亝閻庮參姊绘担鐟邦嚋缂佽鍊歌灋婵°倕鎷嬮弫鍌滄喐閻楀牆绗氶柍閿嬪浮閺屾稓浠﹂崜褎鍣梺绋跨箰閺堫剟濡甸崟顖氼潊闁绘瑥鎳撻崥顐︽倵鐟欏嫭绀冮柛銊ユ健閻涱噣宕堕鈧痪褔鎮规笟顖滃帨缂佽精椴哥换婵嬫偨闂堟稐娌梺鍓茬厛閸ㄨ泛鐣疯ぐ鎺戞嵍妞ゆ挾濮烽悞鍏肩節閵忥絾纭炬い鎴濇瀹曪綀绠涢弮鈧崣蹇斾繆閵堝倸浜惧┑鈽嗗亝椤ㄥ棝寮查懜鐢电瘈婵﹩鍘鹃崢浠嬫⒑閸濆嫬鈧湱鈧瑳鍥佸鎮╃紒妯煎幍闂佸憡鐟ラˇ浼村磹閹邦収娈介柣鎰▕閸庢棃鏌熼鐣屾噰鐎殿喖鐖奸獮瀣攽閸涱垳顦伴梻鍌氬€搁崐椋庢濮橆剦鐒界憸鏃堝箖瑜斿畷鍗灻归弶鎸庡枠妞ゃ垺鐩幃娆撳级閹存粎妫?
-                final String fname = imageFilename != null ? imageFilename : "canvas_input.png";
-                final String mime = imageMime != null ? imageMime : "image/png";
-                builder.part("input_reference",
-                    new ByteArrayResource(imageBytes) {
-                        @Override
-                        public String getFilename() { return fname; }
-                    },
-                    MediaType.parseMediaType(mime));
+            // Collect non-empty image bytes from imageFiles list
+            List<byte[]> validImages = new ArrayList<>();
+            if (imageFiles != null) {
+                for (byte[] b : imageFiles) {
+                    if (b != null && b.length > 0) validImages.add(b);
+                }
+            }
+            if (!validImages.isEmpty()) {
+                // 2026-08-13 FIX: send image/input_reference/image_url 3 field names (mimic Python api_client.submit_video)
+                int imgIdx = 0;
+                for (byte[] imageBytes : validImages) {
+                    final String fname = "ref_" + imgIdx + ".png";
+                    final String mime = "image/png";
+                    ByteArrayResource imgResource1 = new ByteArrayResource(imageBytes) {
+                        @Override public String getFilename() { return fname; }
+                    };
+                    ByteArrayResource imgResource2 = new ByteArrayResource(imageBytes) {
+                        @Override public String getFilename() { return fname; }
+                    };
+                    ByteArrayResource imgResource3 = new ByteArrayResource(imageBytes) {
+                        @Override public String getFilename() { return fname; }
+                    };
+                    builder.part("image", imgResource1, MediaType.parseMediaType(mime));
+                    builder.part("input_reference", imgResource2, MediaType.parseMediaType(mime));
+                    builder.part("image_url", imgResource3, MediaType.parseMediaType(mime));
+                    imgIdx++;
+                }
             } else {
-                // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇牠姊绘笟鈧埀顒傚仜閼活垱鏅堕弶娆剧唵閻熸瑥瀚粈瀣偓瑙勬礈閸忔﹢銆佸鈧幃鈺冨枈婢跺苯绨ラ梻鍌欐祰椤曆囧礄閻ｅ瞼绀婇柛鈩冪☉绾惧鏌熼幑鎰厫妞ゎ偅娲熼弻宥夊传閸曨偀鍋撻懡銈囦笉闁告挆鈧崑鎾绘偡閺夋妫岄梺鍝ュУ濞叉粓鎳炴潏銊х瘈婵﹩鍓涢悾楣冩⒑缂佹ɑ鐓ラ柛姘儔閸╂盯骞嬮敂钘夆偓鐢告煕閿旇骞栭弽锟犳⒑闂堟稒顥滈柛鐔告尦瀵鏁愭径濠勵唺闂佺粯鍔楅弫鎼佸汲閵堝鈷戦悹鍥ｂ偓铏亶濡炪們鍔岄敃顏堝Υ娴ｈ倽鏃堝川椤撶媭妲规俊鐐€栭崹鍏兼叏閵堝洠鍋撳顑惧仮婵﹥妞介幊锟犲Χ閸涱喚鈧箖姊洪懡銈呮瀭闁稿孩濞婇崺鈧い鎺嶇閸ゎ剟鏌涢幘瀵搞€掗柛鎺撳浮瀹曞ジ濡烽妷褜妲版俊鐐€栧濠氬疾椤愶箑鍌ㄩ梺顒€绉甸埛鎴︽煕閹邦剙绾ч柟顖氱墦閺屾稒绻濋崟顓炵闂佸搫鎳庨悥濂稿箖閻ｅ苯鏋堟俊顖濇〃婢规洟鏌ｉ悢鍝ユ噧閻庢凹鍘炬竟鏇熺節濮橆厾鍘卞┑掳鍊愰崑鎾绘煕閻旈攱鍋ラ柟顕€绠栭幃婊堟寠婢跺矈鏀ㄩ梻浣虹帛閸斿繘寮插鍫稏鐎广儱鎳夐弨浠嬫煟閹邦剙绾фい銉у仱閺屾盯濡歌閺嗩剟鏌ｅ☉鍗炴珝鐎规洖銈告俊鐑芥晜鐟欏嫬顏烘繝鐢靛仩閹活亞绱為埀顒併亜椤愩埄妯€闁诡喗锕㈤弻鍡楊吋閸℃瑥骞愰梻浣告啞娓氭宕板顑炶櫣鈧數纭堕崑鎾舵喆閸曨剙顦╅梺鎼炲妼閻栫厧鐣峰ú顏呮櫢闁绘灏欓ˇ銊╂⒑閸愬弶鎯堥柨鏇樺€栫粋鎺懨洪鍛嫽闂佺鏈悷褏鎷规导瀛樼厱闁规儳顕幊鍛磼椤旇姤顥堥柟顔荤矙瀹曘劍绻濋崒娆戞殫濠电姷鏁搁崑鐐哄垂椤栫偛鍨傛繛宸簼閸嬪倿鏌￠崶銉ョ仾闁绘挸鍟撮弻宥嗘姜閹殿噮妲梺鍝勬閻熴儵鍩為幋锔绘晩闁稿繒鍘ч弸鐘绘⒑閸濆嫭婀伴柣鈺婂灠椤曪綁顢氶埀顒勭嵁濮椻偓瀹曟粍鎷呯憴鍕靛晫闂傚倸鍊风粈渚€骞栭锔藉剹濠㈣泛鏈～鏇㈡煛閸モ晛鏋旀い鈺冨厴閺屻劑寮崒姘闁诲孩纰嶅畝鎼佸蓟閻旇櫣纾兼俊顖濇〃閸掑﹪姊虹拠鎻掝劉濠电偛锕ら～蹇曠磼濡顎撻梺鍛婄缚閸庢煡鎮楅灏栨斀闁宠棄妫楁禍婊堟倵濮橆厼顎滄俊顐ゅ枎椤啴濡堕崱娆忊拡闂佺顑嗛惄顖炲箖閳ユ枼鏀介悗锝庝簽椤旀劕鈹戦悜鍥╃У闁告挻鐟︽穱濠囨嚃閳哄啰锛滈梺缁樼懃閹虫劗绮旈鈧弻鈥崇暆鐎ｎ剛袦濡ょ姷鍋涘ú顓€佸鈧幃銏ゆ惞閸忓鐎兼繝鐢靛Х閺佹悂宕戝☉銏犵疇閹艰揪绲鹃弳婊呯磼閺傝法鐛杕ing 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴妤犵偛鍟伴幉鎾礋椤掆偓椤繝姊洪悷鏉挎Щ闁活厼鐗撳畷婵嬪川椤撴稒鏂€闂佺粯鍔栬ぐ鍐箖閹达附鐓熸俊銈勭劍缁€瀣煕閳哄啫浠辨鐐差儔閺佸倿鎸婃径澶嬬潖闂備浇顕ф绋匡耿鏉堛劍鍙忛柟缁㈠暉婢跺ň鏀介柛顐犲灮閿涙繃绻涙潏鍓ф偧闁硅櫕鎸婚幈銊╁醇閻旂繝绨婚梺闈涱焾閸庡鐓鍌楀亾濞堝灝鏋涙い顓犲厴瀵偊骞樼紒妯轰汗闂佽偐鈷堥崜娆撳焵椤掑倸浠辨慨濠冩そ瀹曟宕楅悡搴樺亾閹邦厾绠惧ù锝呭暱濞层倝鎮″┑瀣彄闁搞儯鍔庨埊鏇㈡煃闁垮鐏存慨濠冩そ椤㈡洟濡堕崨顒傛崟闂備礁鍚嬪鍧楀垂闁秴鐤鹃柛顐ｆ处閺佸鏌嶈閸撶喎顕ｆ繝姘亜闁稿繐鍚嬮崕顏勵渻閵堝棗濮﹂柛鎾寸箞閸┾偓妞ゆ帒鍟涵鍫曟煃瑜滈崜姘额敊閺嶎厼闂い鏇楀亾鐎规洘鍨剁换婵嬪磼濠婂嫭顔曟繝娈垮枟閵囨盯宕戦幘娣簻闁靛骏绱曢幊鍥煙閾忣偆澧甸柛鈹惧墲閹峰懘骞囬悢鍛婄闁宠鍨块弫宥夊礋椤愨剝婢€闂備胶顭堥敃銉╂偋濠婂牆鏋佹い鏃傛櫕缁♀偓闂佹悶鍎崝宀勫焵椤掆偓濞硷繝寮婚妸鈺佸嵆婵°倐鍋撳ù婊堢畺濮婅櫣鈧湱濯崵娆戠磼婢舵劦妫戠紒顔款嚙閳藉螣闁垮娼旀繝鐢靛仜濡寮甸鍌楀亾濮樿櫕顥夐柍瑙勫灴閹瑩鎳滈棃娑欓敪缂傚倷娴囩亸顏堝磻閹版澘绠柛鎰靛枟閺呮繈鏌涚仦鍓р槈闁逞屽墮閻忔繆鐏冮梺鎸庣箓閹冲酣寮抽悙鐑樼厽闁规儳顕ú鎾煛鐏炲墽娲存い銏℃礋椤㈡洟锝為鐘垫晨婵犵數濮幏鍐礋椤掆偓閸炲姊洪崫鍕伇闁哥姵鐗犻妴浣糕枎閹炬潙鈧攱銇勯幒鎴濃偓鍛婃叏閼恒儰绻嗛柣鎰典簻閳ь儸鍛笉闁圭儤顨愮紞鏍ь熆閼搁潧濮囧鍛存⒑閸涘﹥澶勯柛銊ゅ嵆閿濈偤宕ㄧ€涙鍘撻梺瀹犳〃缁€渚€寮搁妶鍡曠箚妞ゆ劑鍨归弳锝夋煙椤旂瓔娈橀柟鍙夋尦瀹曠喖顢楅崒妤佹櫖缂傚倸鍊烽懗鍓佸垝椤栨粍宕查柛顐犲劤瀹撲線鏌涢幇鈺佸Ψ闁哄閰ｉ弻鐔煎箚瑜忛敍宥夋煕濡粯鍊愭慨濠呮缁瑩鎳楅锝嗚晧闂備胶顭堥敃銉╂偋濠婂懏顫?file 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛銈嗘礋閺岋紕浠︾拠鎻掑闂佺粯鎸婚惄顖炲蓟濞戞ǚ妲堥柛妤冨仦閻忓牓姊洪柅鐐茶嫰婢т即鏌℃担鍓茬吋鐎殿喛顕ч埥澶婎煥閸涱垱婢戦梻浣烘嚀閻忔繈宕婊呮噮濠电姷鏁搁崑娑㈡偤閵娧冨灊闁规儳澧庢稉宥夋煛瀹擃喖鏈紞搴♀攽閻愬弶鈻曞ù婊勭矊椤斿繐鈹戦崱蹇旀杸闂佺粯蓱瑜板啴寮冲▎鎰╀簻闁挎棁顫夊▍濠冩叏婵犲啯銇濈€规洏鍔嶇换婵嬪礃閵娾晝鈧椽姊绘担鍝勫付缂傚秴锕︾划濠氬冀椤撶偞妲梺闈涚箳婵參宕ョ€ｎ亶鐔嗛悹铏瑰皑瀹搞儵鏌涢悙顏勫妞ゎ亜鍟存俊鍫曞幢濡儤娈梻浣告憸婵敻骞戦崶褏鏆﹂柕蹇ョ磿椤╃兘鎮楅敐搴′航婵☆偄鎳庨—鍐Χ閸℃顫囬梺鎼炲妿閸庛倕顕ラ崟顖氱妞ゆ帒鍊婚鏇㈡⒑閸涘﹦鎳冩い锕侀哺閺呭爼顢楅崒婊咃紲闂佺鏈粙鎴澝归鈧弻娑㈠煛鐎ｎ剛鐦堥悗瑙勬磸閸旀垿銆佸▎鎾崇畾鐟滃秶绮婚悙鐑樷拻濞达絿鐡旈崵娆撴煕閹寸姵娅曠紒杈╁仱瀹曞崬鈽夊Ο纭风幢闂備礁鎲″ú锕傚礈濮樿泛鐭楅煫鍥ㄦ磵閸嬫捇鐛崹顔煎濡炪倧缂氶崡鎶藉箖?16x16 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閹冣挃闁硅櫕鎹囬垾鏃堝礃椤忎礁浜鹃柨婵嗙凹缁ㄧ粯銇勯幒瀣仾闁靛洤瀚伴獮鍥敂閸℃瑧鍘梻浣告惈鐞氼偊宕濋幋锕€绠栭柕蹇嬪€曟导鐘绘煕閺囩喎鐏熼柛銊ヮ煼閹偓妞ゅ繐鐗嗙粻姘辨喐濠婂牊鍋傚┑鍌氭啞閻撴盯鎮橀悙鎻掆挃婵炴彃顕埀顒侇問閸犳骞愰搹顐＄箚闁归棿绀佸敮闂侀潧锛忕仦鑺ユ珡闂傚倷娴囬褍顫濋敃鍌︾稏濠㈣泛鈯曢崫鍕垫建闁逞屽墴楠炲啴鏁撻悩铏闂佺粯顭堢亸顏堝箺閺囥垺鈷戠紓浣股戦ˉ鍡涙煏閸″繐浜鹃梻浣侯焾椤戝棝骞愰幖浣哥叀濠㈣泛艌閺嬪秹鏌ц箛锝呬簻闁诲繐顕埀?PNG 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；婵炴垟鎳為崶顒佸仺缂佸瀵ч悗顒勬⒑閻熸澘鈷旂紒顕呭灦瀹曟垿骞囬婊€绨婚梺鍝勫暙閸婂綊宕甸埀顒佺箾鐎涙鐭掔紒鐘崇墵瀵鈽夐姀鐘电杸闂傚倸鐗婄粙鎺楁倶閸儲鈷掑ù锝囶焾閼歌绻涘顔煎籍鐎殿喖顭烽弫鎰緞婵犲嫮娼夐梻浣侯焾鐞氼偊宕愬Δ鍛闁归棿鐒﹂崐鍨箾閸繄浠㈤柡瀣⊕缁绘稓娑垫搴ｇ槇濡ょ姷鍋涢崯顐ョ亙闂佸憡鍔忛弲娑㈠几閸岀偞鈷戦柛娑橈攻婢跺嫰鏌涢幘瀵告创閽樻繈鏌曟径鍫濆姉闁衡偓娴犲鐓熼柟閭﹀灠閻ㄧ儤绻濋埀顒勫箻椤旂晫鍘遍梺鍝勫€圭€笛囧箲閿濆鐓?
+                // Text-to-video: use 16x16 transparent PNG placeholder
                 final String placeholderName = "_placeholder.png";
-                // 2026-08-13 FIX: 占位图也同时发 3 个字段名(模仿 Python api_client.submit_video)
+                // 2026-08-13 FIX: placeholder also sent with 3 field names
                 ByteArrayResource ph1 = new ByteArrayResource(DUMMY_PNG_BYTES) {
                     @Override public String getFilename() { return placeholderName; }
                 };
@@ -737,11 +752,11 @@ public class NewApiClient {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI /v1/videos 响应格式错误, 缺少 id/task_id:" + response);
             }
-            log.info("NewAPI video task submitted: {} (image={}, size={}B, duration={}s, resolution={})",
+            log.info("NewAPI video task submitted: {} (imageCount={}, size={}B, duration={}s, resolution={})",
                 taskId,
-                imageBytes != null ? imageFilename : "placeholder",
-                imageBytes != null ? imageBytes.length : 0,
-                duration, resolution);
+                validImages.size(),
+                validImages.isEmpty() ? 0 : validImages.get(0).length,
+                duration, useResolution);
             // 2026-08-11 修复:submit 响应里常常已含 video url(同步返回 + task_id 同一响应)。
             // 之前不提取就丢了,只能等 poll 30 秒后取到 → 如果 poll 出现 400 索引延迟就会被误判 FAILED。
             // 现在提取后,即使后续 poll 失败,job 也已保存 url,前端能直接播放。
@@ -764,6 +779,60 @@ public class NewApiClient {
     }
 
     /**
+     * 下载图片 URL 并转成 base64 data URI（用于 NewAPI 中转服务器无法访问公网 URL 的场景）。
+     *
+     * @param url 图片 URL（公网可访问）
+     * @return data URI，格式为 "data:image/{type};base64,xxxxx"
+     * @throws Exception 下载/编码失败时抛出
+     */
+    public String downloadAsDataUri(String url) throws Exception {
+        if (url == null || url.isBlank()) {
+            throw new IllegalArgumentException("url 不能为空");
+        }
+        // 如果已经是 data URI，直接返回
+        if (url.startsWith("data:")) {
+            return url;
+        }
+        try {
+            java.net.URI uri = java.net.URI.create(url);
+            java.net.URL u = uri.toURL();
+            java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(30000);
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                conn.disconnect();
+                throw new RuntimeException("HTTP " + code + " from GET " + url);
+            }
+            java.io.InputStream in = conn.getInputStream();
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) baos.write(buf, 0, n);
+            in.close();
+            conn.disconnect();
+
+            byte[] bytes = baos.toByteArray();
+            // 推断 MIME
+            String mime = "image/png";
+            String lower = url.toLowerCase();
+            if (lower.contains(".jpg") || lower.contains(".jpeg")) mime = "image/jpeg";
+            else if (lower.contains(".webp")) mime = "image/webp";
+            else if (lower.contains(".gif")) mime = "image/gif";
+
+            String b64 = Base64.getEncoder().encodeToString(bytes);
+            String dataUri = "data:" + mime + ";base64," + b64;
+            log.info("[downloadAsDataUri] OK: url={}, bytes={}, mime={}", url, bytes.length, mime);
+            return dataUri;
+        } catch (Exception e) {
+            log.warn("[downloadAsDataUri] failed: url={}, err={}", url, e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
      * 文生视频：调 NewAPI /v1/videos（不传图，内部用占位图）。
      *
      * <p>调用链：Java → NewAPI (jurong) → aicoming-video-proxy
@@ -777,7 +846,8 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
         }
         log.info("[VIDEO-T2V] 文生视频: promptLen={}, options={}", prompt.length(), options);
-        return submitVideo(prompt, null, options);
+        SubmitResult r = submitVideo(prompt, null, options);
+        return r.taskId();
     }
 
     /**
@@ -807,7 +877,8 @@ public class NewApiClient {
         }
         log.info("[VIDEO-MI2V] 多图生视频: promptLen={}, images={}, options={}",
             prompt.length(), valid.size(), options);
-        return submitVideo(prompt, valid, options);
+        SubmitResult r = submitVideo(prompt, valid, options);
+        return r.taskId();
     }
 
     /**
@@ -1051,7 +1122,7 @@ public class NewApiClient {
      * @param style   图片风格，默认 vivid
      * @return 生成的图片 URL
      */
-    public String generateImage(String prompt, String size, String quality, String style) {
+    public String generateImage(String prompt, String imageUrl, String size, String quality, String style) {
         // 快速健康检查，5 秒超时，避免 NewAPI 不可达时长时间挂起
         if (!checkHealth()) {
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 服务不可用，请稍后再试");
@@ -1062,6 +1133,10 @@ public class NewApiClient {
         Map<String, Object> body = new HashMap<>();
         body.put("model", "gpt-image-2-2k");
         body.put("prompt", prompt);
+        // 手册 v3.0 §图生图:带 image 字段即单图生图;不传即文生图
+        if (imageUrl != null && !imageUrl.isBlank()) {
+            body.put("image", imageUrl);
+        }
         body.put("size", size != null ? size : "1024x1024");
         body.put("quality", quality != null ? quality : "standard");
         body.put("style", style != null ? style : "vivid");
@@ -1104,9 +1179,9 @@ public class NewApiClient {
             if (!response.has("data")) {
                 // 有些 NewAPI 可能直接返回 URL 在顶层
                 if (response.has("url") && response.get("url").isTextual()) {
-                    String imageUrl = response.get("url").asText();
-                    log.info("NewAPI image generated OK (top-level url): {}", imageUrl);
-                    return imageUrl;
+                    String imageUrlValue = response.get("url").asText();
+                    log.info("NewAPI image generated OK (top-level url): {}", imageUrlValue);
+                    return imageUrlValue;
                 }
                 // 检查顶层 b64_json
                 if (response.has("b64_json") && response.get("b64_json").isTextual()) {
@@ -1135,9 +1210,9 @@ public class NewApiClient {
             String[] urlFields = {"url", "image_url", "imageUrl", "img_url", "imgUrl"};
             for (String field : urlFields) {
                 if (first.has(field) && first.get(field).isTextual()) {
-                    String imageUrl = first.get(field).asText();
+                    String imageUrlValue = first.get(field).asText();
                     log.info("NewAPI image generated OK ({}): promptLen={}", field, prompt.length());
-                    return imageUrl;
+                    return imageUrlValue;
                 }
             }
 
@@ -1167,7 +1242,7 @@ public class NewApiClient {
      * @return 生成的图片 URL
      */
     public String generateImage(String prompt) {
-        return generateImage(prompt, null, null, null);
+        return generateImage(prompt, null, null, null, null);
     }
 
     /**

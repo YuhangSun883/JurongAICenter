@@ -65,6 +65,7 @@ interface SkillItem {
   referenceSlots?: ReferenceSlot[]; // 技能专属的参考图片槽位
   maxReferences?: number; // 最大参考图片数
   hintText?: string; // 上传图片的提示文字
+  defaultPrompt?: string; // 用户未输入自定义提示词时的默认提示词
 }
 interface SkillCategory {
   id: string;
@@ -79,16 +80,20 @@ const SKILL_CATEGORIES: SkillCategory[] = [
     skills: [
       { id: 'face-3view', name: '脸部三视图', description: '生成正视、侧脸、半侧脸参考', tag: '[脸部三视图]',
         referenceSlots: [{ label: '添加人脸参考图' }], maxReferences: 3,
-        hintText: '上传一张清晰的人脸照片，AI 将生成三视图参考。' },
+        hintText: '上传一张清晰的人脸照片，AI 将生成三视图参考。',
+        defaultPrompt: '请根据上传的人脸照片，生成该人物的正视、侧脸、半侧脸三视图参考图。' },
       { id: 'character-4view', name: '人物四视图', description: '生成全身三视图与脸部特写', tag: '[人物四视图]',
         referenceSlots: [{ label: '添加人物照片' }], maxReferences: 4,
-        hintText: '上传人物全身照片，AI 将生成四视图与脸部特写。' },
+        hintText: '上传人物全身照片，AI 将生成四视图与脸部特写。',
+        defaultPrompt: '请根据上传的人物照片，生成全身三视图与脸部特写参考图。' },
       { id: 'model-face-swap', name: '模特换脸', description: '模特脸部替换为其他人物', tag: '[模特换脸]',
         referenceSlots: [{ label: '添加模特', optional: true }, { label: '添加目标人脸' }], maxReferences: 2,
-        hintText: '上传模特图和目标人脸图，实现换脸效果。' },
+        hintText: '上传模特图和目标人脸图，实现换脸效果。',
+        defaultPrompt: '请将模特的脸部替换为目标人物的脸部，保持模特的姿势和服装不变。' },
       { id: 'face-fusion', name: '人脸融合', description: '融合两张人脸生成全新虚拟头像资产', tag: '[人脸融合]',
         referenceSlots: [{ label: '添加人脸A' }, { label: '添加人脸B' }], maxReferences: 2,
-        hintText: '上传两张人脸照片，AI 将融合生成全新虚拟头像。' },
+        hintText: '上传两张人脸照片，AI 将融合生成全新虚拟头像。',
+        defaultPrompt: '请将两张人脸照片融合生成全新虚拟头像，保留双方面部特征。' },
     ],
   },
   {
@@ -102,16 +107,20 @@ const SKILL_CATEGORIES: SkillCategory[] = [
           { label: '添加裤子', optional: true },
           { label: '添加包', optional: true },
         ], maxReferences: 6,
-        hintText: '上传模特图，服装图，一键模特换衣' },
+        hintText: '上传模特图，服装图，一键模特换衣',
+        defaultPrompt: '请将上传的服装衣物替换到模特身上，保持模特的姿势和比例不变。' },
       { id: 'product-display', name: '商品展示', description: '商品多角度展示图生成', tag: '[商品展示]',
         referenceSlots: [{ label: '添加商品图' }], maxReferences: 9,
-        hintText: '上传商品图片，AI 将生成多角度展示效果图。' },
+        hintText: '上传商品图片，AI 将生成多角度展示效果图。',
+        defaultPrompt: '将图中的商品多角度展示 并生成电商广告图' },
       { id: 'model-pose', name: '模特姿势', description: '生成多种模特姿势姿态', tag: '[模特姿势]',
         referenceSlots: [{ label: '添加模特照片' }], maxReferences: 9,
-        hintText: '上传模特照片，AI 将生成多种姿势姿态。' },
+        hintText: '上传模特照片，AI 将生成多种姿势姿态。',
+        defaultPrompt: '请根据上传的模特照片，生成多种不同姿势姿态的展示图。' },
       { id: 'background-replace', name: '背景替换', description: '替换商品图中的背景', tag: '[背景替换]',
         referenceSlots: [{ label: '添加商品图' }, { label: '添加背景参考', optional: true }], maxReferences: 9,
-        hintText: '上传商品图和目标背景，AI 将智能替换背景。' },
+        hintText: '上传商品图和目标背景，AI 将智能替换背景。',
+        defaultPrompt: '请将商品图中的背景替换为指定背景，保持商品主体清晰完整。' },
     ],
   },
   {
@@ -120,16 +129,20 @@ const SKILL_CATEGORIES: SkillCategory[] = [
     skills: [
       { id: 'hd-enhance', name: '高清增强', description: '提升图片清晰度与细节', tag: '[高清增强]',
         referenceSlots: [{ label: '添加待增强图片' }], maxReferences: 9,
-        hintText: '上传需要高清增强的图片，AI 将提升细节与清晰度。' },
+        hintText: '上传需要高清增强的图片，AI 将提升细节与清晰度。',
+        defaultPrompt: '请对图片进行高清增强处理，提升清晰度与细节表现。' },
       { id: 'style-transfer', name: '风格迁移', description: '艺术风格迁移与渲染', tag: '[风格迁移]',
         referenceSlots: [{ label: '添加原图' }, { label: '添加风格参考' }], maxReferences: 9,
-        hintText: '上传原图和风格参考图，AI 将进行艺术风格迁移。' },
+        hintText: '上传原图和风格参考图，AI 将进行艺术风格迁移。',
+        defaultPrompt: '请根据参考风格对原图进行艺术风格迁移与渲染。' },
       { id: 'lighting', name: '光影增强', description: '增强图片光影效果', tag: '[光影增强]',
         referenceSlots: [{ label: '添加待处理图片' }], maxReferences: 9,
-        hintText: '上传图片，AI 将增强光影效果，打造电影级视觉。' },
+        hintText: '上传图片，AI 将增强光影效果，打造电影级视觉。',
+        defaultPrompt: '请增强图片的光影效果，打造电影级视觉质感。' },
       { id: 'color-grade', name: '调色风格', description: '电影级调色风格处理', tag: '[调色风格]',
         referenceSlots: [{ label: '添加待调色图片' }], maxReferences: 9,
-        hintText: '上传图片，AI 将进行电影级调色风格处理。' },
+        hintText: '上传图片，AI 将进行电影级调色风格处理。',
+        defaultPrompt: '请对图片进行电影级调色风格处理，营造独特视觉氛围。' },
     ],
   },
 ];
@@ -1063,6 +1076,16 @@ export function ImageWorkbench() {
       return;
     }
 
+    // 当用户选中技能但未输入自定义提示词时，自动使用技能的默认提示词
+    let finalPrompt = trimmedPrompt;
+    if (selectedSkill?.defaultPrompt) {
+      const userText = trimmedPrompt.replace(selectedSkill.tag, '').trim();
+      if (!userText) {
+        finalPrompt = selectedSkill.defaultPrompt;
+        console.log('[ImageWorkbench] using skill defaultPrompt:', finalPrompt);
+      }
+    }
+
     // 合并"图片源"用于提交：
     //   - 有技能选中：使用槽位图片（references），AI 根据技能/提示词/槽位图生成
     //   - 无技能选中：使用 @ 引用图片（referencedImages），仅根据提示词+引用图生成
@@ -1083,7 +1106,7 @@ export function ImageWorkbench() {
     }
 
     console.log('[ImageWorkbench] submit start:', {
-      promptLen: trimmedPrompt.length,
+      promptLen: finalPrompt.length,
       refImageCount: referenceImagesBase64.length,
     });
 
@@ -1094,7 +1117,7 @@ export function ImageWorkbench() {
     setGenerating(true);
     // 记录当前正在生成的任务（切走后再回来能恢复"生成中"占位卡）
     setActiveGeneration({
-      prompt: trimmedPrompt || '(空提示词)',
+      prompt: finalPrompt || '(空提示词)',
       referencePreviewUrl: sourceImages[0]?.url,
       startedAt: Date.now(),
     });
@@ -1119,7 +1142,7 @@ export function ImageWorkbench() {
       // - 无引用图片时，后端调用 /v1/images/generations 接口
       const result = await imageApi.generateImage(
         {
-          prompt: trimmedPrompt,
+          prompt: finalPrompt,
           size: '1024x1024',
           quality: 'standard',
           style: 'vivid',
@@ -1140,7 +1163,7 @@ export function ImageWorkbench() {
             {
               id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               url: result.imageUrl,
-              prompt: trimmedPrompt,
+              prompt: finalPrompt,
               createdAt: Date.now(),
             },
             ...prev,

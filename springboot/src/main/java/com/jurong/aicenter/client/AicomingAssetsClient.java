@@ -365,4 +365,67 @@ public class AicomingAssetsClient {
         if (s.length() <= maxLen) return s;
         return s.substring(0, maxLen) + "...(truncated, totalLen=" + s.length() + ")";
     }
+
+    /**
+     * 上传 base64 data URI 图片并返回 active 状态的 asset_url。
+     * <p>
+     * 用于"单图生图"流程：先把用户的引用图上传到 aicoming-proxy（手册 §4.1.1），
+     * 拿到 {@code asset://aic_xxx} 后再传给 NewAPI 的 {@code /v1/images/generations} 的
+     * {@code image} 字段（手册 v3.0 §图生图）。
+     *
+     * @param dataUri   {@code data:image/png;base64,xxxx} 格式
+     * @param assetName 资产名（用于后台溯源）
+     * @return active 状态的 asset_url（{@code asset://aic_xxx}）
+     */
+    public String uploadDataUriAsAssetUrl(String dataUri, String assetName) {
+        if (dataUri == null || dataUri.isBlank()) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED, "dataUri 为空");
+        }
+        // 1) 解析 base64 → 字节
+        byte[] bytes;
+        String mime = "image/png";
+        String ext = ".png";
+        try {
+            String base64Data;
+            if (dataUri.startsWith("data:")) {
+                int commaIdx = dataUri.indexOf(",");
+                if (commaIdx == -1) {
+                    throw new IllegalArgumentException("无效的 data URI 格式");
+                }
+                String header = dataUri.substring(0, commaIdx);
+                base64Data = dataUri.substring(commaIdx + 1);
+                if (header.contains("image/jpeg") || header.contains("image/jpg")) {
+                    mime = "image/jpeg";
+                    ext = ".jpg";
+                } else if (header.contains("image/webp")) {
+                    mime = "image/webp";
+                    ext = ".webp";
+                }
+            } else {
+                base64Data = dataUri;
+            }
+            bytes = java.util.Base64.getDecoder().decode(base64Data);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "data URI 解码失败: " + e.getMessage());
+        }
+
+        // 2) 上传到 aicoming-proxy
+        String filename = "skill_ref_" + System.currentTimeMillis() + ext;
+        com.fasterxml.jackson.databind.JsonNode data =
+            uploadAssetByMultipart(bytes, filename, mime, assetName);
+        String assetId = data.path("id").asText("");
+        String assetUrl = data.path("asset_url").asText("");
+        log.info("[ASSET-SINGLE-IMG] ← 上传成功: id={}, asset_url={}, size={}B",
+            assetId, assetUrl, bytes.length);
+        if (assetUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "aicoming-proxy 返回的 asset_url 为空");
+        }
+
+        // 3) 轮询等到 active 才能传给 NewAPI（手册 §4.2）
+        pollUntilActive(assetId, 90, 3);
+        log.info("[ASSET-SINGLE-IMG] ← 资产 active, 可用于 NewAPI image 字段: {}", assetUrl);
+        return assetUrl;
+    }
 }

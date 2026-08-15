@@ -1,5 +1,6 @@
 package com.jurong.aicenter.controller;
 
+import com.jurong.aicenter.client.AicomingAssetsClient;
 import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.dto.PageResult;
 import com.jurong.aicenter.dto.image.FavoriteImageRequest;
@@ -41,6 +42,7 @@ public class ImageController {
     private final NewApiClient newApiClient;
     private final StorageService storageService;
     private final MediaService mediaService;
+    private final AicomingAssetsClient aicomingAssetsClient;
 
     /**
      * AI 图片生成接口
@@ -66,30 +68,49 @@ public class ImageController {
         String prompt = request.getPrompt();
         List<String> referenceImages = request.getReferenceImages();
         boolean hasReferences = referenceImages != null && !referenceImages.isEmpty();
+        int refCount = hasReferences ? referenceImages.size() : 0;
 
         log.info("AI 图片生成请求: userId={}, promptLen={}, size={}, quality={}, style={}, refImageCount={}",
             userId, prompt.length(), request.getSize(), request.getQuality(), request.getStyle(),
-            hasReferences ? referenceImages.size() : 0);
+            refCount);
 
-        // 1. 根据是否有引用图片，选择调用不同的 NewAPI 接口
-        // - 有引用图片：调用 /v1/images/edits（图片编辑接口），将引用图片作为素材
-        // - 无引用图片：调用 /v1/images/generations（纯文本生成接口）
+        // 1. 根据引用图片"张数"选择不同接口（手册 v3.0 §文生图/§图生图/§多图生图）：
+        //   - 0 张 → /v1/images/generations                      （文生图，不带 image）
+        //   - 1 张 → /v1/images/generations + "image" 字段      （单图生图：先上传为 asset:// 后引用）
+        //   - ≥2 张 → /v1/images/edits                          （多图生图：multipart 多个 image）
+        //   旧逻辑只判断 "有没有" 引用图而忽略张数，已修复 2026-08-14。
         String originalData;
         try {
-            if (hasReferences) {
-                // 有引用图片：调用图片编辑接口，将引用图片作为素材结合提示词生成新图片
-                log.info("检测到 {} 张引用图片，调用 /v1/images/edits 接口", referenceImages.size());
-                originalData = newApiClient.editImage(
+            if (refCount == 0) {
+                // 文生图：调用纯文本生成接口，不带 image 字段
+                log.info("分支=文生图 → /v1/images/generations（无 image）");
+                originalData = newApiClient.generateImage(
                     prompt,
-                    referenceImages,
+                    null,  // imageUrl=null:文生图走无 image 字段
+                    request.getSize(),
+                    request.getQuality(),
+                    request.getStyle()
+                );
+            } else if (refCount == 1) {
+                // 单图生图：先把用户的引用图上传为 aicoming asset，拿到 asset_url 后
+                //           传给 /v1/images/generations 的 image 字段
+                log.info("分支=单图生图 → /v1/images/generations + image(asset_url)");
+                String assetUrl = aicomingAssetsClient.uploadDataUriAsAssetUrl(
+                    referenceImages.get(0),
+                    "skill-img-gen-" + userId);
+                originalData = newApiClient.generateImage(
+                    prompt,
+                    assetUrl,
                     request.getSize(),
                     request.getQuality(),
                     request.getStyle()
                 );
             } else {
-                // 无引用图片：调用纯文本生成接口
-                originalData = newApiClient.generateImage(
+                // 多图生图：调用 /v1/images/edits（multipart 多文件）
+                log.info("分支=多图生图 → /v1/images/edits（{} 个 image）", refCount);
+                originalData = newApiClient.editImage(
                     prompt,
+                    referenceImages,
                     request.getSize(),
                     request.getQuality(),
                     request.getStyle()
