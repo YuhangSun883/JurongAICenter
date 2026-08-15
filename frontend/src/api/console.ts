@@ -1,5 +1,5 @@
-import { request } from '@/lib/http';
-import { setTokens, setUser } from '@/lib/auth-store';
+import { request, type RequestOptions } from '@/lib/http';
+import { setConsoleTokens, setConsoleUser } from '@/lib/auth-store';
 import type { LoginRequest, LoginResponse } from '@/types/user';
 
 export interface ConsolePage<T> {
@@ -137,6 +137,10 @@ export interface ConsoleUserDetail {
   recentAssets: ConsoleAssetItem[];
 }
 
+function consoleRequest<T>(path: string, opts: RequestOptions = {}) {
+  return request<T>(path, { ...opts, authScope: 'console' });
+}
+
 export const consoleApi = {
   login: async (body: LoginRequest): Promise<LoginResponse> => {
     const resp = await request<{
@@ -145,9 +149,11 @@ export const consoleApi = {
       userId: number;
       email: string;
       role: string;
+      createdAt?: string;
     }>('/api/console/auth/login', {
       method: 'POST',
       body: { email: body.email, password: body.password },
+      authScope: 'none',
     });
     const auth = {
       token: resp.accessToken,
@@ -157,53 +163,54 @@ export const consoleApi = {
         id: String(resp.userId),
         nickname: resp.email.split('@')[0],
         email: resp.email,
+        createdAt: resp.createdAt,
         role: resp.role,
         channel: 'CONSOLE',
       },
     };
-    setTokens(auth.token, auth.refreshToken, auth.expiresIn);
-    setUser(auth.user);
+    setConsoleTokens(auth.token, auth.refreshToken, auth.expiresIn);
+    setConsoleUser(auth.user);
     return auth;
   },
-  overview: () => request<ConsoleOverview>('/api/console/overview'),
+  overview: () => consoleRequest<ConsoleOverview>('/api/console/overview'),
   users: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleUserItem>>('/api/console/users', { query }),
+    consoleRequest<ConsolePage<ConsoleUserItem>>('/api/console/users', { query }),
   userDetail: (id: number) =>
-    request<ConsoleUserDetail>(`/api/console/users/${id}`),
+    consoleRequest<ConsoleUserDetail>(`/api/console/users/${id}`),
   patchUser: (id: number, body: { role?: string; disabled?: boolean }) =>
-    request<ConsoleUserItem>(`/api/console/users/${id}`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleUserItem>(`/api/console/users/${id}`, { method: 'PATCH', body }),
   patchUserPlan: (id: number, body: { displayName?: string; plan?: string; monthlyQuota?: number }) =>
-    request<ConsoleUserItem>(`/api/console/users/${id}/plan`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleUserItem>(`/api/console/users/${id}/plan`, { method: 'PATCH', body }),
   resetUserPassword: (id: number, body: { password: string }) =>
-    request<ConsoleUserItem>(`/api/console/users/${id}/password`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleUserItem>(`/api/console/users/${id}/password`, { method: 'PATCH', body }),
   adjustCredits: (id: number, body: { delta: number; reason?: string }) =>
-    request<ConsoleUserItem>(`/api/console/users/${id}/credits`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleUserItem>(`/api/console/users/${id}/credits`, { method: 'PATCH', body }),
   admins: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleAdminItem>>('/api/console/admins', { query }),
+    consoleRequest<ConsolePage<ConsoleAdminItem>>('/api/console/admins', { query }),
   createAdmin: (body: { email: string; password: string; displayName?: string; role?: string }) =>
-    request<ConsoleAdminItem>('/api/console/admins', { method: 'POST', body }),
+    consoleRequest<ConsoleAdminItem>('/api/console/admins', { method: 'POST', body }),
   patchAdmin: (id: number, body: { displayName?: string; role?: string; disabled?: boolean }) =>
-    request<ConsoleAdminItem>(`/api/console/admins/${id}`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleAdminItem>(`/api/console/admins/${id}`, { method: 'PATCH', body }),
   resetAdminPassword: (id: number, body: { password: string }) =>
-    request<ConsoleAdminItem>(`/api/console/admins/${id}/password`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleAdminItem>(`/api/console/admins/${id}/password`, { method: 'PATCH', body }),
   deleteAdmin: (id: number) =>
-    request<void>(`/api/console/admins/${id}`, { method: 'DELETE' }),
+    consoleRequest<void>(`/api/console/admins/${id}`, { method: 'DELETE' }),
   jobs: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleJobItem>>('/api/console/jobs', { query }),
+    consoleRequest<ConsolePage<ConsoleJobItem>>('/api/console/jobs', { query }),
   patchJob: (id: number, body: { status: string; reason?: string }) =>
-    request<ConsoleJobItem>(`/api/console/jobs/${id}`, { method: 'PATCH', body }),
+    consoleRequest<ConsoleJobItem>(`/api/console/jobs/${id}`, { method: 'PATCH', body }),
   assets: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleAssetItem>>('/api/console/assets', { query }),
+    consoleRequest<ConsolePage<ConsoleAssetItem>>('/api/console/assets', { query }),
   deleteAsset: (id: number) =>
-    request<void>(`/api/console/assets/${id}`, { method: 'DELETE' }),
+    consoleRequest<void>(`/api/console/assets/${id}`, { method: 'DELETE' }),
   restoreAsset: (id: number) =>
-    request<ConsoleAssetItem>(`/api/console/assets/${id}/restore`, { method: 'PATCH' }),
+    consoleRequest<ConsoleAssetItem>(`/api/console/assets/${id}/restore`, { method: 'PATCH' }),
   audits: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleAuditItem>>('/api/console/audits', { query }),
+    consoleRequest<ConsolePage<ConsoleAuditItem>>('/api/console/audits', { query }),
   orders: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleFinanceOrderItem>>('/api/console/orders', { query }),
+    consoleRequest<ConsolePage<ConsoleFinanceOrderItem>>('/api/console/orders', { query }),
   billings: (query?: Record<string, string | number | boolean | undefined>) =>
-    request<ConsolePage<ConsoleBillingItem>>('/api/console/billings', { query }),
-  pricing: () => request<ConsolePricingRuleItem[]>('/api/console/pricing'),
-  settings: () => request<ConsoleSettingItem[]>('/api/console/settings'),
+    consoleRequest<ConsolePage<ConsoleBillingItem>>('/api/console/billings', { query }),
+  pricing: () => consoleRequest<ConsolePricingRuleItem[]>('/api/console/pricing'),
+  settings: () => consoleRequest<ConsoleSettingItem[]>('/api/console/settings'),
 };

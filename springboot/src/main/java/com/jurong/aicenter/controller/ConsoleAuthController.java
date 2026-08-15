@@ -47,7 +47,8 @@ public class ConsoleAuthController {
             jwtTokenProvider.generateConsoleRefreshToken(admin.getId(), admin.getEmail(), admin.getRole()),
             admin.getId(),
             admin.getEmail(),
-            admin.getRole()
+            admin.getRole(),
+            admin.getCreatedAt() == null ? null : admin.getCreatedAt().toString()
         );
     }
 }

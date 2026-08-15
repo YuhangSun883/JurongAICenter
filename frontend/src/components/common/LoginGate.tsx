@@ -5,8 +5,10 @@ import { usePathname, useRouter } from 'next/navigation';
 import { onAuthFailure } from '@/lib/http';
 import {
   bindActivityRefresh,
+  bootstrapConsoleTokens,
   bootstrapTokens,
-  getUser,
+  getConsoleUser,
+  isConsoleLoggedIn,
   startAuthWatchdog,
 } from '@/lib/auth-store';
 import { bootstrapAuth } from '@/api/auth.real';
@@ -32,8 +34,25 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
 
     async function run() {
       bootstrapTokens();
+      bootstrapConsoleTokens();
 
       if (isAuthPage) {
+        setBootstrapped(true);
+        return;
+      }
+
+      if (isAdminPath) {
+        if (!isConsoleLoggedIn()) {
+          router.replace(`${loginPath}?from=${encodeURIComponent(pathname || '/admin')}`);
+          return;
+        }
+
+        const user = getConsoleUser<UserInfo>();
+        if (user?.channel !== 'CONSOLE' || !CONSOLE_ROLES.has(user?.role || '')) {
+          router.replace(`/admin/login?from=${encodeURIComponent(pathname || '/admin')}`);
+          return;
+        }
+
         setBootstrapped(true);
         return;
       }
@@ -46,14 +65,6 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      if (isAdminPath) {
-        const user = getUser<UserInfo>();
-        if (user?.channel !== 'CONSOLE' || !CONSOLE_ROLES.has(user?.role || '')) {
-          router.replace(`/admin/login?from=${encodeURIComponent(pathname || '/admin')}`);
-          return;
-        }
-      }
-
       setBootstrapped(true);
     }
 
@@ -64,9 +75,10 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
   }, [isAdminPath, isAuthPage, loginPath, pathname, router]);
 
   useEffect(() => {
+    if (isAdminPath) return;
     startAuthWatchdog();
     return bindActivityRefresh();
-  }, []);
+  }, [isAdminPath]);
 
   useEffect(() => {
     return onAuthFailure(() => {
@@ -78,7 +90,8 @@ export function LoginGate({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     function onStorage(event: StorageEvent) {
-      if (event.key === 'accessToken' && !event.newValue && !isAuthPage) {
+      const watchedKey = isAdminPath ? 'consoleAccessToken' : 'accessToken';
+      if (event.key === watchedKey && !event.newValue && !isAuthPage) {
         router.replace(`${loginPath}?from=${encodeURIComponent(pathname || '/')}`);
       }
     }

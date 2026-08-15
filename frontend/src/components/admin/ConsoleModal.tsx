@@ -1,4 +1,5 @@
 import { X } from 'lucide-react';
+import { useEffect } from 'react';
 import type { ReactNode } from 'react';
 
 interface ConsoleModalProps {
@@ -9,10 +10,24 @@ interface ConsoleModalProps {
 }
 
 export function ConsoleModal({ title, children, footer, onClose }: ConsoleModalProps) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') onClose();
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
-      <div className="w-full max-w-[520px] rounded-lg border border-cyan-300/25 bg-[#07101d] text-cyan-50 shadow-[0_0_90px_rgba(34,211,238,0.18)]">
-        <div className="flex min-h-12 items-center justify-between border-b border-cyan-300/15 px-5 py-3">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-5 backdrop-blur-sm"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="flex max-h-[calc(100vh-40px)] w-full max-w-[560px] flex-col overflow-hidden rounded-lg border border-cyan-300/25 bg-[#07101d] text-cyan-50 shadow-[0_0_90px_rgba(34,211,238,0.18)]">
+        <div className="flex min-h-12 shrink-0 items-center justify-between border-b border-cyan-300/15 px-5 py-3">
           <h3 className="text-base font-semibold text-white">{title}</h3>
           <button
             type="button"
@@ -23,8 +38,8 @@ export function ConsoleModal({ title, children, footer, onClose }: ConsoleModalP
             <X size={16} />
           </button>
         </div>
-        <div className="space-y-4 px-5 py-4">{children}</div>
-        <div className="flex justify-end gap-2 border-t border-cyan-300/15 px-5 py-4">{footer}</div>
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">{children}</div>
+        <div className="shrink-0 flex justify-end gap-2 border-t border-cyan-300/15 bg-[#07101d] px-5 py-4">{footer}</div>
       </div>
     </div>
   );

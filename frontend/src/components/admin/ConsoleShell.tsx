@@ -3,8 +3,7 @@
 import { Activity, ClipboardList, Coins, Database, FileClock, Image, LogOut, Settings, ShieldCheck, UserCog, Users } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import type { ReactNode } from 'react';
-import { authApi } from '@/api/auth';
-import { getUser } from '@/lib/auth-store';
+import { clearConsoleTokens, getConsoleUser } from '@/lib/auth-store';
 import type { UserInfo } from '@/types/user';
 
 interface ConsoleShellProps {
@@ -28,10 +27,10 @@ const navItems = [
 
 export function ConsoleShell({ active, onActiveChange, children }: ConsoleShellProps) {
   const router = useRouter();
-  const user = getUser<UserInfo>();
+  const user = getConsoleUser<UserInfo>();
 
-  async function handleLogout() {
-    await authApi.logout();
+  function handleLogout() {
+    clearConsoleTokens();
     router.replace('/admin/login');
   }
 

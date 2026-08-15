@@ -9,7 +9,6 @@ import { InsufficientCreditsDialog } from '@/components/common/InsufficientCredi
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { agentApi } from '@/api/agent';
 import type { AgentMessage, AgentToolCall } from '@/types/agent';
-import { Coins, Menu, Settings } from 'lucide-react';
 
 /** toolCall.action 到目标路由的映射 */
 const TOOL_ROUTES: Record<string, { route: string; label: string }> = {
@@ -218,34 +217,7 @@ export default function AgentPage() {
 
   return (
     <div className="min-h-screen pl-[72px]">
-      <Sidebar
-        bottom={
-          <>
-            <button className="flex w-12 flex-col items-center gap-0.5 rounded-xl py-1.5 text-fg-muted hover:text-brand" title="积分">
-              <span className="grid h-9 w-9 place-items-center rounded-xl bg-brand-50 text-brand">
-                <Coins className="h-4 w-4" />
-              </span>
-              <span className="text-[10px]">{credits}</span>
-            </button>
-            <button className="flex w-12 flex-col items-center gap-0.5 rounded-xl py-1.5 text-fg-muted hover:text-brand" title="订阅">
-              <span className="grid h-9 w-9 place-items-center rounded-xl hover:bg-brand-50">
-                <span className="text-base">💎</span>
-              </span>
-              <span className="text-[10px]">订阅</span>
-            </button>
-            <button className="flex w-12 flex-col items-center gap-0.5 rounded-xl py-1.5 text-fg-muted hover:text-brand" title="菜单">
-              <span className="grid h-9 w-9 place-items-center rounded-xl hover:bg-brand-50">
-                <Menu className="h-4 w-4" />
-              </span>
-            </button>
-            <button className="mt-1 flex w-12 flex-col items-center gap-0.5 rounded-xl py-1.5 text-fg-muted hover:text-brand" title="设置">
-              <span className="grid h-9 w-9 place-items-center rounded-xl hover:bg-brand-50">
-                <Settings className="h-4 w-4" />
-              </span>
-            </button>
-          </>
-        }
-      />
+      <Sidebar />
 
       <div className="flex h-screen">
         <ChatHistory

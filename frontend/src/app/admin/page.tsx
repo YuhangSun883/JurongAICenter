@@ -20,7 +20,7 @@ import { ConsoleModal, ModalField } from '@/components/admin/ConsoleModal';
 import { ConsoleShell } from '@/components/admin/ConsoleShell';
 import { ConsoleTable } from '@/components/admin/ConsoleTable';
 import { ConsoleMetricGrid, Panel, StatusPill } from '@/components/admin/ConsoleWidgets';
-import { getUser } from '@/lib/auth-store';
+import { getConsoleUser } from '@/lib/auth-store';
 import type { UserInfo } from '@/types/user';
 
 type TabKey = 'overview' | 'users' | 'admins' | 'orders' | 'billings' | 'pricing' | 'jobs' | 'assets' | 'settings' | 'audits';
@@ -90,7 +90,7 @@ export default function AdminConsolePage() {
   const [roleForm, setRoleForm] = useState('VIEWER');
   const [passwordForm, setPasswordForm] = useState('');
   const [creditForm, setCreditForm] = useState({ delta: '100', reason: '后台手动调整积分' });
-  const currentRole = (getUser<UserInfo>()?.role || 'VIEWER').toUpperCase();
+  const currentRole = (getConsoleUser<UserInfo>()?.role || 'VIEWER').toUpperCase();
 
   async function load(tab: TabKey = active, override?: FilterState, pageOverride?: number) {
     setLoading(true);

@@ -9,10 +9,18 @@ const REFRESH_TOKEN_KEY = 'refreshToken';
 const USER_KEY = 'user';
 const ACCESS_TOKEN_EXPIRY_KEY = 'accessTokenExpiry';
 
+const CONSOLE_ACCESS_TOKEN_KEY = 'consoleAccessToken';
+const CONSOLE_REFRESH_TOKEN_KEY = 'consoleRefreshToken';
+const CONSOLE_USER_KEY = 'consoleUser';
+const CONSOLE_ACCESS_TOKEN_EXPIRY_KEY = 'consoleAccessTokenExpiry';
+
 // ===== 内存中的 token（避免反复读 localStorage） =====
 let accessTokenInMemory: string | null = null;
 let refreshTokenInMemory: string | null = null;
 let accessTokenExpiryInMemory: number | null = null;
+let consoleAccessTokenInMemory: string | null = null;
+let consoleRefreshTokenInMemory: string | null = null;
+let consoleAccessTokenExpiryInMemory: number | null = null;
 
 // ===== 单例 Promise（防止并发触发多次 refresh） =====
 let refreshingPromise: Promise<boolean> | null = null;
@@ -39,6 +47,18 @@ export function bootstrapTokens(): void {
   if (typeof window === 'undefined') return;
   const rawAccess = localStorage.getItem(ACCESS_TOKEN_KEY);
   const rawRefresh = localStorage.getItem(REFRESH_TOKEN_KEY);
+  const rawUser = localStorage.getItem(USER_KEY);
+  if (rawUser) {
+    try {
+      const user = JSON.parse(rawUser) as { channel?: string };
+      if (user?.channel === 'CONSOLE') {
+        clearTokens();
+        return;
+      }
+    } catch {
+      localStorage.removeItem(USER_KEY);
+    }
+  }
   // 校验 token 格式（JWT 格式: xxx.yyy.zzz），清除无效 token
   const jwtRe = /^[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+$/;
   if (rawAccess && !jwtRe.test(rawAccess)) {
@@ -55,6 +75,27 @@ export function bootstrapTokens(): void {
   refreshTokenInMemory = rawRefresh;
   const expiry = localStorage.getItem(ACCESS_TOKEN_EXPIRY_KEY);
   accessTokenExpiryInMemory = expiry ? parseInt(expiry, 10) : null;
+}
+
+export function bootstrapConsoleTokens(): void {
+  if (typeof window === 'undefined') return;
+  const rawAccess = localStorage.getItem(CONSOLE_ACCESS_TOKEN_KEY);
+  const rawRefresh = localStorage.getItem(CONSOLE_REFRESH_TOKEN_KEY);
+  const jwtRe = /^[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+?\.[A-Za-z0-9\-_]+$/;
+  if (rawAccess && !jwtRe.test(rawAccess)) {
+    console.warn('[auth] invalid console access token format detected, clearing');
+    clearConsoleTokens();
+    return;
+  }
+  if (rawRefresh && !jwtRe.test(rawRefresh)) {
+    console.warn('[auth] invalid console refresh token format detected, clearing');
+    clearConsoleTokens();
+    return;
+  }
+  consoleAccessTokenInMemory = rawAccess;
+  consoleRefreshTokenInMemory = rawRefresh;
+  const expiry = localStorage.getItem(CONSOLE_ACCESS_TOKEN_EXPIRY_KEY);
+  consoleAccessTokenExpiryInMemory = expiry ? parseInt(expiry, 10) : null;
 }
 
 // ===== 写入 token =====
@@ -75,9 +116,32 @@ export function setUser(user: object): void {
   localStorage.setItem(USER_KEY, JSON.stringify(user));
 }
 
+export function setConsoleTokens(accessToken: string, refreshToken: string, expiresInSec: number): void {
+  if (typeof window === 'undefined') return;
+  consoleAccessTokenInMemory = accessToken;
+  consoleRefreshTokenInMemory = refreshToken;
+  consoleAccessTokenExpiryInMemory = Date.now() + expiresInSec * 1000;
+  localStorage.setItem(CONSOLE_ACCESS_TOKEN_KEY, accessToken);
+  localStorage.setItem(CONSOLE_REFRESH_TOKEN_KEY, refreshToken);
+  localStorage.setItem(CONSOLE_ACCESS_TOKEN_EXPIRY_KEY, String(consoleAccessTokenExpiryInMemory));
+  notifyAuthChange('login');
+}
+
+export function setConsoleUser(user: object): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(CONSOLE_USER_KEY, JSON.stringify(user));
+}
+
 export function getUser<T = unknown>(): T | null {
   if (typeof window === 'undefined') return null;
   const raw = localStorage.getItem(USER_KEY);
+  if (!raw) return null;
+  try { return JSON.parse(raw) as T; } catch { return null; }
+}
+
+export function getConsoleUser<T = unknown>(): T | null {
+  if (typeof window === 'undefined') return null;
+  const raw = localStorage.getItem(CONSOLE_USER_KEY);
   if (!raw) return null;
   try { return JSON.parse(raw) as T; } catch { return null; }
 }
@@ -95,9 +159,25 @@ export function clearTokens(): void {
   notifyAuthChange('logout');
 }
 
+export function clearConsoleTokens(): void {
+  consoleAccessTokenInMemory = null;
+  consoleRefreshTokenInMemory = null;
+  consoleAccessTokenExpiryInMemory = null;
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(CONSOLE_ACCESS_TOKEN_KEY);
+  localStorage.removeItem(CONSOLE_REFRESH_TOKEN_KEY);
+  localStorage.removeItem(CONSOLE_ACCESS_TOKEN_EXPIRY_KEY);
+  localStorage.removeItem(CONSOLE_USER_KEY);
+  notifyAuthChange('logout');
+}
+
 // ===== 查询 token =====
 export function getAccessToken(): string | null {
   return accessTokenInMemory;
+}
+
+export function getConsoleAccessToken(): string | null {
+  return consoleAccessTokenInMemory;
 }
 
 export function getRefreshToken(): string | null {
@@ -106,6 +186,12 @@ export function getRefreshToken(): string | null {
 
 export function isLoggedIn(): boolean {
   return !!accessTokenInMemory && !!refreshTokenInMemory;
+}
+
+export function isConsoleLoggedIn(): boolean {
+  if (!consoleAccessTokenInMemory || !consoleRefreshTokenInMemory) return false;
+  if (!consoleAccessTokenExpiryInMemory) return true;
+  return consoleAccessTokenExpiryInMemory - Date.now() > 0;
 }
 
 /**

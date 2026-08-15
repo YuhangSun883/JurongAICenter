@@ -17,6 +17,7 @@ interface BackendAuthResponse {
   userId: number;
   email: string;
   role: string;
+  createdAt?: string;
 }
 
 // 必须跟后端 application.yml 里 jwt.access-token-expiry 一致(目前是 2h)
@@ -33,6 +34,7 @@ function adapt(resp: BackendAuthResponse): LoginResponse {
       id: String(resp.userId),
       nickname: resp.email.split('@')[0],
       email: resp.email,
+      createdAt: resp.createdAt,
       role: resp.role,
       channel: 'APP',
     },

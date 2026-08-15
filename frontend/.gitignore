@@ -5,6 +5,8 @@ node_modules
 
 # build
 .next
+.next-dev
+.next-build
 out
 build
 dist

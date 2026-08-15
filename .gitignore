@@ -18,6 +18,8 @@ logs/
 # Local dependencies and build outputs
 node_modules/
 frontend/.next/
+frontend/.next-dev/
+frontend/.next-build/
 frontend/frontend/
 
 # Local handoff/build artifacts

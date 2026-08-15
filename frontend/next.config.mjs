@@ -1,7 +1,9 @@
 const apiBaseUrl = (process.env.INTERNAL_API_BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
 
 /** @type {import('next').NextConfig} */
-const nextConfig = {
+const createNextConfig = (phase) => ({
+  // dev 和 build 分开目录，避免开发服务运行时执行 next build 导致 _next/static chunk 404。
+  distDir: phase === 'phase-development-server' ? '.next-dev' : '.next-build',
   reactStrictMode: true,
   images: {
     remotePatterns: [
@@ -29,6 +31,6 @@ const nextConfig = {
       destination: `${apiBaseUrl}/api/:path*`,
     },
   ],
-};
+});
 
-export default nextConfig;
+export default createNextConfig;
