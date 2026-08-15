@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jurong.aicenter.dto.video.VideoOptions;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -21,6 +22,8 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import java.io.IOException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -405,6 +408,144 @@ public class NewApiClient {
     }
 
     /**
+     * 2026-08-14 改造:支持多模态(图片)
+     *   - userContent 可以是 String(纯文本,旧用法)或 List(Map<String,Object>)(OpenAI 多模态格式)
+     *   - 多模态格式:content = [{type:"text", text:"..."}, {type:"image_url", image_url:{url:"..."}}, ...]
+     *   - 由调用方负责拼多模态 content 数组(本方法不感知图片,只负责转发)
+     *
+     * <p>协议:与 chatCompletion 相同,body 多一个 "stream": true;
+     *      响应变成 SSE 格式,每行 "data: {...}" 是一个增量,直到 "data: [DONE]" 结束。
+     *
+     * @param onToken 每收到一段 token 时调用(可能 1-3 个字)
+     */
+    public void chatCompletionStream(
+            String model, String systemPrompt, Object userContent,
+            int maxTokens, java.util.function.Consumer<String> onToken) throws IOException {
+
+        // 1) 构造 messages
+        //   - system content 仍是 String
+        //   - user content 由调用方传,可以是 String 或 List(Map)
+        List<Map<String, Object>> messages = new ArrayList<>(2);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        // 2026-08-14:user content 改 Object(Map.of 不支持 null,改用 HashMap)
+        Map<String, Object> userMsg = new HashMap<>();
+        userMsg.put("role", "user");
+        userMsg.put("content", userContent == null ? "" : userContent);
+        messages.add(userMsg);
+
+        // 2) body 关键差异:stream: true
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", model);
+        body.put("messages", messages);
+        body.put("max_tokens", maxTokens);
+        body.put("temperature", 0.7);
+        body.put("stream", true);
+
+        // 3) JDK HttpClient 发请求(项目里 downloadAsDataUri 已有先例 line 955)
+        java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .build();
+
+        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/v1/chat/completions"))
+                .header("Authorization", "Bearer " + token)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                        objectMapper.writeValueAsString(body)))
+                .timeout(Duration.ofSeconds(180))
+                .build();
+
+        try {
+            java.net.http.HttpResponse<java.io.InputStream> resp = client.send(
+                    request, java.net.http.HttpResponse.BodyHandlers.ofInputStream());
+
+            // 4) 非 200 直接抛
+            if (resp.statusCode() != 200) {
+                String errBody = new String(resp.body().readAllBytes(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                log.error("NewAPI stream failed: {} {}", resp.statusCode(), errBody);
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "LLM 流式调用失败:" + resp.statusCode());
+            }
+
+            // 5) 按行解析 SSE
+            // 2026-08-14 临时调试:把 NewAPI 原始 SSE 响应 dump 到日志(前 20 行)
+            StringBuilder rawDump = new StringBuilder();
+            int dumpLineCount = 0;
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(resp.body(),
+                            java.nio.charset.StandardCharsets.UTF_8))) {
+                String line;  // 2026-08-14 修复:漏声明导致编译错误
+                int chunkIdx = 0;
+                while ((line = reader.readLine()) != null) {
+                    if (dumpLineCount < 20) {
+                        rawDump.append(line).append("\n");
+                        dumpLineCount++;
+                    }
+                    if (!line.startsWith("data: ")) continue;
+                    String payload = line.substring(6).trim();
+                    if (payload.isEmpty() || "[DONE]".equals(payload)) continue;
+
+                    try {
+                        JsonNode node = objectMapper.readTree(payload);
+                        JsonNode delta = node.path("choices").path(0).path("delta");
+                        String token = delta.path("content").asText("");
+                        if (token.isEmpty()) continue;
+
+                        // 2026-08-14 兜底:某些 NewAPI 中转的 bug 会把
+                        //   "data: " 前缀塞进 delta.content 字段(应该只在 SSE 行上,不在 content 里)
+                        //   实际表现:前端看到 "data: 好 data: 的..." 这种串字符
+                        //   而存进数据库的 LLM 真实输出是干净的(刷新页面后看到的是正常故事)
+                        //   说明每个 chunk 的 content 都是 "data: <text>" 形式
+                        //   - 先 strip 开头的 "data: "(最常见)
+                        //   - 再 strip 末尾残留的(防御)
+                        //   注:极端情况 LLM 真要输出 "data: " 字面量会被误剥,但概率极低,可接受
+                        if (token.startsWith("data: ")) {
+                            token = token.substring("data: ".length());
+                        } else if (token.startsWith("data:")) {
+                            // String.trimStart() 是 Java 21+,JDK 17 不可用
+                            // 改用 replaceFirst 去前导空格
+                            token = token.substring("data:".length()).replaceFirst("^\\s+", "");
+                        }
+                        if (token.endsWith("data: ")) {
+                            token = token.substring(0, token.length() - "data: ".length());
+                        }
+                        if (token.endsWith("data:")) {
+                            token = token.substring(0, token.length() - "data:".length());
+                        }
+
+                        if (token.isEmpty()) continue;
+
+                        // 调试:头 3 个 chunk 打 INFO log,确认 NewAPI 实际返回格式
+                        if (chunkIdx < 3) {
+                            log.info("[NewAPI-stream] chunk#{} raw='{}' cleaned='{}'",
+                                    chunkIdx, line, token);
+                            chunkIdx++;
+                        }
+
+                        onToken.accept(token);
+                    } catch (Exception e) {
+                        // 单 chunk 解码失败不致命,继续读
+                        log.debug("SSE chunk parse failed: {}", e.getMessage());
+                    }
+                }
+            }
+            // 2026-08-14 dump NewAPI 原始 SSE 响应(前 20 行)
+            log.info("=== NewAPI raw SSE dump (first {} lines) ===\n{}",
+                    dumpLineCount, rawDump);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("NewAPI chatCompletionStream failed: {}", e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, e.getMessage());
+        }
+    }
+
+    /**
      * 多模态 chat completion（支持图片理解）。
      *
      * <p>调用 /v1/chat/completions，传 user message 时使用 OpenAI 多模态格式：
@@ -687,6 +828,12 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                 "NewAPI /v1/videos (multi) 调用失败: " + e.getMessage());
         }
+        VideoOptions opts = VideoOptions.builder()
+            .duration(duration)
+            .resolution(resolution)
+            .build();
+        SubmitResult r = submitVideo(prompt, allImages, opts);
+        return r.taskId();
     }
 
     /**
@@ -738,6 +885,7 @@ public class NewApiClient {
             // aicoming 只接受小写 resolution（480p/720p/1080p/4k）
             String useResolution = (options.getResolution() != null && !options.getResolution().isBlank())
                 ? options.getResolution().toLowerCase() : "480p";
+            int useDuration = options.getDuration();
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
@@ -818,8 +966,9 @@ public class NewApiClient {
             }
             log.info("NewAPI video task submitted: {} (image={}, size={}B, duration={}s, resolution={})",
                 taskId,
-                imageFiles != null && !imageFiles.isEmpty() ? imageFiles.get(0).length : 0,
-                options.getDuration(), useResolution);
+                (imageFiles != null && !imageFiles.isEmpty()) ? "ref_0" : "placeholder",
+                (imageFiles != null && !imageFiles.isEmpty()) ? imageFiles.get(0).length : 0,
+                useDuration, useResolution);
             // 2026-08-11 修复:submit 响应里常常已含 video url(同步返回 + task_id 同一响应)。
             // 之前不提取就丢了,只能等 poll 30 秒后取到 → 如果 poll 出现 400 索引延迟就会被误判 FAILED。
             // 现在提取后,即使后续 poll 失败,job 也已保存 url,前端能直接播放。
@@ -1092,6 +1241,51 @@ public class NewApiClient {
             log.warn("[NewAPI] 清洗后的 URL 格式异常: 原始={}, 清洗后={}", url, cleaned);
         }
         return cleaned;
+    }
+
+    /**
+     * 2026-08-14 补回:下载图片 URL 并转为 base64 data URI,
+     * 应对 NewAPI 中转服务器无法访问公网 URL 的情况(chatCompletionWithImages 用)。
+     *
+     * <p>如果 URL 已经是 data URI,直接返回;如果是 http(s),下载后 base64 编码。</p>
+     *
+     * @param url 图片 URL(可以是 data URI 或公网 URL)
+     * @return data URI 形式的字符串(若失败则返回原 URL 让调用方 fallback)
+     */
+    // 2026-08-14:从 private 改 public,让 AgentServiceImpl.sendStream 复用(支持流式多模态)
+    public String downloadAsDataUri(String url) {
+        if (url == null || url.isBlank()) return url;
+        if (url.startsWith("data:")) return url;  // 已经是 data URI,直接返回
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            return url;  // 未知 scheme,原样返回(让调用方处理)
+        }
+        try {
+            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                .build();
+            java.net.http.HttpRequest req = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(url))
+                .timeout(Duration.ofSeconds(30))
+                .header(HttpHeaders.USER_AGENT, "JurongAICenter/1.0")
+                .GET()
+                .build();
+            java.net.http.HttpResponse<byte[]> resp = client.send(req,
+                java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            if (resp.statusCode() < 200 || resp.statusCode() >= 300 || resp.body() == null) {
+                log.warn("[downloadAsDataUri] 下载失败: status={}, url={}", resp.statusCode(), url);
+                return url;
+            }
+            String contentType = resp.headers().firstValue("Content-Type").orElse("image/png");
+            String b64 = Base64.getEncoder().encodeToString(resp.body());
+            String dataUri = "data:" + contentType + ";base64," + b64;
+            log.debug("[downloadAsDataUri] 下载成功: url={}, bytes={}, mime={}",
+                url, resp.body().length, contentType);
+            return dataUri;
+        } catch (Exception e) {
+            log.warn("[downloadAsDataUri] 异常: url={}, err={}", url, e.getMessage());
+            return url;  // 失败时原样返回,让调用方 fallback
+        }
     }
     /**
      * 快速健康检查 —— 检测 NewAPI 服务是否可用

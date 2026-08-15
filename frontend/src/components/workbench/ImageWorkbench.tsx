@@ -277,6 +277,23 @@ export function ImageWorkbench() {
               type: p.type,
               name: p.name,
             })));
+
+            // 2026-08-14 增强:把 prefill 的图片作为 @图片1 chip 插入到 prompt 编辑器,
+            //   这样用户能在 prompt 文本里"看到"哪张图被引用了。
+            // 复用 selectImageReference 逻辑（确保编号与 references 数组一致）:
+            //   1) 先 setReferences（line 272）
+            //   2) 用 setTimeout 推到下一个事件循环,等 React 完成 setState
+            //   3) 调 selectImageReference 把 chip 插到 contenteditable
+            setTimeout(() => {
+              try {
+                for (const p of picked) {
+                  selectImageReference(p);
+                }
+                console.log('[ImageWorkbench] prefill: inserted @ image chips to editor (via selectImageReference)');
+              } catch (e) {
+                console.warn('[ImageWorkbench] failed to insert @ chips via selectImageReference:', e);
+              }
+            }, 50);
           }
         })();
       }

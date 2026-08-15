@@ -79,6 +79,20 @@ public class GenerationController {
                     e.getMessage());
             }
         }
+        // 2026-08-14 通过 MediaAsset.sourceTaskId 反查对应的 mediaAssetId(视频完成后已入库时有值)
+        Long mediaAssetId = null;
+        try {
+            MediaAsset asset = mediaAssetRepository.selectOne(
+                new LambdaQueryWrapper<MediaAsset>()
+                    .eq(MediaAsset::getSourceTaskId, String.valueOf(job.getId()))
+                    .last("LIMIT 1")
+            );
+            if (asset != null) {
+                mediaAssetId = asset.getId();
+            }
+        } catch (Exception e) {
+            log.warn("[jobs.getJob] 反查 mediaAssetId 失败: id={}, err={}", id, e.getMessage());
+        }
         return new JobResponse(
             job.getId(),
             job.getWorkflowId(),

@@ -45,6 +45,9 @@ export default function AgentPage() {
   });
   // AI 跳转建议弹窗（toolCall）
   const [pendingToolCall, setPendingToolCall] = useState<AgentToolCall | null>(null);
+  // 2026-08-14:不再需要 useMaterials —— handleSend 现在直接接收完整 PickedMedia(含 url)
+  //   之前的反查逻辑有闭包陷阱:ChatComposer addMaterials 异步 setState → handleSend 触发时
+  //   page.tsx 的 materials 还是旧值 → find() 找不到 → attachmentInfos 为空 → 图片不显示
 
   /** 拉会话列表 */
   const refreshSessions = useCallback(async () => {
@@ -143,9 +146,26 @@ export default function AgentPage() {
     router.push(`${route.route}?${params.toString()}`);
   }
 
-  /** 发送消息 —— 先 checkCredits，再乐观更新请求 send */
-  async function handleSend(content: string, attachmentIds: string[]) {
+  /** 发送消息 —— 先 checkCredits，再乐观更新请求 send
+   *  2026-08-14:第二个参数改成 PickedMedia[] 完整素材(原 attachmentIds: string[]),
+   *  这样可以拿到 url 直接渲染图片,不用再去 useMaterials 反查 */
+  async function handleSend(content: string, pickedAttachments: Array<{ id: string; type: 'image' | 'video' | 'audio'; url: string; name: string }>) {
     if (!content.trim() || sending) return;
+    const attachmentIds = pickedAttachments.map((m) => m.id);
+    // 2026-08-14 增强:用户没手动上传图时,自动从历史消息里取最近 AI 回复中的图片附件
+    //   这样 "把这只猫的毛色变成白色" 这种图生图意图能被正确识别
+    let effectiveAttachmentIds = attachmentIds;
+    if (!attachmentIds || attachmentIds.length === 0) {
+      // 倒序遍历 messages,找最近一条带图片附件的 AI 回复
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role === 'assistant' && Array.isArray(m.attachments) && m.attachments.length > 0) {
+          effectiveAttachmentIds = m.attachments.map((a: any) => a.id);
+          console.log('[agent] auto-injected attachmentIds from previous AI reply:', effectiveAttachmentIds);
+          break;
+        }
+      }
+    }
 
     // 1) 前端粗算：长度 + 素材数量 → estimated
     const estimated = Math.max(1, Math.ceil(content.length / 100) + attachmentIds.length);
@@ -155,7 +175,7 @@ export default function AgentPage() {
       const check = await agentApi.checkCredits({
         action: 'agent-send',
         estimated,
-        context: { length: content.length, attachments: attachmentIds.length },
+        context: { length: content.length, attachments: effectiveAttachmentIds.length },
       });
 
       if (check.status === 'insufficient') {
@@ -167,6 +187,15 @@ export default function AgentPage() {
     }
 
     // 3) 乐观更新：先显示用户消息（temp id，等真实返回后被替换）
+    // 2026-08-14 修复:用入参 pickedAttachments 直接构造 attachments(有 url)
+    //   之前从 materials.find() 反查遇到闭包陷阱(addMaterials 是异步 setState),
+    //   现在直接用入参数据,简单可靠
+    const attachmentInfos = (pickedAttachments || []).map((m) => ({
+      id: m.id,
+      type: m.type,
+      url: m.url,
+      name: m.name,
+    }));
     const optimisticUserId = 'temp-user-' + Date.now();
     const optimisticUserMsg: AgentMessage = {
       id: optimisticUserId,
@@ -174,10 +203,11 @@ export default function AgentPage() {
       role: 'user',
       content,
       createdAt: Date.now(),
+      attachments: attachmentInfos.length > 0 ? attachmentInfos : undefined,
     };
     setMessages((prev) => [...prev, optimisticUserMsg]);
 
-    // 4) 助手“思考中”占位气泡（加重试点提示）
+    // 4) 助手"思考中"占位气泡（加重试点提示）
     const thinkingMsgId = 'temp-thinking-' + Date.now();
     setMessages((prev) => [
       ...prev,
@@ -190,27 +220,142 @@ export default function AgentPage() {
       },
     ]);
 
-    // 5) 真正发送
+    // 5) 真正发送(流式:逐字更新 AI 气泡)
+    //    2026-08-14 修复:如果 activeId 为 null(还没建会话),先建一个
+    //      ⚠️ 不要立即 setActiveId!否则 useEffect 立刻 refreshMessages(新空会话)
+    //        → setMessages([]) → 乐观消息被清空 → 视觉上"对话消失"
+    //      改用 workingSessionId 局部变量,等 sendStream 走完再用 meta.sessionId 切
     setSending(true);
+    let workingSessionId = activeId;
+    let didCreateSession = false;
     try {
-      const res = await agentApi.send({
-        sessionId: activeId,
-        content,
-        attachmentIds,
-      });
-      setActiveId(res.sessionId);
-      await refreshSessions();
-      await refreshMessages(res.sessionId); // 用真实消息替换乐观消息
-      await refreshCredits();
+      if (!workingSessionId) {
+        const { session } = await agentApi.createSession();
+        workingSessionId = session.id;
+        didCreateSession = true;
+        // ⚠️ 不要 setActiveId/refreshSessions,等 sendStream 完成后一起做
+      }
 
-      // 6) 如果 LLM 返回了 toolCall，弹确认框（不是直接跳，让用户决定）
-      if (res.toolCall && TOOL_ROUTES[res.toolCall.action]) {
-        setPendingToolCall(res.toolCall);
+      const res = await agentApi.sendStream({
+        sessionId: workingSessionId,
+        content,
+        attachmentIds: effectiveAttachmentIds,
+      });
+
+      if (!res.ok) {
+        // 2026-08-14 修复:把后端业务码透传给用户(避免 catch 块默默移除乐观消息)
+        const errText = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${res.statusText} - ${errText.slice(0, 200)}`);
+      }
+
+      if (!res.body) throw new Error('No response body from stream');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = '';        // 累积的 AI 文本(不含 [META])
+      let meta: any = null;         // 流结束时的元数据
+      // 2026-08-14 兜底:90s 内 reader 没收到任何数据就主动中断,refreshMessages 拉 DB
+      //   (避免 Next.js 代理 buffer 或网络层卡死导致 UI 一直"正在思考")
+      const streamTimeoutMs = 90_000;
+      let lastChunkAt = Date.now();
+
+      const watchdog = setInterval(() => {
+        if (Date.now() - lastChunkAt > streamTimeoutMs) {
+          console.warn('[agent] SSE stream watchdog timeout, aborting reader');
+          reader.cancel().catch(() => {});
+          clearInterval(watchdog);
+        }
+      }, 5_000);
+
+      // 2026-08-14 关键修复:前端 reader 拿到的是 SSE 协议原文("data: <token>\n\n" 多行拼接),
+      //   之前的代码把整段当 LLM 文本直接显示,导致 "data: 好 data: 的..." 污染。
+      //   现在按 \n\n 切事件 → 每个事件里所有 data: 行拼成 token → 累积到 accumulated。
+      let sseBuffer = '';
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          lastChunkAt = Date.now();
+          sseBuffer += decoder.decode(value, { stream: true });
+
+          // 按 \n\n 切出"完整事件",最后一个可能不完整,留给下个循环
+          const events = sseBuffer.split('\n\n');
+          sseBuffer = events.pop() ?? '';
+
+          for (const ev of events) {
+            if (!ev.trim()) continue;
+            // 提取本事件的所有 data: 行,拼接成 token
+            // (Spring SseEmitter.event().data(token) 生成 "data: <token>\n\n",
+            //  正常情况一个事件只有一行 data;这里按规范把多行 data 用 \n 拼接)
+            const dataLines = ev
+              .split('\n')
+              .filter(line => line.startsWith('data:'))
+              .map(line => line.substring(5).replace(/^ /, ''));  // 去 "data:" 后可能的前导空格
+            if (dataLines.length === 0) continue;
+            const token = dataLines.join('\n');
+            if (!token) continue;
+            accumulated += token;
+          }
+
+          // 检测 [META] 标记(only in 累积文本里查)
+          const metaIdx = accumulated.indexOf('[META]');
+          if (metaIdx >= 0) {
+            const metaJson = accumulated.substring(metaIdx + 6);
+            accumulated = accumulated.substring(0, metaIdx);
+            try {
+              meta = JSON.parse(metaJson);
+            } catch (e) {
+              console.warn('[agent] failed to parse META:', e);
+            }
+          }
+
+          // 更新 AI 气泡(去掉可能的 META 部分)
+          setMessages(prev => prev.map(m =>
+            m.id === thinkingMsgId
+              ? { ...m, content: accumulated.replace(/\[META\].*$/, '') }
+              : m
+          ));
+        }
+      } finally {
+        clearInterval(watchdog);
+      }
+
+      // 6) 流结束,处理元数据
+      if (meta) {
+        if (didCreateSession) {
+          // 新建的会话:切到新会话,useEffect 触发 refreshMessages(此时 DB 已有 2 条消息)
+          setActiveId(meta.sessionId);
+        }
+        if (meta.toolCall && TOOL_ROUTES[meta.toolCall.action]) {
+          setPendingToolCall({
+            action: meta.toolCall.action,
+            prompt: meta.toolCall.prompt,
+            reason: meta.toolCall.reason,
+            attachmentIds: effectiveAttachmentIds,  // 流式拒收图,这里用于透传
+          });
+        }
+        await refreshSessions();
+        await refreshCredits();
+      } else if (didCreateSession) {
+        // 异常路径但新建了会话:主动 refreshMessages(避免 UI 一直是乐观消息)
+        await refreshMessages(workingSessionId);
       }
     } catch (err) {
-      // 发送失败：移除乐观消息 + 提示
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticUserId && m.id !== thinkingMsgId));
-      console.error('[agent] send failed:', err);
+      // 2026-08-14 修复:失败时不要移除乐观消息,改成把思考气泡改成错误提示
+      // 之前的逻辑会清空用户消息,导致"对话发出去立马消失"
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[agent] sendStream failed:', err);
+      if (didCreateSession) {
+        // 即使失败也切到新会话,让用户能看到自己发的消息(避免下一轮又新建一个)
+        setActiveId(workingSessionId);
+        await refreshSessions();
+      }
+      setMessages(prev => prev.map(m =>
+        m.id === thinkingMsgId
+          ? { ...m, content: `⚠️ 发送失败: ${errMsg}` }
+          : m
+      ));
     } finally {
       setSending(false);
     }
@@ -262,7 +407,7 @@ export default function AgentPage() {
         <main className="relative flex flex-1 flex-col">
           {/* 消息流 */}
           <div className="flex-1 overflow-auto px-6 py-6">
-            {messages.length === 0 ? (
+            {(messages ?? []).length === 0 ? (
               <div className="grid h-full place-items-center text-center text-fg-subtle">
                 <div>
                   <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-brand-50 text-2xl">🤖</div>
@@ -272,7 +417,7 @@ export default function AgentPage() {
               </div>
             ) : (
               <div className="mx-auto max-w-3xl space-y-4">
-                {messages.map((m) => (
+                {(messages ?? []).map((m) => (
                   <div
                     key={m.id}
                     className={

@@ -61,6 +61,15 @@ public interface StorageService {
     List<String> listObjectsByPrefix(String prefix, boolean recursive);
 
     /**
+     * 2026-08-14 新增:获取 MinIO 对象的输入流(给 MediaController 流式读取用)。
+     * 调用方负责关闭 InputStream。
+     *
+     * @param objectKey MinIO 对象 key
+     * @return InputStream
+     */
+    java.io.InputStream getFileStream(String objectKey);
+
+    /**
      * uploadAiMedia 的返回体
      */
     record UploadResult(String objectKey, String url) {}

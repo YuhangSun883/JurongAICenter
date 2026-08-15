@@ -21,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -102,6 +103,11 @@ public class AgentServiceImpl implements AgentService {
 
     @Value("${llm.system-prompt:你是 Jurong AI 助手，简洁专业地回答用户问题。}")
     private String llmSystemPrompt;
+
+    // 2026-08-14 新增:滑动窗口 — 喂给 LLM 的最近原文条数(默认 20)
+    //   DB 全量存,前端 listMessages 也返回全量,只在这里限流
+    @Value("${agent.context.max-raw-messages:20}")
+    private int maxRawMessages;
 
     @Override
     public Map<String, Object> listSessions(Long userId, Integer page, Integer pageSize) {
@@ -231,12 +237,22 @@ public class AgentServiceImpl implements AgentService {
         userMsg.setCreatedAt(LocalDateTime.now());
         messageRepo.insert(userMsg);
 
-        // 4) 拉历史消息
+        // 4) 拉历史消息(滑动窗口:只取最近 N 条喂给 LLM)
+        //   先按 created_at DESC 取最新 N 条,再 reverse 恢复正序给 LLM
         List<AgentMessage> history = messageRepo.selectList(
                 new QueryWrapper<AgentMessage>()
                         .eq("session_id", session.getId())
-                        .orderByAsc("created_at")
+                        .orderByDesc("created_at")
+                        .last("LIMIT " + maxRawMessages)
         );
+        Collections.reverse(history);
+
+        // 2026-08-14 临时 debug log:验证滑动窗口生效
+        long totalMsgs = messageRepo.selectCount(
+            new QueryWrapper<AgentMessage>().eq("session_id", session.getId())
+        );
+        log.info("Agent context window: feeding {} msgs to LLM (total in session: {}, limit: {})",
+            history.size(), totalMsgs, maxRawMessages);
 
         // 5) 调 LLM（多模态 vs 文字）
         String llmReply;
@@ -351,9 +367,17 @@ public class AgentServiceImpl implements AgentService {
     }
 
     /**
-     * 纯文字 LLM 调用（无图片时用，保持旧逻辑）。
+     * 把 history 拼成 LLM 用的 user prompt(纯文本模式)。
+     * 抽出来给 send 和 sendStream 共用。
+     *
+     * 2026-08-14 修复:不要在这里拼 system prompt!
+     *   之前 sb.append(llmSystemPrompt) 会让 userPrompt 里带一份完整的 system 文本,
+     *   而 NewApiClient 调用时又把 llmSystemPrompt 作为独立 system message 传一遍,
+     *   LLM 收到双份 system 后被压垮,开始模仿 user 里的 system 格式续写
+     *   (实际表现:LLM 持续输出 "data:..." / "[ASSISTANT]..." 等串字符)。
+     *   正确做法:system 只在调用方传一次,这里只拼 history。
      */
-    private String callLlmTextOnly(List<AgentMessage> history) {
+    private String buildLlmPrompt(List<AgentMessage> history) {
         // 构造 messages 数组
         List<Map<String, String>> messages = new ArrayList<>();
         for (AgentMessage m : history) {
@@ -366,7 +390,6 @@ public class AgentServiceImpl implements AgentService {
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append(llmSystemPrompt).append("\n\n");
         for (Map<String, String> m : messages) {
             String role = m.get("role");
             if ("system".equals(role)) continue;
@@ -374,14 +397,186 @@ public class AgentServiceImpl implements AgentService {
             sb.append(m.get("content")).append("\n\n");
         }
         sb.append("[ASSISTANT]\n");
-        String userPrompt = sb.toString();
+        return sb.toString();
+    }
 
+    /**
+     * 纯文字 LLM 调用(无图片时用,走原 chatCompletion 阻塞模式)。
+     */
+    private String callLlmTextOnly(List<AgentMessage> history) {
+        String userPrompt = buildLlmPrompt(history);
         try {
             return newApiClient.chatCompletion(llmModel, llmSystemPrompt, userPrompt, llmMaxTokens);
         } catch (Exception e) {
             log.error("LLM call failed: {}", e.getMessage());
             return "抱歉，AI 助手暂时无法回复，请稍后再试。";
         }
+    }
+
+    /**
+     * 2026-08-14 新增:流式 send。
+     *   - 2026-08-14 改造:支持多模态(带图也能流式,图片转 data URI 后给 LLM 看)
+     *   - 每生成一段 token 调 onToken 推给 controller(SseEmitter)
+     *   - 攒 fullReply,完整后解析 tool_call + 存 assistant 消息
+     *   - 流结束前推一个 [META] 事件,带 sessionId / toolCall 等元数据
+     */
+    @Override
+    @Transactional
+    public void sendStream(Long userId, AgentSendRequest req,
+                           java.util.function.Consumer<String> onToken) {
+        // 1) 找/建 session(同 send)
+        AgentSession session;
+        if (req.getSessionId() == null || req.getSessionId().isBlank()) {
+            String defaultTitle = req.getContent().trim();
+            if (defaultTitle.length() > 30) {
+                defaultTitle = defaultTitle.substring(0, 30) + "...";
+            }
+            session = createSession(userId, defaultTitle);
+        } else {
+            session = requireOwnedSession(userId, req.getSessionId());
+        }
+
+        // 2) 2026-08-14 改造:流式也支持多模态(图片)
+        //   拉图片 URL(presigned MinIO URL,24h 有效),给 LLM 看图用
+        List<String> imageUrls = new ArrayList<>();
+        if (req.getAttachmentIds() != null && !req.getAttachmentIds().isEmpty()) {
+            imageUrls = mediaService.getImageUrlsByIds(userId, req.getAttachmentIds());
+        }
+
+        // 3) 存用户消息
+        AgentMessage userMsg = new AgentMessage();
+        userMsg.setSessionId(session.getId());
+        userMsg.setUserId(userId);
+        userMsg.setRole("user");
+        userMsg.setContent(req.getContent());
+        // 同步 attachmentInfos 到消息(前端气泡显示图片用,同 send 逻辑)
+        if (!imageUrls.isEmpty()) {
+            List<com.jurong.aicenter.entity.MediaAsset> assets =
+                mediaService.getAssetsByIds(userId, req.getAttachmentIds());
+            List<Map<String, Object>> attachmentInfos = new java.util.ArrayList<>();
+            for (com.jurong.aicenter.entity.MediaAsset a : assets) {
+                Map<String, Object> m = new java.util.HashMap<>();
+                m.put("id", String.valueOf(a.getId()));
+                m.put("type", a.getType());
+                m.put("name", a.getName());
+                m.put("url", a.getObjectKey() == null
+                    ? null
+                    : mediaService.getPresignedUrl(a.getObjectKey(), 24));
+                attachmentInfos.add(m);
+            }
+            try {
+                userMsg.setAttachments(new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(attachmentInfos));
+            } catch (Exception ignore) {
+                userMsg.setAttachments(null);
+            }
+        }
+        userMsg.setCreatedAt(LocalDateTime.now());
+        messageRepo.insert(userMsg);
+
+        // 4) 拉历史(滑动窗口,同 send)
+        List<AgentMessage> history = messageRepo.selectList(
+                new QueryWrapper<AgentMessage>()
+                        .eq("session_id", session.getId())
+                        .orderByDesc("created_at")
+                        .last("LIMIT " + maxRawMessages)
+        );
+        Collections.reverse(history);
+
+        // 5) 2026-08-14 改造:根据是否有图,选纯文本 / 多模态
+        //   - 纯文本:userContent = buildLlmPrompt(history) 单字符串(旧逻辑)
+        //   - 多模态:userContent = [{type:"text", text:当前消息}, {type:"image_url", ...}]
+        //     同时把 history 拼到 system prompt 后面(简化:不传多 messages 数组,LLM 仍能感知上下文)
+        String systemPromptForLlm = llmSystemPrompt;
+        Object userContentForLlm;
+        if (imageUrls.isEmpty()) {
+            // 纯文本
+            userContentForLlm = buildLlmPrompt(history);
+        } else {
+            // 多模态:history 拼到 system 后面
+            StringBuilder histSb = new StringBuilder();
+            for (AgentMessage m : history) {
+                String role = m.getRole();
+                if (!"user".equals(role) && !"assistant".equals(role)) continue;
+                histSb.append("[").append(role.toUpperCase()).append("]\n")
+                      .append(m.getContent() == null ? "" : m.getContent())
+                      .append("\n\n");
+            }
+            systemPromptForLlm = llmSystemPrompt
+                + "\n\n## 历史对话(参考,图片用户上传,文字即用户原文)\n"
+                + histSb;
+
+            List<Map<String, Object>> mm = new ArrayList<>();
+            mm.add(Map.of("type", "text",
+                    "text", req.getContent() == null ? "" : req.getContent()));
+            for (String url : imageUrls) {
+                if (url == null || url.isBlank()) continue;
+                String finalUrl = url;
+                try {
+                    // 优先转 data URI(NewAPI 中转服务器可能访问不到公网 URL)
+                    finalUrl = newApiClient.downloadAsDataUri(url);
+                } catch (Exception e) {
+                    log.warn("[sendStream] downloadAsDataUri 失败,fallback 原 URL: url={}, err={}",
+                        url, e.getMessage());
+                }
+                mm.add(Map.of("type", "image_url",
+                        "image_url", Map.of("url", finalUrl)));
+            }
+            userContentForLlm = mm;
+        }
+
+        // 6) ★ 流式调 LLM,边推边攒
+        StringBuilder fullReply = new StringBuilder();
+        try {
+            newApiClient.chatCompletionStream(
+                    llmModel, systemPromptForLlm, userContentForLlm, llmMaxTokens,
+                    token -> {
+                        fullReply.append(token);
+                        onToken.accept(token);
+                    });
+        } catch (Exception e) {
+            log.error("Agent LLM stream failed: {}", e.getMessage());
+            onToken.accept("\n[生成失败,请重试]");
+            return;  // 不存 assistant 消息
+        }
+
+        // 7) 解析 tool_call
+        ParsedLlmReply parsed = parseLlmReply(fullReply.toString());
+
+        // 8) 存 assistant 消息
+        AgentMessage assistantMsg = new AgentMessage();
+        assistantMsg.setSessionId(session.getId());
+        assistantMsg.setUserId(userId);
+        assistantMsg.setRole("assistant");
+        assistantMsg.setContent(parsed.displayContent);
+        if (parsed.toolCallJson != null) {
+            assistantMsg.setToolCalls(parsed.toolCallJson);
+        }
+        assistantMsg.setCreatedAt(LocalDateTime.now());
+        messageRepo.insert(assistantMsg);
+
+        // 9) 更新 session 积分
+        int creditsUsed = (session.getCreditsUsed() == null ? 0 : session.getCreditsUsed()) + DEFAULT_CREDITS_PER_MESSAGE;
+        session.setCreditsUsed(creditsUsed);
+        session.setUpdatedAt(LocalDateTime.now());
+        sessionRepo.updateById(session);
+
+        // 10) 推 [META] 事件,带 sessionId / toolCall 等元数据(前端用)
+        Map<String, Object> meta = new HashMap<>();
+        meta.put("type", "done");
+        meta.put("sessionId", session.getId());
+        meta.put("userMessageId", userMsg.getId());
+        meta.put("assistantMessageId", assistantMsg.getId());
+        meta.put("creditsUsed", creditsUsed);
+        if (parsed.toolCall != null) {
+            Map<String, Object> tc = new HashMap<>();
+            tc.put("action", parsed.toolCall.getAction());
+            tc.put("prompt", parsed.toolCall.getPrompt());
+            tc.put("reason", parsed.toolCall.getReason());
+            meta.put("toolCall", tc);
+        }
+        try {
+            onToken.accept("[META]" + new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(meta));
+        } catch (Exception ignore) {}
     }
 
     @Override

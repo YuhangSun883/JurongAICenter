@@ -91,6 +91,10 @@ logging:
 llm:
   model: claude-sonnet-4-6  # 多模态模型（NewAPI 实际可用），支持图片理解
   max-tokens: 2048
+  # 2026-08-14 新增:Agent 对话滑动窗口,只把最近 N 条原文喂给 LLM,
+  #   超过这个数的早期内容直接丢掉(方案 A,先跑起来)。
+  #   后续可平滑升级到方案 B(摘要压缩),不动前端。
+  agent-context-window: 20
   system-prompt: |
     你是 Jurong AI 助手。用户可能上传图片给你。
 
@@ -127,6 +131,15 @@ llm:
     普通问题直接回答，输出简洁，不要 markdown 格式。
   image-poll-timeout-sec: 600    # ComfyUI text-to-image 超时（10 分钟）
   video-poll-timeout-sec: 1800   # NewAPI 视频生成超时（30 分钟）
+
+# ============================================================
+# Agent 上下文配置（滑动窗口,避免 LLM context 无限增长）
+# DB 仍然全量存,前端 listMessages 也返回全量,只是喂给 LLM 时只取最近 N 条
+# ============================================================
+agent:
+  context:
+    # 喂给 LLM 的最近原文条数（不含 system prompt）
+    max-raw-messages: 20
 
 # 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
 canvas:
