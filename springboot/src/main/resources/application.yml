@@ -61,6 +61,17 @@ newapi:
   token: ${NEWAPI_TOKEN:}
 
 # ============================================================
+# 独立后台首个管理员初始化
+# 只写 console_admins 表，不会修改前台 users 用户密码。
+# 线上第一次启动前设置 CONSOLE_ADMIN_EMAIL / CONSOLE_ADMIN_PASSWORD 即可。
+# ============================================================
+console:
+  bootstrap:
+    email: ${CONSOLE_ADMIN_EMAIL:}
+    password: ${CONSOLE_ADMIN_PASSWORD:}
+    display-name: ${CONSOLE_ADMIN_DISPLAY_NAME:超级管理员}
+
+# ============================================================
 # aicoming-image-proxy 配置（素材库 CRUD 走这里 :8090）
 # 文档 §3 明说：
 #   - :8080 是 aicoming-video-proxy（视频生成），不管理素材库

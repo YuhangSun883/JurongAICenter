@@ -33,6 +33,8 @@ function adapt(resp: BackendAuthResponse): LoginResponse {
       id: String(resp.userId),
       nickname: resp.email.split('@')[0],
       email: resp.email,
+      role: resp.role,
+      channel: 'APP',
     },
   };
 }

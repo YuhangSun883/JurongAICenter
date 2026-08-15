@@ -36,7 +36,7 @@ import {
   X,
 } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent, type PointerEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type ComponentType, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type PointerEvent } from 'react';
 import { flushSync } from 'react-dom';
 import { canvasApi, type CanvasNodeType, type CanvasNode } from '@/api/canvas';
 import { getAccessToken } from '@/lib/auth-store';
@@ -240,7 +240,7 @@ export default function NewCanvasPage() {
   // 点击画布菜单外部关闭菜单
   useEffect(() => {
     if (!showCanvasMenu) return;
-    const handler = (e: MouseEvent) => {
+    const handler = (e: globalThis.MouseEvent) => {
       if (canvasMenuRef.current && !canvasMenuRef.current.contains(e.target as Node)) {
         setShowCanvasMenu(false);
       }
@@ -2380,7 +2380,7 @@ function CanvasNodeCard({
   onOpenMenu: (node: CanvasViewNode, side: 'left' | 'right') => void;
   onStartLinkDrag: (node: CanvasViewNode, side: 'left' | 'right', event: PointerEvent<HTMLButtonElement>) => void;
   onOpenExpanded: (node: CanvasViewNode) => void;
-  onContextMenu: (event: MouseEvent<HTMLDivElement>) => void;
+  onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => void;
   onDragStart: (event: PointerEvent<HTMLDivElement>) => void;
   /** 双击图片节点放大查看 */
   onExpandImage: (image: { url: string; title: string }) => void;
@@ -2571,6 +2571,7 @@ function PromptComposer({
   uploading?: boolean;
   /** 当前节点已上传的素材列表(包含缩略图 url) */
   materials?: Array<{ id: string; url: string; name?: string }>;
+  onRemoveMaterial?: (materialId: string) => void;
   /** 视频节点:激活回调(点击设置时) */
   onActivate?: () => void;
   /** 视频节点:更新 duration/resolution */

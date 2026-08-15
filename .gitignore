@@ -13,3 +13,14 @@ frontend/build/
 
 # 忽略本地日志
 *.log
+logs/
+
+# Local dependencies and build outputs
+node_modules/
+frontend/.next/
+frontend/frontend/
+
+# Local handoff/build artifacts
+.admin_keep_path
+_incoming_AIprojectlast/
+release/
