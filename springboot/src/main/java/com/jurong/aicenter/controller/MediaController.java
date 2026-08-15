@@ -140,6 +140,8 @@ public class MediaController {
                                 "inline; filename=\"" + encodedName + "\"; filename*=UTF-8''" + encodedName)
                         .header("Accept-Ranges", "bytes")
                         .header("Content-Range", "bytes " + start + "-" + end + "/" + contentLength)
+                        // V26：分片响应也带缓存头
+                        .header(HttpHeaders.CACHE_CONTROL, "private, max-age=86400, immutable")
                         .contentLength(len)
                         .contentType(MediaType.parseMediaType(asset.getMimeType() != null
                                 ? asset.getMimeType() : "application/octet-stream"))
@@ -152,6 +154,11 @@ public class MediaController {
                     .header(HttpHeaders.CONTENT_DISPOSITION,
                             "inline; filename=\"" + encodedName + "\"; filename*=UTF-8''" + encodedName)
                     .header("Accept-Ranges", "bytes")
+                    // V26：媒体流加缓存头。URL 稳定（/api/assets/{id}/stream），资产 id 不变 → 浏览器可命中磁盘缓存。
+                    // - private：仅浏览器本地缓存，禁 CDN/代理共享（资产归属当前用户，跨用户共享不安全）
+                    // - max-age=86400：1 天内不重新请求
+                    // - immutable：明确告诉浏览器资源不会变（资产更新会换 id，对应新 URL）
+                    .header(HttpHeaders.CACHE_CONTROL, "private, max-age=86400, immutable")
                     .contentType(MediaType.parseMediaType(asset.getMimeType() != null
                             ? asset.getMimeType() : "application/octet-stream"))
                     .contentLength(contentLength)
@@ -181,12 +188,13 @@ public class MediaController {
     }
 
     @PatchMapping("/assets/{id}")
-    public MediaAssetResponse rename(
+    public MediaAssetResponse patch(
             @AuthenticationPrincipal AuthenticatedUser user,
             @PathVariable Long id,
             @Valid @RequestBody PatchAssetRequest request) {
         requireUser(user);
-        return mediaService.renameAsset(user.id(), id, request.getName());
+        // 2026-08-15：PATCH 现在支持同时改 name 和/或 libraryId
+        return mediaService.patchAsset(user.id(), id, request);
     }
 
     @DeleteMapping("/assets/{id}")

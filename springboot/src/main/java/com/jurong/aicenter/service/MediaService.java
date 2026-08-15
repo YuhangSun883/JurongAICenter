@@ -37,6 +37,12 @@ public interface MediaService {
 
     MediaAssetResponse renameAsset(Long userId, Long assetId, String name);
 
+    /**
+     * 2026-08-15：通用 PATCH 接口，同时支持改 name 和/或 libraryId。
+     * 至少要传一个字段，否则抛 INVALID_PARAM。
+     */
+    MediaAssetResponse patchAsset(Long userId, Long assetId, com.jurong.aicenter.dto.media.PatchAssetRequest request);
+
     List<Map<String, String>> listCategories();
 
     List<MediaRoleDto> listRolesByCategory(String category);

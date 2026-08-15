@@ -1,14 +1,13 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Upload, X, ChevronDown, Search,
-  Check, ShieldCheck, Trash2, Loader2, Music,
+  Upload, X, Search,
+  Check, ShieldCheck, Trash2, Loader2, Music, ChevronDown, ChevronRight, CornerDownRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AddMaterialCard } from './AddMaterialCard';
-import { RoleCategorySelect, type RoleCategory } from './RoleCategorySelect';
 import { mediaApi } from '@/api/media';
 import type { MediaAsset, MediaLibrary, MediaRole, MediaRoleCategory } from '@/types/media';
 
@@ -40,17 +39,162 @@ export interface MediaPickerDialogProps {
 }
 
 const TABS = ['图片', '视频', '音频'] as const;
-const SOURCES = ['全部', '我上传的', 'AI生成的'] as const;
-
-interface RoleItem {
-  id: string;
-  name: string;
-  url: string;
-  date: string;
-  size: string;
-}
+const SOURCES = ['全部资产', '我上传的', 'AI生成的'] as const;
 
 const PAGE_SIZE = 24;
+
+/* ============= 库类型徽章：统一普通/虚拟人/真人/AI/我的 视觉 ============= */
+type LibraryTypeBadgeKey = 'normal' | 'virtual_human' | 'real_person' | 'ai' | 'mine';
+
+interface LibraryTypeBadgeStyle {
+  /** 圆点颜色（用于下拉前缀等场景） */
+  dotClass: string;
+  /** 标签文本 */
+  label: string;
+  /** 徽章底色（深底白字） */
+  badgeClass: string;
+  /** 徽章浅底（柔和高亮） */
+  badgeSoftClass: string;
+}
+
+/** 库类型 → 徽章样式（颜色与 AssetsView 卡片保持一致） */
+const LIB_TYPE_STYLE: Record<LibraryTypeBadgeKey, LibraryTypeBadgeStyle> = {
+  normal: {
+    label: '普通',
+    dotClass: 'bg-[#7c8cff]',
+    badgeClass: 'bg-[#5b9aff] text-white',
+    badgeSoftClass: 'bg-[#eaf3ff] text-[#006cff]',
+  },
+  virtual_human: {
+    label: '虚拟人',
+    dotClass: 'bg-[#7c3aed]',
+    badgeClass: 'bg-[#7c3aed] text-white',
+    badgeSoftClass: 'bg-[#ede9fe] text-[#7c3aed]',
+  },
+  real_person: {
+    label: '真人',
+    dotClass: 'bg-[#fbbf24]',
+    badgeClass: 'bg-[#fbbf24] text-[#92400e]',
+    badgeSoftClass: 'bg-[#fef3c7] text-[#92400e]',
+  },
+  ai: {
+    label: 'AI',
+    dotClass: 'bg-[#1673ff]',
+    badgeClass: 'bg-[#1673ff] text-white',
+    badgeSoftClass: 'bg-[#eaf3ff] text-[#1673ff]',
+  },
+  mine: {
+    label: '我的',
+    dotClass: 'bg-[#1673ff]',
+    badgeClass: 'bg-[#1673ff] text-white',
+    badgeSoftClass: 'bg-[#eaf3ff] text-[#1673ff]',
+  },
+};
+
+/** 把库对象归一为类型键 */
+export function getLibraryTypeKey(lib: MediaLibrary | null | undefined): LibraryTypeBadgeKey {
+  if (!lib) return 'mine';
+  if (lib.type === 'system-ai') return 'ai';
+  if (lib.type === 'system-uploaded') return 'mine';
+  const biz = (lib.bizType ?? 'normal') as string;
+  if (biz === 'virtual_human') return 'virtual_human';
+  if (biz === 'real_person') return 'real_person';
+  return 'normal';
+}
+
+/** 紧凑的圆点 + 文字徽章，可在 select 选项里做前缀或独立显示 */
+export function LibraryTypeBadge({
+  typeKey,
+  variant = 'soft',
+  showDot = true,
+  className,
+}: {
+  typeKey: LibraryTypeBadgeKey;
+  variant?: 'soft' | 'solid' | 'dot';
+  showDot?: boolean;
+  className?: string;
+}) {
+  const s = LIB_TYPE_STYLE[typeKey];
+  if (variant === 'dot') {
+    return <span className={cn('inline-block h-2 w-2 rounded-full', s.dotClass, className)} aria-hidden />;
+  }
+  const colorClass = variant === 'solid' ? s.badgeClass : s.badgeSoftClass;
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-semibold tracking-wide',
+        colorClass,
+        className
+      )}
+    >
+      {showDot && <span className={cn('h-1.5 w-1.5 rounded-full', s.dotClass)} aria-hidden />}
+      {s.label}
+    </span>
+  );
+}
+
+/* ============= 角色库：写死数据 ============= */
+/**
+ * 2026-08-15：根据用户确认，角色库不归我们管，只展示写死的示例数据。
+ * 这里固定放几张占位图 + 角色名，不调任何后端接口。
+ */
+const HARDCODED_ROLES: MediaRole[] = [
+  { id: 'r-1', name: '示例角色 1', category: 'face', imageUrl: 'https://placehold.co/300x400/1673ff/ffffff?text=R1', description: '写死数据 · 占位' },
+  { id: 'r-2', name: '示例角色 2', category: 'face', imageUrl: 'https://placehold.co/300x400/7c3aed/ffffff?text=R2', description: '写死数据 · 占位' },
+  { id: 'r-3', name: '示例角色 3', category: 'face', imageUrl: 'https://placehold.co/300x400/10b981/ffffff?text=R3', description: '写死数据 · 占位' },
+  { id: 'r-4', name: '示例角色 4', category: 'body', imageUrl: 'https://placehold.co/300x400/f59e0b/ffffff?text=R4', description: '写死数据 · 占位' },
+  { id: 'r-5', name: '示例角色 5', category: 'body', imageUrl: 'https://placehold.co/300x400/dc2626/ffffff?text=R5', description: '写死数据 · 占位' },
+  { id: 'r-6', name: '示例角色 6', category: 'body', imageUrl: 'https://placehold.co/300x400/0ea5e9/ffffff?text=R6', description: '写死数据 · 占位' },
+];
+
+const HARDCODED_ROLE_CATEGORIES: MediaRoleCategory[] = [
+  { key: 'all', label: '全部' },
+  { key: 'face', label: '人脸' },
+  { key: 'body', label: '全身' },
+];
+
+/* ============= 2026-08-15 V19：把扁平的库列表扁平化为带 depth 的树序 ============= */
+/**
+ * 用途：在自定义树形下拉里展示父库 → 子库 → 孙库 …
+ * - 系统库 + 自定义根库：depth=0
+ * - 子库：depth = 父库 depth + 1
+ * - 同一父库下的兄弟按 sortOrder ASC, id ASC 排
+ * - 父库被删的孤儿节点会按根库对待（深度 0）
+ */
+/**
+ * 把库按树序展平。V26：默认全部折叠——只返回根库；只有 expanded 集合中的父库会展开其直接子库（递归）。
+ * 返回的项带 hasChildren 标记，便于 UI 决定是否渲染展开按钮。
+ */
+function flattenLibraryTree(
+  list: MediaLibrary[],
+  expanded: Set<number>,
+): (MediaLibrary & { depth: number; hasChildren: boolean })[] {
+  // 排序：sortOrder ASC, id ASC
+  const sorted = [...list].sort(
+    (a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0) || a.id - b.id
+  );
+  // 构造 children 列表
+  const childrenOf = new Map<number | null, MediaLibrary[]>();
+  sorted.forEach((l) => {
+    const pid = l.parentId ?? null;
+    if (!childrenOf.has(pid)) childrenOf.set(pid, []);
+    childrenOf.get(pid)!.push(l);
+  });
+  // DFS 展平（按 expanded 决定是否递归）
+  const flat: (MediaLibrary & { depth: number; hasChildren: boolean })[] = [];
+  const walk = (pid: number | null, depth: number) => {
+    const kids = childrenOf.get(pid) ?? [];
+    kids.forEach((k) => {
+      const hasChildren = (childrenOf.get(k.id)?.length ?? 0) > 0;
+      flat.push({ ...k, depth, hasChildren });
+      if (hasChildren && expanded.has(k.id)) {
+        walk(k.id, depth + 1);
+      }
+    });
+  };
+  walk(null, 0);
+  return flat;
+}
 
 export function MediaPickerDialog({
   open, onClose, onConfirm, max = 12, uploadedFiles: propUploadedFiles, onUploadFiles, onRemoveUploaded,
@@ -58,21 +202,24 @@ export function MediaPickerDialog({
   accept = 'image/*,video/*,audio/*',
 }: MediaPickerDialogProps) {
   const [tab, setTab] = useState<typeof TABS[number]>(initialTab);
-  const [source, setSource] = useState<typeof SOURCES[number]>('全部');
+  const [source, setSource] = useState<typeof SOURCES[number]>('全部资产');
   const [keyword, setKeyword] = useState('');
   const [activeTopTab, setActiveTopTab] = useState<'assets' | 'roles'>('assets');
   const [pickedIds, setPickedIds] = useState<Set<string>>(new Set());
   const [mounted, setMounted] = useState(false);
-  const [roleCategory, setRoleCategory] = useState<string>('face');
+  const [roleCategory, setRoleCategory] = useState<string>('all');
   /** 待删除的素材 id（弹确认弹窗用） */
   const [pendingRemoveId, setPendingRemoveId] = useState<string | null>(null);
 
   /** ============ 真实 API 数据 ============ */
   const [libraries, setLibraries] = useState<MediaLibrary[]>([]);
   const [assets, setAssets] = useState<MediaAsset[]>([]);
-  const [roles, setRoles] = useState<MediaRole[]>([]);
-  const [roleCategories, setRoleCategories] = useState<MediaRoleCategory[]>([]);
-  const [currentLibId, setCurrentLibId] = useState<number | null>(null);  // null = 全部资产
+  // 角色库：写死数据（不调后端）
+  const [roles] = useState<MediaRole[]>(HARDCODED_ROLES);
+  const [roleCategories] = useState<MediaRoleCategory[]>(HARDCODED_ROLE_CATEGORIES);
+  // V23：currentLibId 始终绑定到具体库 id（不保留 null 的"虚拟汇总"状态）。
+  // 默认值在 libs 加载完后会自动对齐到 system-uploaded「我的资产」库。
+  const [currentLibId, setCurrentLibId] = useState<number | null>(null);
   const [assetsLoading, setAssetsLoading] = useState(false);
   const [assetsPage, setAssetsPage] = useState(1);
   const [assetsTotal, setAssetsTotal] = useState(0);
@@ -96,7 +243,7 @@ export function MediaPickerDialog({
     };
   }, [open, onClose]);
 
-  // 打开弹窗：拉库列表 + 角色分类 + 第一页素材
+  // 打开弹窗：拉库列表 + 第一页素材（角色库为写死数据，不调接口）
   useEffect(() => {
     if (!open) return;
     setTab(initialTab);
@@ -105,20 +252,20 @@ export function MediaPickerDialog({
     setDataError(null);
     (async () => {
       try {
-        const [libs, cats, firstRoles] = await Promise.all([
-          mediaApi.listLibraries(),
-          mediaApi.listRoleCategories(),
-          mediaApi.listRoles(),  // 全量,后面按 category 筛
-        ]);
+        const libs = await mediaApi.listLibraries();
         setLibraries(libs);
-        setRoleCategories(cats);
-        setRoles(firstRoles);
+        // V23：默认选「我的资产」系统库（跨库汇总，代替之前的"全部资产"虚拟入口）。
+        // 已有 currentLibId（来自用户已点选）则保持不动。
+        if (currentLibId == null) {
+          const sysUploaded = libs.find((l) => l.type === 'system-uploaded');
+          if (sysUploaded) setCurrentLibId(sysUploaded.id);
+        }
       } catch (err) {
         console.warn('[media-picker] init load failed:', err);
         setDataError('加载数据失败,请稍后重试');
       }
     })();
-  }, [open, initialTab]);
+  }, [open, initialTab, currentLibId]);
 
   /** 标签 → 类型映射（提到 useEffect 之前，避免引用未定义） */
   const tabToType: Record<typeof TABS[number], string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
@@ -129,6 +276,14 @@ export function MediaPickerDialog({
     return undefined;
   }
 
+  // V23：把 currentLibId 转译为后端查询参数。
+  // system-uploaded「我的资产」是跨库汇总语义，需要传 undefined 触发后端汇总逻辑。
+  // 其余库传具体 id。
+  const sel = currentLibId == null
+    ? null
+    : libraries.find((l) => l.id === currentLibId) ?? null;
+  const queryLibId = sel?.type === 'system-uploaded' ? undefined : currentLibId ?? undefined;
+
   // 拉素材（库 + 类型 + 来源 + 关键词 + 页码变化时）
   useEffect(() => {
     if (!open) return;
@@ -137,7 +292,7 @@ export function MediaPickerDialog({
     (async () => {
       try {
         const res = await mediaApi.listAssets({
-          libraryId: currentLibId,
+          libraryId: queryLibId,
           type: tabToType[tab],
           source: sourceToApiSource(source),
           keyword,
@@ -155,16 +310,17 @@ export function MediaPickerDialog({
         setAssetsLoading(false);
       }
     })();
-  }, [open, activeTopTab, currentLibId, tab, source, keyword, assetsPage]);
+  }, [open, activeTopTab, currentLibId, tab, source, keyword, assetsPage, libraries]);
 
-  // 过滤后的角色（按 category 筛）
+  // 过滤后的角色（写死数据，按 category 筛；'all' 表示全部）
   const filteredRoles = activeTopTab === 'roles'
-    ? (roleCategory ? roles.filter((r) => r.category === roleCategory) : roles)
+    ? (!roleCategory || roleCategory === 'all'
+        ? roles
+        : roles.filter((r) => r.category === roleCategory))
     : [];
 
   // ============ 派生 ============
-  const showUploadedHere = activeTopTab === 'assets' && (source === '全部' || source === '我上传的');
-  const assetUrls = new Set(assets.map((asset) => asset.url).filter(Boolean));
+  const showUploadedHere = activeTopTab === 'assets' && (source === '全部资产' || source === '我上传的');
   const visiblePickedCount =
     (showUploadedHere
       ? uploadedFiles.filter((u) => u.type === tabToType[tab] && pickedIds.has(u.id)).length
@@ -217,7 +373,7 @@ export function MediaPickerDialog({
       // 上传完后刷新素材库
       if (activeTopTab === 'assets') {
         const res = await mediaApi.listAssets({
-          libraryId: currentLibId,
+          libraryId: queryLibId,
           type: tabToType[tab],
           source: sourceToApiSource(source),
           keyword,
@@ -414,26 +570,121 @@ function AssetsView({
   accept: string;
 }) {
   const tabToType: Record<typeof tab, string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
-  const showUploaded = source === '全部' || source === '我上传的';
+  const showUploaded = source === '全部资产' || source === '我上传的';
   const PAGE_SIZE = 24;
+
+  // 2026-08-15 V19：自定义下拉 popover
+  const [libMenuOpen, setLibMenuOpen] = useState(false);
+  const libMenuRef = useRef<HTMLDivElement | null>(null);
+  // V26：库下拉的展开/折叠状态。默认全部折叠，子库隐藏。
+  const [expandedLibIds, setExpandedLibIds] = useState<Set<number>>(new Set());
+  function toggleExpand(libId: number) {
+    setExpandedLibIds((s) => {
+      const next = new Set(s);
+      if (next.has(libId)) next.delete(libId);
+      else next.add(libId);
+      return next;
+    });
+  }
+  // 注：弹窗未打开时整组件 return null（见 MediaPickerDialog 顶部），
+  // 每次打开都是全新挂载，expandedLibIds 自动回到默认空集，无需额外重置。
+
+  // 2026-08-15 V19：库扁平化为带 depth 的树序
+  const flatLibs = useMemo(
+    () => flattenLibraryTree(libraries, expandedLibIds),
+    [libraries, expandedLibIds]
+  );
+
+  // 当前选中的库
+  const selectedLib = currentLibId == null ? null : libraries.find((l) => l.id === currentLibId) ?? null;
+
+  // 点外面关闭
+  useEffect(() => {
+    if (!libMenuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (libMenuRef.current && !libMenuRef.current.contains(e.target as Node)) {
+        setLibMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [libMenuOpen]);
 
   return (
     <>
       {/* 工具条 */}
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        {/* 库下拉 */}
-        <select
-          value={currentLibId == null ? '' : String(currentLibId)}
-          onChange={(e) => onChangeLibrary(e.target.value === '' ? null : Number(e.target.value))}
-          className="h-9 rounded-lg border border-bg-line bg-bg-card px-3 text-sm text-fg outline-none focus:border-brand/60"
-        >
-          <option value="">全部资产</option>
-          {libraries.map((l) => (
-            <option key={l.id} value={String(l.id)}>
-              {l.name} ({l.assetCount})
-            </option>
-          ))}
-        </select>
+        {/* 2026-08-15 V19：库下拉改树形（自定义 popover + 缩进） */}
+        <div ref={libMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setLibMenuOpen((o) => !o)}
+            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-bg-line bg-bg-card px-3 text-sm text-fg outline-none transition hover:border-brand/40"
+          >
+            {/* V23：currentLibId 默认就是 system-uploaded「我的资产」id，selectedLib 始终能查到 */}
+            <LibraryTypeBadge typeKey={getLibraryTypeKey(selectedLib)} />
+            <span className="max-w-[180px] truncate">
+              {selectedLib?.name ?? '我的资产'}
+            </span>
+            {selectedLib && (
+              <span className="text-[11px] text-fg-subtle">({selectedLib.assetCount ?? 0})</span>
+            )}
+            <ChevronDown className={cn('h-3.5 w-3.5 text-fg-muted transition', libMenuOpen && 'rotate-180')} />
+          </button>
+          {libMenuOpen && (
+            <div className="card absolute left-0 top-full z-50 mt-1.5 max-h-[360px] min-w-[260px] overflow-auto bg-white p-1 shadow-2xl">
+              {/* V23：去掉"全部资产"虚拟入口。system-uploaded「我的资产」就是跨库汇总，二选一即可。 */}
+              {flatLibs.length === 0 ? (
+                <div className="px-2.5 py-3 text-center text-xs text-fg-subtle">暂无资产库</div>
+              ) : (
+                flatLibs.map((l) => {
+                  const active = currentLibId === l.id;
+                  const isChild = (l.depth ?? 0) > 0;
+                  const isExpanded = expandedLibIds.has(l.id);
+                  return (
+                    <div
+                      key={l.id}
+                      className={cn(
+                        'flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2.5 text-left text-sm transition',
+                        active ? 'bg-brand-50 text-brand' : 'text-fg hover:bg-bg-soft'
+                      )}
+                      style={{ paddingLeft: `${8 + (l.depth ?? 0) * 16}px` }}
+                    >
+                      {/* V26：父库前的展开/折叠按钮（不冒泡到下面选库按钮） */}
+                      {l.hasChildren ? (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); toggleExpand(l.id); }}
+                          className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-fg-muted transition hover:bg-bg-soft hover:text-fg"
+                          title={isExpanded ? '折叠子库' : '展开子库'}
+                        >
+                          {isExpanded
+                            ? <ChevronDown className="h-3.5 w-3.5" />
+                            : <ChevronRight className="h-3.5 w-3.5" />}
+                        </button>
+                      ) : isChild ? (
+                        <CornerDownRight className="h-3 w-3 shrink-0 text-fg-subtle" />
+                      ) : (
+                        <span className="inline-block h-3.5 w-3.5 shrink-0" />
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => { onChangeLibrary(l.id); setLibMenuOpen(false); }}
+                        className="flex flex-1 items-center gap-2 text-left"
+                        title={l.name}
+                      >
+                        <LibraryTypeBadge typeKey={getLibraryTypeKey(l)} />
+                        <span className="flex-1 truncate">{l.name}</span>
+                        <span className="text-[10px] text-fg-subtle">{l.assetCount ?? 0}</span>
+                        {active && <Check className="h-3.5 w-3.5" />}
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
         <div className="relative min-w-[220px] flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-fg-subtle" />
           <input
@@ -461,20 +712,23 @@ function AssetsView({
             </button>
           ))}
         </div>
-        <div className="flex items-center gap-1">
-          {SOURCES.map((s) => (
-            <button
-              key={s}
-              onClick={() => { setSource(s); onChangePage(1); }}
-              className={cn(
-                'rounded-full px-3 py-1 text-xs transition',
-                source === s ? 'bg-fg text-white' : 'text-fg-muted hover:bg-bg-soft hover:text-fg'
-              )}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
+        {/* V24：AI 库下只有 AI 生成的素材，"全部/我上传的/AI生成的" 分类无意义，隐藏整条筛选 */}
+        {selectedLib?.type !== 'system-ai' && (
+          <div className="flex items-center gap-1">
+            {SOURCES.map((s) => (
+              <button
+                key={s}
+                onClick={() => { setSource(s); onChangePage(1); }}
+                className={cn(
+                  'rounded-full px-3 py-1 text-xs transition',
+                  source === s ? 'bg-fg text-white' : 'text-fg-muted hover:bg-bg-soft hover:text-fg'
+                )}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* 网格 */}

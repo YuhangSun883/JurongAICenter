@@ -16,8 +16,9 @@
 
     <!-- 2026-08-13:用户要求后端日志写到独立文件,方便排查(不写到 API 文档 md,避免覆盖) -->
     <!--  使用简单 FileAppender + append=true,不滚动,文件可能很大但能跑就行 -->
+    <!--  2026-08-15:log.path 系统属性可覆盖,默认写到 ./logs/backend-run.log -->
     <appender name="MD_FILE" class="ch.qos.logback.core.FileAppender">
-        <file>D:/ymWork/JurongAICenter/backend-run.log</file>
+        <file>${log.path:-./logs}/backend-run.log</file>
         <append>true</append>
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %5p [%15.15t] %-40.40logger{39} : %m%n%wEx</pattern>
