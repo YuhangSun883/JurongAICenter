@@ -58,6 +58,7 @@
 ### 2.5 后端返回数据
 
 - 登录返回体 `AuthResponse` 增加 `createdAt`。
+- 登录返回体 `AuthResponse` 增加 `displayName`，前台个人信息里的“昵称”优先展示客户注册时填写的昵称。
 - 前台客户登录时，`createdAt` 来自 `users.createdAt`。
 - 后台管理员登录时，`createdAt` 来自 `console_admins.createdAt`。
 - 前端用户类型 `UserInfo` 增加 `createdAt` 字段，用于展示注册/创建时间。

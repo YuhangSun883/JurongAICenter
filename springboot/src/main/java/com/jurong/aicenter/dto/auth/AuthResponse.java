@@ -10,6 +10,7 @@ public class AuthResponse {
     private String refreshToken;
     private Long userId;
     private String email;
+    private String displayName;
     private String role;
     private String createdAt;
 }

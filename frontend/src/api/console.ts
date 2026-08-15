@@ -148,6 +148,7 @@ export const consoleApi = {
       refreshToken: string;
       userId: number;
       email: string;
+      displayName?: string;
       role: string;
       createdAt?: string;
     }>('/api/console/auth/login', {
@@ -161,7 +162,7 @@ export const consoleApi = {
       expiresIn: 2 * 60 * 60,
       user: {
         id: String(resp.userId),
-        nickname: resp.email.split('@')[0],
+        nickname: resp.displayName?.trim() || resp.email.split('@')[0],
         email: resp.email,
         createdAt: resp.createdAt,
         role: resp.role,

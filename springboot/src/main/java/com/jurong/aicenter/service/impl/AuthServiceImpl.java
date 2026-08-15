@@ -114,7 +114,7 @@ public class AuthServiceImpl implements AuthService {
                     throw new BusinessException(ErrorCode.USER_DISABLED, "console admin disabled");
                 }
                 String newAccessToken = jwtTokenProvider.generateConsoleAccessToken(admin.getId(), admin.getEmail(), admin.getRole());
-                return new AuthResponse(newAccessToken, request.getRefreshToken(), admin.getId(), admin.getEmail(), admin.getRole(), toIsoString(admin.getCreatedAt()));
+                return new AuthResponse(newAccessToken, request.getRefreshToken(), admin.getId(), admin.getEmail(), admin.getDisplayName(), admin.getRole(), toIsoString(admin.getCreatedAt()));
             }
 
             User user = userRepository.selectById(subjectId);
@@ -125,7 +125,7 @@ public class AuthServiceImpl implements AuthService {
                 throw new BusinessException(ErrorCode.USER_DISABLED, "account disabled");
             }
             String newAccessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail(), user.getRole());
-            return new AuthResponse(newAccessToken, request.getRefreshToken(), user.getId(), user.getEmail(), user.getRole(), toIsoString(user.getCreatedAt()));
+            return new AuthResponse(newAccessToken, request.getRefreshToken(), user.getId(), user.getEmail(), user.getDisplayName(), user.getRole(), toIsoString(user.getCreatedAt()));
         } catch (JwtException e) {
             throw new BusinessException(ErrorCode.INVALID_TOKEN, "token invalid or expired");
         }
@@ -164,7 +164,7 @@ public class AuthServiceImpl implements AuthService {
     private AuthResponse buildAppAuthResponse(User user) {
         String accessToken = jwtTokenProvider.generateAccessToken(user.getId(), user.getEmail(), user.getRole());
         String refreshToken = jwtTokenProvider.generateRefreshToken(user.getId(), user.getEmail(), user.getRole());
-        return new AuthResponse(accessToken, refreshToken, user.getId(), user.getEmail(), user.getRole(), toIsoString(user.getCreatedAt()));
+        return new AuthResponse(accessToken, refreshToken, user.getId(), user.getEmail(), user.getDisplayName(), user.getRole(), toIsoString(user.getCreatedAt()));
     }
 
     private String toIsoString(LocalDateTime value) {

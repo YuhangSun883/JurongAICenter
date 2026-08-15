@@ -1,5 +1,5 @@
 // 用户认证 - 真实后端
-// 后端 AuthResponse: {accessToken, refreshToken, userId, email, role}
+// 后端 AuthResponse: {accessToken, refreshToken, userId, email, displayName, role}
 // 这里保存双 token 到 auth-store，自动触发滑动窗口
 import { request } from '@/lib/http';
 import {
@@ -16,6 +16,7 @@ interface BackendAuthResponse {
   refreshToken?: string;
   userId: number;
   email: string;
+  displayName?: string;
   role: string;
   createdAt?: string;
 }
@@ -32,7 +33,7 @@ function adapt(resp: BackendAuthResponse): LoginResponse {
     expiresIn: ACCESS_TOKEN_TTL_SEC,
     user: {
       id: String(resp.userId),
-      nickname: resp.email.split('@')[0],
+      nickname: resp.displayName?.trim() || resp.email.split('@')[0],
       email: resp.email,
       createdAt: resp.createdAt,
       role: resp.role,
