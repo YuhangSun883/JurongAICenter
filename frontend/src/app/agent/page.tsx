@@ -13,12 +13,14 @@ import { Coins, Menu, Settings } from 'lucide-react';
 
 /** toolCall.action 到目标路由的映射 */
 const TOOL_ROUTES: Record<string, { route: string; label: string }> = {
-  'jump-to-image':           { route: '/ai-image',          label: '图片生成' },
-  'jump-to-image-edit':       { route: '/ai-image',          label: '图生图（编辑）' },
-  'jump-to-video':            { route: '/ai-video',          label: '视频生成' },
-  'jump-to-image-to-video':   { route: '/ai-video',          label: '图生视频' },
-  'jump-to-product-image':    { route: '/tools/product-image', label: '商品套图' },
-  'jump-to-image-enhancer':   { route: '/tools/image-enhancer', label: '图像增强' },
+  'jump-to-image':              { route: '/ai-image',                label: '图片生成' },
+  'jump-to-image-edit':         { route: '/ai-image',                label: '图生图（编辑）' },
+  'jump-to-video':              { route: '/ai-video',                label: '视频生成' },
+  'jump-to-image-to-video':     { route: '/ai-video',                label: '图生视频' },
+  'jump-to-product-image':      { route: '/tools/product-image',     label: '生成电商套图' },
+  'jump-to-watermark-remover':  { route: '/tools/watermark-remover', label: '水印擦除' },
+  'jump-to-subtitle-remover':   { route: '/tools/subtitle-remover',  label: '字幕擦除' },
+  'jump-to-image-enhancer':     { route: '/tools/image-enhancer',    label: '画质增强' },
 };
 
 /** 把后端的 AgentSession 适配成 ChatHistory 需要的 ChatSession */
@@ -426,17 +428,34 @@ export default function AgentPage() {
                         : 'mr-auto max-w-[80%] rounded-2xl bg-bg-soft px-4 py-2.5 text-sm text-fg'
                     }
                   >
-                    {/* 用户消息：先显示附件图片，再显示文字 */}
+                    {/* 用户消息：先显示附件,再显示文字 */}
                     {m.role === 'user' && m.attachments && m.attachments.length > 0 && (
                       <div className="mb-2 flex flex-wrap gap-2">
                         {m.attachments.map((att, idx) => (
-                          <img
-                            key={idx}
-                            src={att.url || ''}
-                            alt={att.name || 'attachment'}
-                            className="max-h-40 max-w-[200px] rounded-lg object-cover"
-                            loading="lazy"
-                          />
+                          // 2026-08-15:视频附件用 <video> 标签,避免 <img> 解析 mp4 失败
+                          att.type === 'video' ? (
+                            <video
+                              key={idx}
+                              src={att.url || ''}
+                              className="max-h-40 max-w-[200px] rounded-lg object-cover bg-black"
+                              muted
+                              playsInline
+                              preload="metadata"
+                              onLoadedData={(e) => {
+                                // 加载完元数据后跳到第 0.1s 截一帧作为气泡内封面,避免黑屏
+                                const v = e.currentTarget;
+                                v.currentTime = 0.1;
+                              }}
+                            />
+                          ) : (
+                            <img
+                              key={idx}
+                              src={att.url || ''}
+                              alt={att.name || 'attachment'}
+                              className="max-h-40 max-w-[200px] rounded-lg object-cover"
+                              loading="lazy"
+                            />
+                          )
                         ))}
                       </div>
                     )}

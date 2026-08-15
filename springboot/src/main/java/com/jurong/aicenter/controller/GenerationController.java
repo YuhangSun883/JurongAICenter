@@ -80,7 +80,6 @@ public class GenerationController {
             }
         }
         // 2026-08-14 通过 MediaAsset.sourceTaskId 反查对应的 mediaAssetId(视频完成后已入库时有值)
-        Long mediaAssetId = null;
         try {
             MediaAsset asset = mediaAssetRepository.selectOne(
                 new LambdaQueryWrapper<MediaAsset>()

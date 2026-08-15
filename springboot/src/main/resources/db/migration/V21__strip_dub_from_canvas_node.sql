@@ -13,12 +13,12 @@
 -- 期望影响行数:少量(只有 2026-08-10 之前跑过抽帧/脚本拆解的画布会命中)。
 -- ============================================================================
 
-UPDATE canvas_node
+UPDATE canvas_nodes
 SET content = REGEXP_REPLACE(content, ' 口播:"[^"]*"', '')
 WHERE content REGEXP ' 口播:"';
 
 -- 验证一下:理想结果返回 0 行(应该已经没有"口播:"残留了)
 -- 如果 > 0,说明有边界情况没匹配上,需要人工排查
 SELECT COUNT(*) AS remaining_dub_rows
-FROM canvas_node
+FROM canvas_nodes
 WHERE content REGEXP ' 口播:"';

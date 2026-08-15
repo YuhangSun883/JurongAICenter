@@ -116,11 +116,28 @@ export function ChatComposer({
             {picked.map((m) => (
               <div
                 key={m.id}
-                className="group relative h-14 w-14 overflow-hidden rounded-lg border border-bg-line"
+                className="group relative h-14 w-14 overflow-hidden rounded-lg border border-bg-line bg-[#f1f5f9]"
                 title={m.name}
               >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={m.url} alt={m.name} className="h-full w-full object-cover" />
+                {/* V26+：视频类型用 <video> 标签取首帧,图片用 <img>。
+                   之前不管类型都用 <img>,视频文件被当成图片加载 → 一直破图。 */}
+                {m.type === 'video' ? (
+                  <video
+                    src={m.url}
+                    className="h-full w-full object-cover"
+                    muted
+                    playsInline
+                    preload="metadata"
+                    onLoadedData={(e) => {
+                      // 加载完元数据后跳到第 0.1s 截一帧作为缩略图,避免黑屏
+                      const v = e.currentTarget;
+                      v.currentTime = 0.1;
+                    }}
+                  />
+                ) : (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={m.url} alt={m.name} className="h-full w-full object-cover" />
+                )}
                 {/* V26：删除按钮 —— 悬停时显示，点击从已选列表移除 */}
                 <button
                   type="button"
