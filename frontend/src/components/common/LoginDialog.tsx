@@ -50,14 +50,13 @@ export function LoginDialog({ onClose, initialMode = 'login' }: LoginDialogProps
 
     setSubmitting(true);
     try {
-      let result;
       if (mode === 'login') {
-        result = await authApi.login({
+        await authApi.login({
           email: trimmedEmail,
           password,
         });
       } else {
-        result = await authApi.register({
+        await authApi.register({
           email: trimmedEmail,
           password,
           displayName: displayName.trim() || undefined,
@@ -69,8 +68,20 @@ export function LoginDialog({ onClose, initialMode = 'login' }: LoginDialogProps
       onClose?.();
     } catch (cause) {
       if (cause instanceof ApiError) {
-        const payload = cause.payload as { message?: string } | undefined;
-        setError(payload?.message || (mode === 'login' ? '登录失败，请检查邮箱或密码' : '注册失败'));
+        const payload = cause.payload as { message?: string; code?: number } | undefined;
+        // 6010 ADMIN_LOGIN_FORBIDDEN_ON_USER_ENTRY：管理员账号走错入口了，
+        // 给一个更醒目的提示（带建议去哪里登录）
+        if (payload?.code === 6010) {
+          setError(
+            payload.message ||
+              '管理员账号不允许在此登录，请使用管理后台专属入口',
+          );
+        } else {
+          setError(
+            payload?.message ||
+              (mode === 'login' ? '登录失败，请检查邮箱或密码' : '注册失败'),
+          );
+        }
       } else {
         setError('网络异常，请稍后重试');
       }

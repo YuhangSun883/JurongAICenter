@@ -40,6 +40,10 @@ public enum ErrorCode {
     ADMIN_OPERATION_DENIED(6001, "admin operation denied"),
     ADMIN_CANNOT_CHANGE_OWN_ROLE(6002, "cannot change own role"),
     ADMIN_CANNOT_DISABLE_SELF(6003, "cannot disable self"),
+    // 2026-08-14 added: 管理员账号禁止从普通 /login 页登录
+    // 普通登录页不允许 ADMIN 角色登录，管理员必须走 /admin/login 专属入口（未来）
+    // 注：原 6003 已占用，用新 code 6010
+    ADMIN_LOGIN_FORBIDDEN_ON_USER_ENTRY(6010, "admin login forbidden on user login page"),
     GROUP_NAME_DUPLICATE(6004, "group name duplicate"),
     GROUP_IS_DEFAULT_CANNOT_DELETE(6005, "default group cannot be deleted"),
     GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "default group cannot be unset"),
