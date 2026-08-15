@@ -31,6 +31,7 @@ import { nanoid } from 'nanoid';
 import { useWorkbenchStore } from '@/store/workbench';
 import { useTaskPolling } from '@/hooks/useTaskPolling';
 import { videoApi } from '@/api/video';
+import { agentApi } from '@/api/agent';
 import { mediaApi } from '@/api/media';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
@@ -54,6 +55,32 @@ const ASPECTS: AspectRatio[] = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16'];
 const RESOLUTIONS: Resolution[] = ['480p', '720p', '1080p'];
 const DURATIONS: Duration[] = [5, 10, 15];
 const AI_VIDEO_MAX_REFS = 15;
+
+const HELP_SCENES = [
+  { key: 'product-selling', label: '商品卖点种草', prompt: '突出商品核心卖点、使用场景和购买理由，适合信息流投放。' },
+  { key: 'model-try-on', label: '模特上身展示', prompt: '围绕模特展示、动作节奏、细节特写生成短视频脚本。' },
+  { key: 'new-arrival', label: '新品发布', prompt: '强调新品亮点、质感、适用人群和快速记忆点。' },
+  { key: 'promotion', label: '促销转化', prompt: '强化限时优惠、痛点解决和行动引导，适合直播间或广告转化。' },
+  { key: 'brand-story', label: '品牌质感片', prompt: '用更高级的镜头语言和氛围描述，提升品牌信任感。' },
+] as const;
+
+function inferNameFromFilename(filename: string) {
+  return filename
+    .replace(/\.[^.]+$/, '')
+    .replace(/[_-]+/g, ' ')
+    .trim();
+}
+
+function inferProductType(filename: string) {
+  const lower = filename.toLowerCase();
+  if (/dress|skirt|shirt|coat|pants|服|裙|衬衫|外套|裤/.test(lower)) return '服饰';
+  if (/shoe|sneaker|boot|鞋/.test(lower)) return '鞋靴';
+  if (/bag|handbag|包/.test(lower)) return '箱包';
+  if (/cosmetic|lipstick|cream|makeup|美妆|口红|面霜/.test(lower)) return '美妆';
+  if (/food|snack|drink|茶|咖啡|零食|饮/.test(lower)) return '食品饮品';
+  if (/model|person|avatar|模特|人物|人像/.test(lower)) return '模特人物';
+  return '商品';
+}
 
 const SLOT_META = [
   { kind: 'product', label: '添加商品', optional: false, icon: Package },
@@ -147,6 +174,17 @@ export function Workbench() {
   const [previewTab, setPreviewTab] = useState<'preview' | 'favorites'>('preview');
   const [favorites, setFavorites] = useState<FavoriteVideo[]>([]);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [helpCostOpen, setHelpCostOpen] = useState(false);
+  const [helpWizardOpen, setHelpWizardOpen] = useState(false);
+  const [skipHelpCost, setSkipHelpCost] = useState(false);
+  const [helpAsset, setHelpAsset] = useState<ReferenceMedia | null>(null);
+  const [helpAssetKind, setHelpAssetKind] = useState<'product' | 'model'>('product');
+  const [helpProductType, setHelpProductType] = useState('');
+  const [helpProductName, setHelpProductName] = useState('');
+  const [helpScene, setHelpScene] = useState('product-selling');
+  const [helpExtra, setHelpExtra] = useState('');
+  const [helpGeneratedScript, setHelpGeneratedScript] = useState('');
+  const [helpAvailableCredits, setHelpAvailableCredits] = useState<number | null>(null);
   const savePopoverRef = useRef<HTMLDivElement>(null);
   const { materials, addMaterials, removeMaterial } = useMaterials();
   const {
@@ -444,18 +482,73 @@ export function Workbench() {
     });
   }
 
-  async function writeForMe() {
+  function writeForMe() {
+    if (isWriting) return;
+    if (skipHelpCost) {
+      openHelpWizard();
+      return;
+    }
+    agentApi.getCredits()
+      .then((info) => setHelpAvailableCredits(info.remaining ?? info.total ?? 0))
+      .catch(() => setHelpAvailableCredits(null));
+    setHelpCostOpen(true);
+  }
+
+  function openHelpWizard() {
+    const firstImage = selectedReferences.find((reference) => reference.type === 'image') ?? null;
+    setHelpAsset(firstImage);
+    if (firstImage && !helpProductName) {
+      setHelpProductName(inferNameFromFilename(firstImage.name));
+    }
+    if (firstImage && !helpProductType) {
+      setHelpProductType(inferProductType(firstImage.name));
+    }
+    setHelpCostOpen(false);
+    setHelpWizardOpen(true);
+  }
+
+  function handleHelpFile(file: File | null) {
+    if (!file) return;
+    const asset: ReferenceMedia = {
+      id: `help_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      url: URL.createObjectURL(file),
+      type: 'image',
+      name: file.name,
+      token: '',
+    };
+    setHelpAsset(asset);
+    setHelpProductName(inferNameFromFilename(file.name));
+    setHelpProductType(inferProductType(file.name));
+    setSelectedReferences((current) => {
+      if (current.some((item) => item.id === asset.id)) return current;
+      return [asset, ...current].slice(0, AI_VIDEO_MAX_REFS);
+    });
+    addMaterials([{ id: asset.id, url: asset.url, type: asset.type, name: asset.name }]);
+  }
+
+  async function generateHelpScript() {
     if (isWriting) return;
     setIsWriting(true);
     try {
+      const scene = HELP_SCENES.find((item) => item.key === helpScene) ?? HELP_SCENES[0];
+      const brief = [
+        script.trim(),
+        `素材类型：${helpAssetKind === 'product' ? '产品图' : '模特图'}`,
+        `系统识别产品类型：${helpProductType || '待识别商品'}`,
+        `系统识别产品名称：${helpProductName || inferNameFromFilename(helpAsset?.name || '') || '未命名商品'}`,
+        `业务场景：${scene.label}`,
+        `脚本要求：${scene.prompt}`,
+        helpExtra.trim() ? `补充要求：${helpExtra.trim()}` : '',
+      ].filter(Boolean).join('\n');
       const result = await videoApi.generateScript({
-        brief: script.trim() || undefined,
+        brief,
         model,
         aspectRatio,
         duration,
         audioMode,
         referenceIds: selectedReferences.map((reference) => reference.id),
       });
+      setHelpGeneratedScript(result.script);
       setScript(result.script);
     } finally {
       setIsWriting(false);
@@ -938,6 +1031,172 @@ export function Workbench() {
         max={remainingReferenceSlots}
       />
 
+      {helpCostOpen && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-[#101522]/35 p-4 backdrop-blur-[2px]" onClick={() => setHelpCostOpen(false)}>
+          <div className="w-full max-w-[480px] rounded-[14px] bg-[#f8f9fb] p-6 text-[#1d222b] shadow-[0_24px_80px_rgba(18,24,38,0.28)]" onClick={(event) => event.stopPropagation()}>
+            <h3 className="text-xl font-semibold">立即「帮我写」</h3>
+            <div className="mt-5 rounded-xl border border-[#e3e6eb] bg-[#fbfcfd] px-4 py-3">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-[#394150]">预计消耗积分</div>
+                  <div className="mt-2 text-xs text-[#9aa3af]">当前可用积分</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-sm font-semibold text-[#111827]">≈ 0.50 积分</div>
+                  <div className={cn('mt-2 text-xs font-medium', (helpAvailableCredits ?? 0) <= 0 ? 'text-[#e5484d]' : 'text-[#667085]')}>
+                    {helpAvailableCredits == null ? '读取中' : `${helpAvailableCredits} 积分`}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 border-t border-[#e4e7ed] pt-3">
+                <div className="mb-2 text-sm font-semibold text-[#242832]">计费明细</div>
+                <CostRow index={1} label="分析我的素材" value="0.20 积分 / 次" />
+                <CostRow index={2} label="参考视频拆解（可选，未计入合计）" value="0.30 积分 / 次" muted />
+                <CostRow index={3} label="生成视频脚本（按条计费）" value="0.30 积分 / 条" />
+              </div>
+            </div>
+            <div className="mt-4 rounded-xl border border-[#e3e6eb] bg-[#fbfcfd] px-4 py-3 text-xs text-[#6b7280]">
+              <span className="mr-2 inline-grid h-4 w-4 place-items-center rounded-full border border-[#b8c0cc] text-[10px]">i</span>
+              实际扣费以任务成功结果为准，失败不扣对应项积分。
+            </div>
+            <div className="mt-6 flex items-center justify-between gap-4">
+              <label className="flex items-center gap-2 text-sm text-[#6b7280]">
+                <input
+                  type="checkbox"
+                  checked={skipHelpCost}
+                  onChange={(event) => setSkipHelpCost(event.target.checked)}
+                  className="h-4 w-4 rounded border-[#c9ced8]"
+                />
+                不再提示
+              </label>
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => setHelpCostOpen(false)} className="h-9 rounded-xl bg-white px-6 text-sm font-semibold text-[#242832] shadow-sm hover:bg-[#f1f3f6]">取消</button>
+                <button type="button" onClick={openHelpWizard} className="h-9 rounded-xl bg-[#8e939c] px-6 text-sm font-semibold text-white shadow-sm hover:bg-[#6f7580]">继续生成</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {helpWizardOpen && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center bg-[#101522]/35 p-4 backdrop-blur-[2px]" onClick={() => setHelpWizardOpen(false)}>
+          <div className="flex max-h-[88vh] w-full max-w-[720px] flex-col rounded-2xl bg-white text-[#1d222b] shadow-[0_24px_80px_rgba(18,24,38,0.28)]" onClick={(event) => event.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-[#eef0f4] px-6 py-4">
+              <div>
+                <h3 className="text-lg font-semibold">帮我写视频脚本</h3>
+                <p className="mt-1 text-xs text-[#8a93a3]">上传产品图或模特图，确认识别结果，选择业务场景后生成脚本。</p>
+              </div>
+              <button type="button" onClick={() => setHelpWizardOpen(false)} className="grid h-8 w-8 place-items-center rounded-full text-[#8a93a3] hover:bg-[#f3f4f6] hover:text-[#1d222b]"><X className="h-4 w-4" /></button>
+            </div>
+
+            <div className="grid gap-5 overflow-auto px-6 py-5 md:grid-cols-[240px_minmax(0,1fr)]">
+              <div>
+                <label className="group grid aspect-[4/5] cursor-pointer place-items-center overflow-hidden rounded-xl border border-dashed border-[#cfd5df] bg-[#f8fafc] text-center transition hover:border-[#2f78ff] hover:bg-[#f5f8ff]">
+                  {helpAsset ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={helpAsset.url} alt={helpAsset.name} className="h-full w-full object-cover" />
+                  ) : (
+                    <span className="px-5 text-sm text-[#6b7280]">
+                      <ImageIcon className="mx-auto mb-3 h-8 w-8 text-[#9aa3af] group-hover:text-[#2f78ff]" />
+                      上传产品图或模特图
+                    </span>
+                  )}
+                  <input type="file" accept="image/*" className="hidden" onChange={(event) => handleHelpFile(event.target.files?.[0] ?? null)} />
+                </label>
+                {helpAsset && <div className="mt-2 truncate text-xs text-[#8a93a3]">{helpAsset.name}</div>}
+              </div>
+
+              <div className="space-y-4">
+                <div>
+                  <div className="mb-2 text-xs font-semibold text-[#4f5969]">素材类型</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(['product', 'model'] as const).map((kind) => (
+                      <button
+                        key={kind}
+                        type="button"
+                        onClick={() => setHelpAssetKind(kind)}
+                        className={cn(
+                          'flex h-10 items-center justify-center gap-2 rounded-xl border text-sm transition',
+                          helpAssetKind === kind ? 'border-[#20242b] bg-[#20242b] text-white' : 'border-[#e4e7ed] bg-white text-[#4f5969] hover:border-[#c9ced8]'
+                        )}
+                      >
+                        {kind === 'product' ? <Package className="h-4 w-4" /> : <UserRound className="h-4 w-4" />}
+                        {kind === 'product' ? '产品图' : '模特图'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <HelpField label="识别产品类型" value={helpProductType} onChange={setHelpProductType} placeholder="如：服饰 / 美妆 / 鞋靴" />
+                  <HelpField label="识别产品名称" value={helpProductName} onChange={setHelpProductName} placeholder="如：防晒衣 / 口红" />
+                </div>
+
+                <div>
+                  <div className="mb-2 text-xs font-semibold text-[#4f5969]">业务场景</div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {HELP_SCENES.map((scene) => (
+                      <button
+                        key={scene.key}
+                        type="button"
+                        onClick={() => setHelpScene(scene.key)}
+                        className={cn(
+                          'rounded-xl border px-3 py-2 text-left transition',
+                          helpScene === scene.key ? 'border-[#20242b] bg-[#20242b] text-white' : 'border-[#e4e7ed] bg-white text-[#4f5969] hover:border-[#c9ced8]'
+                        )}
+                      >
+                        <div className="text-sm font-semibold">{scene.label}</div>
+                        <div className={cn('mt-1 line-clamp-2 text-xs', helpScene === scene.key ? 'text-white/70' : 'text-[#8a93a3]')}>{scene.prompt}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <label className="block">
+                  <span className="mb-2 block text-xs font-semibold text-[#4f5969]">补充要求</span>
+                  <textarea
+                    value={helpExtra}
+                    onChange={(event) => setHelpExtra(event.target.value)}
+                    placeholder="可补充风格、卖点、人群、口播节奏等"
+                    className="h-20 w-full resize-none rounded-xl border border-[#e4e7ed] px-3 py-2 text-sm outline-none focus:border-[#2f78ff] focus:ring-2 focus:ring-[#2f78ff]/10"
+                  />
+                </label>
+              </div>
+            </div>
+
+            {helpGeneratedScript && (
+              <div className="mx-6 mb-4 rounded-xl border border-[#e4e7ed] bg-[#f8fafc] p-3">
+                <div className="mb-2 text-xs font-semibold text-[#4f5969]">已生成脚本</div>
+                <div className="max-h-28 overflow-auto whitespace-pre-wrap text-xs leading-6 text-[#303642]">{helpGeneratedScript}</div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#eef0f4] px-6 py-4">
+              <div className="text-xs text-[#8a93a3]">流程：上传素材 → 自动识别 → 选择场景 → 生成脚本 → 一键生成视频</div>
+              <div className="flex items-center gap-3">
+                <button type="button" onClick={() => setHelpWizardOpen(false)} className="h-9 rounded-xl border border-[#e4e7ed] px-4 text-sm font-semibold text-[#4f5969] hover:bg-[#f8fafc]">关闭</button>
+                <button type="button" onClick={generateHelpScript} disabled={isWriting} className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#20242b] px-5 text-sm font-semibold text-white disabled:cursor-wait disabled:bg-[#8e939c]">
+                  <Sparkles className={cn('h-4 w-4', isWriting && 'animate-pulse')} />
+                  {isWriting ? '生成中...' : '生成脚本'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!helpGeneratedScript || isSubmitting}
+                  onClick={() => {
+                    setHelpWizardOpen(false);
+                    setTimeout(() => submit(), 0);
+                  }}
+                  className="inline-flex h-9 items-center gap-2 rounded-xl bg-[#2f78ff] px-5 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:bg-[#aeb6c2]"
+                >
+                  <Play className="h-4 w-4" />
+                  一键生成视频
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 我的提示词弹窗 */}
       {showPromptsDialog && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" onClick={() => setShowPromptsDialog(false)}>
@@ -992,6 +1251,42 @@ export function Workbench() {
         </div>
       )}
     </main>
+  );
+}
+
+function CostRow({ index, label, value, muted = false }: { index: number; label: string; value: string; muted?: boolean }) {
+  return (
+    <div className={cn('flex items-center justify-between gap-4 border-t border-[#e7e9ee] py-2 text-sm first:border-t-0', muted && 'text-[#7c8491]')}>
+      <span className="flex items-center gap-2">
+        <span className="grid h-5 w-5 place-items-center rounded-full bg-[#dfe3e8] text-[11px] font-semibold text-[#7c8491]">{index}</span>
+        {label}
+      </span>
+      <span className="shrink-0 text-[#242832]">{value}</span>
+    </div>
+  );
+}
+
+function HelpField({
+  label,
+  value,
+  onChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-2 block text-xs font-semibold text-[#4f5969]">{label}</span>
+      <input
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="h-10 w-full rounded-xl border border-[#e4e7ed] px-3 text-sm outline-none focus:border-[#2f78ff] focus:ring-2 focus:ring-[#2f78ff]/10"
+      />
+    </label>
   );
 }
 
