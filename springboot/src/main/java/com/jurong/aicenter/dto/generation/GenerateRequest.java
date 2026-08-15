@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
+import java.util.List;
 import java.util.Map;
 
 @Data
@@ -20,4 +21,10 @@ public class GenerateRequest {
 
     /** 可选：直接传 workflow JSON（覆盖 workflowId） */
     private JsonNode workflowOverride;
+
+    /**
+     * 2026-08-14 新增:引用图(base64 data URI 数组)。
+     * 流程:前端 → 控制器 → GenerationService 注入到 workflow 节点的 image_ref / image 输入。
+     */
+    private List<String> referenceImages;
 }

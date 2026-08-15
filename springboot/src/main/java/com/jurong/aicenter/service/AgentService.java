@@ -19,6 +19,12 @@ public interface AgentService {
 
     AgentSendResponse send(Long userId, AgentSendRequest req);
 
+    /**
+     * 2026-08-14 新增:流式 send。每生成一段 token 就调 onToken,完整后自动存 DB。
+     *   用于 /api/agent/send/stream 端点(SseEmitter)。
+     */
+    void sendStream(Long userId, AgentSendRequest req, java.util.function.Consumer<String> onToken);
+
     AgentCreditInfo getCredits(Long userId);
 
     CreditsCheckResponse checkCredits(Long userId, CreditsCheckRequest req);

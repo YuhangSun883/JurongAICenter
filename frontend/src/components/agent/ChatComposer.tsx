@@ -19,8 +19,10 @@ interface ChatComposerProps {
   creditsUsed?: number;
   /** 预估积分（仅用于"发送中"的提示，可选） */
   creditsEstimated?: number;
-  /** 点击发送：参数 = (内容, 素材id 列表) */
-  onSend?: (content: string, attachmentIds: string[]) => void | Promise<void>;
+  /** 点击发送：参数 = (内容, 已选素材) —— 传完整 PickedMedia 列表(含 url,名称等),
+   *  让 page.tsx 不用再从 materials 里反查(避免闭包陷阱:addMaterials 是异步 setState,
+   *  触发 handleSend 时 page.tsx 的 materials 还是旧值) */
+  onSend?: (content: string, attachments: PickedMedia[]) => void | Promise<void>;
   /** 发送中：禁用按钮 + 显示 spinner */
   sending?: boolean;
 }
@@ -91,7 +93,8 @@ export function ChatComposer({
 
   function handleSend() {
     if (!text.trim() || sending) return;
-    onSend?.(text.trim(), picked.map((m) => m.id));
+    // 2026-08-14:传完整 PickedMedia 列表(不只传 id),避免 page.tsx 闭包陷阱
+    onSend?.(text.trim(), picked.slice());
     setText('');
     setPicked([]);
   }
@@ -146,7 +149,7 @@ export function ChatComposer({
             <textarea
               value={text}
               onChange={(e) => setText(e.target.value)}
-              placeholder="结合参考、输入文字或 @ 主体，说说今天想做什么。"
+              placeholder="结合参考、输入文字，说说今天想做什么。"
               rows={1}
               className="block w-full resize-none border-0 bg-transparent py-2 text-sm leading-6 text-fg outline-none placeholder:text-fg-subtle"
             />

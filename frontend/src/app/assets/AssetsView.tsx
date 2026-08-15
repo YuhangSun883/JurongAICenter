@@ -822,6 +822,18 @@ function AssetEditDialog({
             </div>
           </div>
 
+          {/* 视频大预览播放器（带 controls） */}
+          {asset.type === 'video' && asset.url && (
+            <video
+              key={asset.url}
+              src={asset.url}
+              controls
+              preload="metadata"
+              className="w-full rounded-lg border border-[#edf0f4] bg-black"
+              style={{ maxHeight: '320px' }}
+            />
+          )}
+
           {/* 名称 */}
           <label className="mb-1.5 block text-[12.5px] font-medium text-[#5f6876]">
             资产名称 <span className="text-[#dc2626]">*</span>

@@ -317,7 +317,6 @@ export function MediaPickerDialog({
               assetsTotal={assetsTotal}
               onChangePage={setAssetsPage}
               accept={accept}
-              assetUrls={assetUrls}
             />
           ) : (
             <RolesView
@@ -395,7 +394,6 @@ function AssetsView({
   tab, setTab, source, setSource, keyword, setKeyword, pickedIds, onToggle, onUpload, onAskRemove,
   uploadedFiles, libraries, currentLibId, onChangeLibrary,
   assets, assetsLoading, assetsPage, assetsTotal, onChangePage, accept,
-  assetUrls,
 }: {
   tab: typeof TABS[number]; setTab: (t: typeof TABS[number]) => void;
   source: typeof SOURCES[number]; setSource: (s: typeof SOURCES[number]) => void;
@@ -414,8 +412,6 @@ function AssetsView({
   assetsTotal: number;
   onChangePage: (p: number) => void;
   accept: string;
-  /** 2026-08-10 修复:从父组件传进来的资产 URL 集合(用于去重判断) */
-  assetUrls: Set<string>;
 }) {
   const tabToType: Record<typeof tab, string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
   const showUploaded = source === '全部' || source === '我上传的';
