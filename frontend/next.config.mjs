@@ -1,3 +1,5 @@
+const apiBaseUrl = (process.env.INTERNAL_API_BASE_URL || 'http://localhost:8080').replace(/\/$/, '');
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
@@ -24,7 +26,7 @@ const nextConfig = {
   rewrites: async () => [
     {
       source: '/api/:path*',
-      destination: 'http://localhost:8080/api/:path*',
+      destination: `${apiBaseUrl}/api/:path*`,
     },
   ],
 };
