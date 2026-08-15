@@ -109,8 +109,31 @@ export interface AgentCreditInfo {
   total: number;       // 总积分
   used: number;        // 累计已消耗
   remaining: number;   // 剩余
+  /** 后端返回的订阅/月度积分额度 */
+  monthlyQuota?: number;
   /** 本次消息预估消耗 */
   estimated?: number;
+}
+
+export type CreditLedgerType = 'CONSUME' | 'RECHARGE' | 'REFUND' | 'GRANT' | 'EXPIRE';
+
+export interface CreditLedgerItem {
+  id: number;
+  jobId?: number;
+  type: CreditLedgerType | string;
+  creditsDelta: number;
+  balanceAfter: number;
+  description?: string;
+  paymentId?: string;
+  tool?: string;
+  createdAt?: string;
+}
+
+export interface CreditLedgerResponse {
+  items: CreditLedgerItem[];
+  total: number;
+  page: number;
+  pageSize: number;
 }
 
 /* ================= 积分前置校验（发送前调用） ================= */

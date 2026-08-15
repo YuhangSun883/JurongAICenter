@@ -21,6 +21,8 @@ public interface AgentService {
 
     AgentCreditInfo getCredits(Long userId);
 
+    CreditLedgerResponse listCreditLedger(Long userId, String type, String tool, Integer page, Integer pageSize);
+
     CreditsCheckResponse checkCredits(Long userId, CreditsCheckRequest req);
 
     List<PlanInfo> listPlans();

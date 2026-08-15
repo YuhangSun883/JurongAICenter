@@ -20,6 +20,8 @@ export const agentApi = {
     USE_MOCK ? mock.sendStream(req) : real.sendStream(req),
   getCredits: () =>
     USE_MOCK ? mock.getCredits() : real.getCredits(),
+  listCreditLedger: (query?: Parameters<typeof real.listCreditLedger>[0]) =>
+    USE_MOCK ? mock.listCreditLedger(query) : real.listCreditLedger(query),
   // 积分前置校验
   checkCredits: (req: Parameters<typeof real.checkCredits>[0]) =>
     USE_MOCK ? mock.checkCredits(req) : real.checkCredits(req),

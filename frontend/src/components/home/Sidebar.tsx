@@ -153,6 +153,7 @@ export function Sidebar(_props: SidebarProps = {}) {
                 <div className="space-y-1 border-y border-[#eef1f5] py-2">
                   <button
                     type="button"
+                    onClick={() => router.push('/credits')}
                     className="flex h-9 w-full items-center justify-between rounded-xl px-2 text-sm text-[#344054] transition hover:bg-[#f6f8fb]"
                   >
                     <span className="flex items-center gap-2">

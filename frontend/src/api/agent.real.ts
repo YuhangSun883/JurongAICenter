@@ -13,6 +13,7 @@ import type {
   AgentSession,
   AgentMessage,
   AgentCreditInfo,
+  CreditLedgerResponse,
   CreditsCheckRequest,
   CreditsCheckResponse,
   PlanInfo,
@@ -73,6 +74,18 @@ export async function sendStream(req: AgentSendRequest): Promise<Response> {
 /** 查询当前用户积分 */
 export async function getCredits(): Promise<AgentCreditInfo> {
   return request<AgentCreditInfo>('/api/agent/credits');
+}
+
+/** 查询当前用户自己的积分明细 */
+export async function listCreditLedger(query: {
+  type?: string;
+  tool?: string;
+  page?: number;
+  pageSize?: number;
+} = {}): Promise<CreditLedgerResponse> {
+  return request<CreditLedgerResponse>('/api/agent/credits/ledger', {
+    query: query as Record<string, string | number | boolean>,
+  });
 }
 
 /**

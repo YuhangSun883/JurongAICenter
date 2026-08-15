@@ -95,6 +95,17 @@ public class AgentController {
         return agentService.getCredits(user.id());
     }
 
+    @GetMapping("/credits/ledger")
+    public CreditLedgerResponse listCreditLedger(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @RequestParam(required = false) String type,
+            @RequestParam(required = false) String tool,
+            @RequestParam(required = false) Integer page,
+            @RequestParam(required = false) Integer pageSize) {
+        requireUser(user);
+        return agentService.listCreditLedger(user.id(), type, tool, page, pageSize);
+    }
+
     @PostMapping("/credits/check")
     public CreditsCheckResponse checkCredits(
             @AuthenticationPrincipal AuthenticatedUser user,

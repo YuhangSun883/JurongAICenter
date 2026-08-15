@@ -14,6 +14,7 @@ import type {
   AgentSessionListQuery,
   AgentSessionListResponse,
   AgentCreditInfo,
+  CreditLedgerResponse,
   AgentTool,
   CreditsCheckRequest,
   CreditsCheckResponse,
@@ -156,7 +157,17 @@ export async function getCredits(): Promise<AgentCreditInfo> {
     total: MOCK_TOTAL_CREDITS,
     used,
     remaining: Math.max(0, MOCK_TOTAL_CREDITS - used),
+    monthlyQuota: MOCK_TOTAL_CREDITS,
   });
+}
+
+export async function listCreditLedger(_query?: {
+  type?: string;
+  tool?: string;
+  page?: number;
+  pageSize?: number;
+}): Promise<CreditLedgerResponse> {
+  return delay({ items: [], total: 0, page: 1, pageSize: 20 });
 }
 
 /* ============= 积分校验 mock ============= */

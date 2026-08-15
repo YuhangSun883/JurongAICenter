@@ -5,11 +5,13 @@ import com.jurong.aicenter.client.NewApiClient;
 import com.jurong.aicenter.dto.agent.*;
 import com.jurong.aicenter.entity.AgentMessage;
 import com.jurong.aicenter.entity.AgentSession;
+import com.jurong.aicenter.entity.BillingLog;
 import com.jurong.aicenter.entity.User;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.repository.AgentMessageRepository;
 import com.jurong.aicenter.repository.AgentSessionRepository;
+import com.jurong.aicenter.repository.BillingLogRepository;
 import com.jurong.aicenter.repository.UserRepository;
 import com.jurong.aicenter.service.AgentService;
 import com.jurong.aicenter.service.MediaService;
@@ -91,6 +93,7 @@ public class AgentServiceImpl implements AgentService {
     private final AgentSessionRepository sessionRepo;
     private final AgentMessageRepository messageRepo;
     private final UserRepository userRepo;
+    private final BillingLogRepository billingLogRepository;
     private final NewApiClient newApiClient;
     private final MediaService mediaService;
 
@@ -398,6 +401,29 @@ public class AgentServiceImpl implements AgentService {
     }
 
     @Override
+    public CreditLedgerResponse listCreditLedger(Long userId, String type, String tool, Integer page, Integer pageSize) {
+        int currentPage = page == null || page < 1 ? 1 : page;
+        int currentPageSize = pageSize == null || pageSize < 1 ? 20 : Math.min(pageSize, 100);
+        String normalizedType = normalizeLedgerType(type);
+        String normalizedTool = tool == null ? "" : tool.trim();
+
+        QueryWrapper<BillingLog> wrapper = new QueryWrapper<>();
+        wrapper.eq("user_id", userId);
+        if (normalizedType != null) {
+            wrapper.eq("type", normalizedType);
+        }
+        wrapper.orderByDesc("created_at");
+
+        List<CreditLedgerItem> filtered = billingLogRepository.selectList(wrapper).stream()
+                .filter(log -> matchesTool(log, normalizedTool))
+                .map(this::toCreditLedgerItem)
+                .toList();
+        int from = Math.min((currentPage - 1) * currentPageSize, filtered.size());
+        int to = Math.min(from + currentPageSize, filtered.size());
+        return new CreditLedgerResponse(filtered.subList(from, to), filtered.size(), currentPage, currentPageSize);
+    }
+
+    @Override
     public CreditsCheckResponse checkCredits(Long userId, CreditsCheckRequest req) {
         User user = requireUser(userId);
         int remaining = resolveRemainingCredits(user);
@@ -574,22 +600,30 @@ public class AgentServiceImpl implements AgentService {
         }
 
         int creditsAdded = 100 + Math.abs(code.hashCode() % 901);
-        int remaining = addCreditsToUser(userId, creditsAdded);
+        String redeemId = "rc_" + randomId();
+        int remaining = addCreditsToUser(userId, creditsAdded, "兑换充值卡", redeemId);
         return new RedeemCardResponse(
                 creditsAdded,
                 365,
-                "rc_" + randomId(),
+                redeemId,
                 remaining
         );
     }
 
     private void applyOrderEffect(OrderRecord order, Long userId) {
         if (order.applied.compareAndSet(false, true)) {
-            addCreditsToUser(userId, order.credits);
+            String desc = order.kind == OrderKind.PLAN
+                    ? "订阅套餐充值：" + order.refId
+                    : "积分充值：" + order.refId;
+            addCreditsToUser(userId, order.credits, desc, order.orderId);
         }
     }
 
     private int addCreditsToUser(Long userId, int delta) {
+        return addCreditsToUser(userId, delta, "积分充值", null);
+    }
+
+    private int addCreditsToUser(Long userId, int delta, String description, String paymentId) {
         User user = requireUser(userId);
         int base = user.getCredits() != null
                 ? Math.max(0, user.getCredits())
@@ -598,7 +632,54 @@ public class AgentServiceImpl implements AgentService {
         user.setCredits(total);
         user.setUpdatedAt(LocalDateTime.now());
         userRepo.updateById(user);
+
+        BillingLog log = new BillingLog();
+        log.setUserId(userId);
+        log.setType("RECHARGE");
+        log.setCreditsDelta(Math.max(0, delta));
+        log.setBalanceAfter(total);
+        log.setDescription(description == null || description.isBlank() ? "积分充值" : description);
+        log.setPaymentId(paymentId);
+        log.setCreatedAt(LocalDateTime.now());
+        billingLogRepository.insert(log);
         return total;
+    }
+
+    private String normalizeLedgerType(String type) {
+        if (type == null || type.isBlank() || "ALL".equalsIgnoreCase(type)) return null;
+        return type.trim().toUpperCase();
+    }
+
+    private boolean matchesTool(BillingLog log, String tool) {
+        if (tool == null || tool.isBlank() || "ALL".equalsIgnoreCase(tool)) return true;
+        return inferTool(log).equalsIgnoreCase(tool.trim());
+    }
+
+    private CreditLedgerItem toCreditLedgerItem(BillingLog log) {
+        return new CreditLedgerItem(
+                log.getId(),
+                log.getJobId(),
+                log.getType(),
+                log.getCreditsDelta(),
+                log.getBalanceAfter(),
+                log.getDescription(),
+                log.getPaymentId(),
+                inferTool(log),
+                log.getCreatedAt()
+        );
+    }
+
+    private String inferTool(BillingLog log) {
+        String text = ((log.getDescription() == null ? "" : log.getDescription()) + " "
+                + (log.getPaymentId() == null ? "" : log.getPaymentId())).toLowerCase();
+        if (text.contains("video") || text.contains("视频")) return "video";
+        if (text.contains("image") || text.contains("图片") || text.contains("画面")) return "image";
+        if (text.contains("subtitle") || text.contains("字幕")) return "subtitle";
+        if (text.contains("enhance") || text.contains("增强")) return "enhance";
+        if (text.contains("prompt") || text.contains("提示词")) return "prompt";
+        if (text.contains("agent") || text.contains("助手") || text.contains("对话")) return "agent";
+        if (text.contains("订阅") || text.contains("套餐") || text.contains("充值") || text.contains("兑换")) return "recharge";
+        return "other";
     }
 
     private User requireUser(Long userId) {
