@@ -38,8 +38,10 @@ import java.util.Map;
  * 背景：ComfyUI 节点的 JurongImageToVideo 在 save_video_file 阶段偶发失败，
  * 导致 outputs 为空，Spring Boot 端拿不到 video_path。
  * 此接口允许手动补救：传入 NewAPI task_id → 查状态 → 拿 URL → 下载上传到 MinIO。
+ *
+ * 2026-08-13 FIX:删除 @Slf4j 注释,只保留 L84 手动 log 声明,避免 lombok annotationProcessor
+ *   失败时出现 "log 变量重复声明" 编译错误。
  */
-@Slf4j
 @Component
 public class NewApiClient {
 
@@ -110,8 +112,23 @@ public class NewApiClient {
     @Value("${newapi.vision-model:qwen-vl-max}")
     private String visionModel;
 
-    public NewApiClient(WebClient.Builder webClientBuilder) {
+    // 2026-08-13:用于 editImage 多图图生图 — 把 base64 图片批量上传到 :8090 素材库
+    //   拿到 asset_url 后,改用 /v1/images/generations + JSON body(image 字段)
+    //   提交图生图。旧版 multipart /v1/images/edits 端点在新版本已下线。
+    private final AicomingAssetsClient aicomingAssetsClient;
+
+    public NewApiClient(WebClient.Builder webClientBuilder,
+                        AicomingAssetsClient aicomingAssetsClient) {
         this.webClientBuilder = webClientBuilder;
+        this.aicomingAssetsClient = aicomingAssetsClient;
+    }
+
+    /**
+     * 2026-08-13 补:对外暴露 AicomingAssetsClient,方便其他 Service 复用素材上传/轮询等基础能力。
+     * (避免在多个调用方重复注入 AicomingAssetsClient)
+     */
+    public AicomingAssetsClient getAicomingAssetsClientForUpload() {
+        return aicomingAssetsClient;
     }
 
     /**
@@ -629,6 +646,51 @@ public class NewApiClient {
     // downloadAsDataUri 已在文件下方定义（line 1019 附近），直接复用。
 
     /**
+     * 2026-08-13 补:下载公网图片 URL 并转 base64 data URI。
+     * 用于 chatCompletionWithImages 在 NewAPI 中转服务器无法访问公网 URL 时,
+     * 把图片临时下载到内存中再上传。
+     * @param imageUrl 公网图片 URL
+     * @return "data:image/{ext};base64,..." 格式
+     */
+    public String downloadAsDataUri(String imageUrl) {
+        if (imageUrl == null || imageUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "downloadAsDataUri: imageUrl 为空");
+        }
+        try {
+            byte[] bytes = webClientBuilder.baseUrl("http://placeholder").build()
+                .get()
+                .uri(imageUrl)
+                .retrieve()
+                .bodyToMono(byte[].class)
+                .timeout(Duration.ofSeconds(30))
+                .block();
+            if (bytes == null || bytes.length == 0) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "downloadAsDataUri: 下载为空: " + imageUrl);
+            }
+            String mime = "image/jpeg";
+            if (bytes.length > 8 && (bytes[0] & 0xFF) == 0x89 && bytes[1] == 0x50) {
+                mime = "image/png";
+            } else if (bytes.length > 12 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F') {
+                mime = "image/gif";
+            } else if (bytes.length > 4 && (bytes[0] & 0xFF) == 0xFF && (bytes[1] & 0xFF) == 0xD8) {
+                mime = "image/jpeg";
+            } else if (bytes.length > 4 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F') {
+                mime = "image/webp";
+            }
+            String b64 = Base64.getEncoder().encodeToString(bytes);
+            log.info("[downloadAsDataUri] OK: url={}, size={}B, mime={}", imageUrl, bytes.length, mime);
+            return "data:" + mime + ";base64," + b64;
+        } catch (Exception e) {
+            if (e instanceof BusinessException) throw (BusinessException) e;
+            log.error("[downloadAsDataUri] 下载失败: url={}, err={}", imageUrl, e.getMessage());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "downloadAsDataUri 下载失败: " + e.getMessage());
+        }
+    }
+
+
+    /**
      * 调 NewAPI /v1/videos（走 aicoming-video-proxy），multipart 单图直传。
      *
      * <p>调用链：Java → NewAPI (jurong) → aicoming-video-proxy
@@ -662,10 +724,109 @@ public class NewApiClient {
     public String submitVideo(String prompt, byte[] imageBytes, String imageFilename,
                               String imageMime, int duration, String resolution,
                               java.util.List<String> additionalImageUrls) {
-        // 2026-08-14 简化:多图走通用 List<byte[]> 入口;这里只把主图带上。
-        java.util.List<byte[]> allImages = new java.util.ArrayList<>();
-        if (imageBytes != null && imageBytes.length > 0) {
-            allImages.add(imageBytes);
+        // 走 submitVideoMultiImage 方法(直接构造 multipart + 附加 URL)
+        return submitVideoMultiImage(prompt, imageBytes, imageFilename, imageMime,
+            duration, resolution, additionalImageUrls).taskId();
+    }
+
+    /**
+     * 2026-08-11 新增:多图版 submitVideo 内部实现。
+     * 主图走 multipart input_reference,附加 URL 通过 image_urls JSON 字段附加。
+     */
+    private SubmitResult submitVideoMultiImage(String prompt, byte[] imageBytes, String imageFilename,
+                              String imageMime, int duration, String resolution,
+                              java.util.List<String> additionalImageUrls) {
+        try {
+            // 2026-08-13 FIX:补齐方法体内需要的局部变量
+            VideoOptions options = VideoOptions.builder()
+                .duration(duration)
+                .resolution(resolution)
+                .build();
+            String useResolution = (resolution != null && !resolution.isBlank())
+                ? resolution.toLowerCase() : "480p";
+            List<byte[]> imageFiles = (imageBytes != null && imageBytes.length > 0)
+                ? List.of(imageBytes) : null;
+
+            MultipartBodyBuilder builder = new MultipartBodyBuilder();
+            builder.part("model", "doubao-seedance-2.0");
+            builder.part("prompt", prompt);
+            builder.part("duration", String.valueOf(options.getDuration()));
+            // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
+            //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
+            builder.part("resolution", useResolution);
+
+            // 主图(如果有 bytes)走 multipart input_reference
+            if (imageFiles != null && !imageFiles.isEmpty()) {
+                byte[] firstImageBytes = imageFiles.get(0);
+                final String fname = "canvas_input.png";
+                final String mime = "image/png";
+                // 2026-08-13 FIX: 同步发 image/input_reference/image_url 3 个字段名(模仿 Python api_client.submit_video)
+                // 原因:aicoming-proxy 8/13 改了期望字段名,只发 input_reference 会被忽略
+                ByteArrayResource imgResource1 = new ByteArrayResource(firstImageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                ByteArrayResource imgResource2 = new ByteArrayResource(firstImageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                ByteArrayResource imgResource3 = new ByteArrayResource(firstImageBytes) {
+                    @Override public String getFilename() { return fname; }
+                };
+                builder.part("image", imgResource1, MediaType.parseMediaType(mime));
+                builder.part("input_reference", imgResource2, MediaType.parseMediaType(mime));
+                builder.part("image_url", imgResource3, MediaType.parseMediaType(mime));
+            }
+
+            // 附加 URL 通过 image_urls JSON 字段附加(2026-08-11 新增多图)
+            if (additionalImageUrls != null && !additionalImageUrls.isEmpty()) {
+                try {
+                    String imageUrlsJson = MAPPER.writeValueAsString(additionalImageUrls);
+                    builder.part("image_urls", imageUrlsJson);
+                } catch (Exception e) {
+                    log.warn("Failed to serialize image_urls: {}", e.getMessage());
+                }
+            }
+
+            JsonNode response = webClientBuilder.baseUrl(videoBaseUrl).build()
+                .post()
+                .uri("/v1/videos")
+                .header("Authorization", "Bearer " + token)
+                .contentType(MediaType.MULTIPART_FORM_DATA)
+                .body(BodyInserters.fromMultipartData(builder.build()))
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(Duration.ofSeconds(600))
+                .onErrorMap(WebClientResponseException.class, e -> {
+                    String body = e.getResponseBodyAsString();
+                    log.error("NewAPI /v1/videos (multi) failed: {} body={}", e.getStatusCode(), body);
+                    String friendly = translateNewApiError(body);
+                    ErrorCode code = (e.getStatusCode().is4xxClientError())
+                        ? ErrorCode.NEWAPI_REQUEST_INVALID
+                        : ErrorCode.NEWAPI_UNREACHABLE;
+                    return new BusinessException(code,
+                        "NewAPI /v1/videos " + e.getStatusCode() + ": " + friendly);
+                })
+                .block();
+
+            if (response == null) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI /v1/videos (multi) 返回空响应");
+            }
+
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
+            if (taskId.isEmpty()) {
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                    "NewAPI /v1/videos (multi) 响应缺 id/task_id: " + response);
+            }
+            log.info("NewAPI /v1/videos (multi) task submitted: {} (primary={}B, additionalUrls={})",
+                taskId,
+                (imageFiles != null && !imageFiles.isEmpty() ? imageFiles.get(0).length : 0),
+                additionalImageUrls);
+            return new SubmitResult(taskId, null);
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                "NewAPI /v1/videos (multi) 调用失败: " + e.getMessage());
         }
         VideoOptions opts = VideoOptions.builder()
             .duration(duration)
@@ -728,17 +889,18 @@ public class NewApiClient {
 
             builder.part("model", useModel);
             builder.part("prompt", prompt);
-            builder.part("duration", String.valueOf(useDuration));
+            builder.part("duration", String.valueOf(options.getDuration()));
             // 2026-08-13 14:25 修复:严格对齐聚融 v2.1 文档 §7(resolution 必须小写 "480p"/"720p"/"1080p")
             //   之前原样转发,如果上游传 "480P" 会被原样发出,aicoming 上游会拒
             builder.part("resolution", useResolution);
             // ratio / watermark 濠电姷鏁告慨鐑藉极閸涘﹥鍙忛柣鎴ｆ閺嬩線鏌涘☉姗堟敾闁告瑥绻橀弻锝夊箣閿濆棭妫勯梺鍝勵儎缁舵岸寮婚悢鍏尖拻閻庨潧澹婂Σ顔剧磼閻愵剙鍔ゆい顓犲厴瀵鏁愭径濠勭杸濡炪倖甯婇悞锕傚磿閹剧粯鈷戦柟鑲╁仜婵″ジ鏌涙繝鍌涘仴鐎殿喛顕ч埥澶愬閳哄倹娅囬梻浣瑰缁诲倸螞濞戔懞鍥Ψ瑜忕壕钘壝归敐鍛儓鐏忓繘姊洪崨濠庢畷濠电偛锕ら锝囨嫚濞村顫嶅┑鈽嗗灦閺€閬嶅棘閳ь剟姊绘担鍛婂暈婵炶绠撳畷鎴﹀礋椤掍礁寮块梺闈涚箞閸婃牠鍩涢幋鐐电闁煎ジ顤傞崵娆愵殽閻愭惌娈滈柡宀€鍠栭獮鏍ㄦ媴閾忚姣囬梻浣虹《閺備線宕戦幘鎰佹富闁靛牆妫楃粭鎺楁煕閻樺疇澹樻い顓炴喘楠炲洭顢橀悩娈垮晭闂備礁鎲￠悷銉┧囨潏銊︽珷妞ゅ繐鐗婇崑鍌炴煏閸繍妲归柣鎾卞劦閺岋繝宕堕埡浣风捕婵炲瓨绮嶆竟鍡欐閹炬剚鍚嬮柛鈩冪懃閳峰矂姊洪崫鍕効缂佺粯绻傞悾鐑藉醇閺囩倣銊╂煏婢诡垰鍊诲Λ顖炴⒒閸屾瑨鍏岀紒顕呭灦楠炴劗鎷犵憗浣告惈椤粓鍩€椤掍椒绻嗛柣銏㈩焾缁€瀣亜閺嶃劍鐨戦柣銈傚亾闂傚倷绀侀幉锟犲箰閻戣姤鍤勯柟顖滃閹冲瞼绱撻崒姘偓鎼佸磹妞嬪孩濯奸柡灞诲劚绾惧鏌熼崜褏甯涢柣鎾存礋閺岀喐瀵肩€涙ɑ閿梺鍝勵儑閸犳牠寮婚敐澶婄閻庨潧鎲￠崚娑㈡⒑閸濆嫭婀扮紒瀣灴閳ワ箓濡搁埡浣哄姦濡炪倖甯掗崐濠氭儗閸℃褰掓晲閸偅缍堝┑鐐叉噽婵炩偓闁哄瞼鍠撶槐鎺楀閻樺磭浜堕梻浣虹帛閹稿鎮烽敃鍌毼﹂柛鏇ㄥ灠缁秹鏌嶈閸撶喎顕ｉ崨濠勭瘈婵﹩鍘煎▓宀勬⒑缁夊棗瀚峰▓鏇㈡煟閹惧鎳勯柕鍥у瀵噣宕掑☉娆戝涧闂備胶鎳撻崯鍨洪銏犺摕闁绘柨鍚嬮幆鐐淬亜閹扳晛鈧鎮￠埀顒勬⒒娴ｅ摜锛嶇紒顕呭灦楠炴垿宕堕鍌氱ウ闂佸綊鍋婇崢浠嬪磿閻旀悶浜滈柡鍐ㄥ€婚幗鍌涗繆椤愩垹顏╅柍瑙勫灴閹晠宕归锝嗙槑濠电姵顔栭崰姘跺礂濮椻偓婵℃挳宕掗悙鏉戠檮婵犮垹鍘滈弲顏嗙礊娴ｅ摜鏆﹂柕濞炬櫅缁狙囨煙鐎电顎撶紒閬嶄憾濮婄粯鎷呴崨濠傛殘缂備礁顑嗛崹鍧楀箖濞差亜惟闁宠桨鑳堕弻褍鈹戦悩缁樻锭妞ゆ垵妫濋幃陇绠涘☉姘絼闂佹悶鍎滅仦钘夊闂備線鈧偛鑻晶顖涚箾閼碱剙鏋涙鐐茬箻楠炲鏁傞挊澶夌盎闂備胶顭堢换妤呭磻閹版澘鍌ㄦい蹇撶墛閳锋垿鏌涢幘鏉戠祷濞存粍绻勭槐鎺旀嫚閼碱儷銏ゅ础闁秵鐓曟繝闈涘閸斻倗鐥幆褋鍋㈤柡宀嬬到閳诲酣骞囬钘夋珣婵犵數鍋犻婊呯不閹捐绠栭柨鐔哄Т閸楁娊鏌ｉ弮鍌滅瘈缂併劏顕ч—鍐Χ閸℃ê鏆楅梺鍝ュТ闁帮綁骞冨鈧俊鐑藉煛閸屾粌骞愰梺璇插嚱缂嶅棝宕滃▎鎾冲嚑闁瑰濮风壕鑲╃磽娴ｈ鐒芥繛鎻掝嚟閳ь剝顫夊ú鏍Χ閹间礁绠栭柕蹇嬪€曠粻褰掓煟閹邦厼顎滄俊鍓ь焾閳规垿鎮╅幇浣告櫛闂佸摜濮甸悧鐘诲极閸愵喖惟闁靛鍨洪悗娲⒑閹稿海绠撴繛灞傚€濆畷鐟扳攽閸モ晝顔曢梺绯曞墲閿氶柣蹇ュ閳ь剝顫夊ú鏍囬悽绋胯摕闁哄洨鍠撶粻鍓ф喐瀹ュ鍤愭い鏍仜閺嬩線鏌ｉ幘宕囧哺闁衡偓娴犲鐓ユ繛鎴灻鈺伱瑰鍐﹀仮闁哄本绋掔换娑㈠垂椤旂懓浜炬繝闈涙閺嗭箓鏌曡箛瀣偓鏍磻閸屾侗娈介柣鎰版涧閺嬫垶淇婇悙鎵煓闁靛棔绀侀～婊堝焵椤掍焦鍙忛柍褜鍓熼弻鏇＄疀閺囩倫銉╂煏閸剛鐣垫慨濠勭帛閹峰懏绗熼娑欐殲闂備浇顫夊鎸庣閻愰潧鍨濆┑鐘宠壘缁狅綁鏌ｅΟ鍏兼毄闁绘帒銈搁弻锝嗘償椤栨粎校闂佺顑勯悞锔剧矉瀹ュ拋鐓ラ柛顐ゅ枔閸樻悂鎮楅獮鍨姎闁哥噥鍋呮穱濠冪鐎ｎ偆鍘介梺闈涱煭缁犳垿鎮橀敃鍌涚厪闁搞儜鍐句純濡ょ姷鍋為…鍥焵椤掍胶鈯曢懣褍霉閻橆喖鐏╅柍瑙勫灴椤㈡瑧娑甸柨瀣毎婵犵绱曢崑妯煎垝濞嗘挻鍋樻い鏇楀亾妤犵偛娲、姗€鎮㈠畡鏉课ら梻鍌欑閸熷潡鎮橀崼銉ョ柧婵犲﹤鎳夐崑鎾愁潩椤愩倗鐓撳┑顔硷功缁垶骞忛崨顔剧懝妞ゆ牗绋掗弳鐐寸節閻㈤潧浠滈柟鍐茬箰鐓ら柣鏃囧亹瀹撲線鏌熼幍顔碱暭闁搞倖甯￠弻鏇㈠醇濠靛洤绐涢梺缁樺笒濞硷繝骞冨Δ鍛祦闁割煈鍠栨慨搴☆渻閵堝繒绱伴柛妤€鍟块悾鐑藉箛閻楀牏鍙嗛柣搴祷閸斿鑺辨繝姘拺闁荤喓澧楅幆鍫㈢磼婢跺﹦鍩ｉ挊婵嬫煥閺冨牊鏆滈柛瀣尭閳绘捇宕归鐣屼邯闂備浇顕х换鎴犳崲閸儱鏄ラ柣鎰惈缁狅綁鏌ㄩ弴妤€浜鹃梺缁樻惈缁绘繈寮诲☉銏犵労闁告劗鍋撻悾鍏肩箾鐎电袥闁哄懏鐩崺鐐哄箣閿旇棄鈧兘鏌ｉ幇顒€甯ㄩ柛瀣尵閳ь剨缍嗛崜姘暦閸欏绡€闂傚牊绋掗ˉ鐘绘煛閸☆參妾柕鍥у楠炲洭濡搁敃鈧妯衡攽閻愬弶鈻曞ù婊冪埣瀵偊宕掗悙瀵稿幈濠电偞鍨靛畷顒勬倶閻樻剚娈?Python api_client.py
 
-            if (imageFiles != null && !imageFiles.isEmpty()
-                && imageFiles.get(0) != null && imageFiles.get(0).length > 0) {
+            if (imageFiles != null && !imageFiles.isEmpty()) {
                 byte[] imageBytes = imageFiles.get(0);
                 final String fname = "canvas_input.png";
                 final String mime = "image/png";
+                // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鐐劤缂嶅﹪寮婚敐澶婄闁挎繂鎲涢幘缁樼厱濠电姴鍊归崑銉╂煛鐏炶濮傜€殿喗鎸抽幃娆徝圭€ｎ亙澹曢梺鍛婄缚閸庤櫕绋夊澶嬬厸鐎广儱楠搁獮妤呮煟閹惧瓨绀冮柕鍥у楠炲洭宕滄担鑽锋垹绱撴担鎻掍壕闂侀€炲苯澧扮紒杈ㄥ浮閹瑩顢楅埀顒勫礉閵堝棛绠鹃悘蹇旂墤閸嬫捇骞囨担鍛婎吙闂備礁澹婇崑鍛洪弽顓熺厑闁搞儯鍔庣粻楣冩煙鐎甸晲绱虫い蹇撶墐閳ь剚鐗楀鍕箾閻愵剚鏉搁梻浣虹帛閸旀洖顕ｉ崼鏇為棷闁芥ê顦弨鑺ャ亜閺冨洤袚閻忓骏闄勭换婵嬪焵椤掍胶鐟归柍褜鍓欓～蹇涙惞閸︻厾锛滃┑鈽嗗灠濞存碍绂嶅鍡欎航濠电姷鏁告慨鏉懨洪妶鍥ь棜闁秆勵殘閸欐捇鏌涢妷锝呭闁愁垱娲熼弻锝夊箻鐎靛憡鍒涢梺璇″枟椤ㄥ﹪寮幇鏉跨＜婵炴垶鐟цぐ鍥╃磽閸屾瑧鍔嶉柛鏃€鐗曡灋闁告劦鍠栭拑鐔兼煃閵夈儳锛嶉柡鍡楁閺屽秷顧侀柛鎾跺枎閻ｉ攱瀵奸弶鎴濆敤濡炪倖鎸炬慨瀵哥矈閿曞倹鈷戠痪顓炴噺瑜把呯磼閻樺啿鐏╃紒顔款嚙閳藉鈻庡鍕泿闂備礁婀遍崕銈夊垂閻㈢鐒垫い鎺嗗亾闁硅姤绮撳顐︻敋閳ь剙鐣风粙璇炬梹鎷呴崣澶婎伜婵犵數鍋犻幓顏嗗緤娴犲绠熼柨鐔哄Т缁犵喓绱掔€ｎ亞姘ㄩ柡鈧懞銉ｄ簻闁哄啫娲よ缂傚倸绉甸崹鍧楀箺閸洘鍊烽悗闈涙憸閻﹀牓姊婚崒姘卞濞撴碍顨婂畷鏇＄疀濞戞瑧鍙冮梺鍛婂姦娴滄粓寮搁幋鐘电＜缂備焦顭囧ú瀛橆殽閻愬樊鍎忛柍璇叉唉缁犳盯寮村顓炰簼闂傚倸鍊烽懗鍓佸垝椤栨粍鏆滄俊銈傚亾妞ゎ亜鍟粋鎺斺偓锝庝海閹芥洖鈹戦悙鏉戠仧闁搞劌婀辩划璇测槈閵忊€斥偓鍫曟煟閹邦垱纭剧悮姘舵⒑闂堚晝鎮奸柡鍜佸亞濡叉劙骞掑Δ浣镐汗闂佸憡鍔曞鍓佹嫚閻愭祴鏀芥い鏃傘€嬮崝鐔虹磼椤曞懎鐏︽鐐茬箻瀹曘劑寮堕幋婵堢崺濠电姷鏁告慨鎾疮椤愶箑绀堥柛顭戝亞缁♀偓缂佸墽澧楄摫妞ゎ偄锕弻娑氣偓锝庝簻椤忣參鏌＄仦鏂よ含闁轰焦鍔欏畷銊╊敍濞戞瑯鍟庨梻鍌欑閹碱偄煤閵忋倕鍨傛繛宸簻绾惧鏌曟繛褍鎳愰敍婊堟煟鎼搭垳绉甸柛妯恒偢瀹曟繈鎮介崨濠勫幍闂佸吋浜介崕鑼矆鐎ｎ偅鍙忓┑鐘插暞閵囨繃淇婇銏犳殭闁宠棄顦板蹇涘煛娴ｆ劅顏堟⒒閸屾瑨鍏屾い顓炵墢閳ь剙鐏氱敮鈥崇暦娴兼潙鍐€鐟滃秶绮婇锔解拻濞达絿顭堥ˉ蹇涙煕鐎ｎ亝顥㈢€规洑鍗抽獮姗€宕滄担椋庣憹濠德板€х徊浠嬪疮椤栫偞鍋傞柡鍥ュ灪閻撳啴鏌嶆潪鎵槮妤犵偞蓱閵囧嫯绠涢幘璺侯杸闂佺锕ら悥濂稿蓟瀹ュ浼犻柛鏇ㄥ墮濞呫倝姊虹紒妯诲鞍婵炲弶顭囬幑銏犫槈閵忕姴鑰垮┑鈽嗗灠閹碱偊锝炴惔锝囩＝濞达絽鎼牎濡炪値鍘煎ú銊ノｉ幇鏉跨闁规儳顕粔鍫曟⒑闂堟侗鐓紒鐘冲灴濡嫬顓兼径瀣ф嫼闂佽崵鍠愬妯何ｆ繝姘厵闁惧浚鍋撻懓鎸庮殽閻愭彃鏆ｆ鐐叉椤︽挳鏌￠崱妤侇棦闁哄苯绉烽¨渚€鏌涢幘瀵搞€掓俊鍙夊姇閳诲酣骞樼€电濮搁柣搴＄畭閸庡崬螞瀹€鍕闁惧繐婀辩壕钘夈€掑顒佹悙闁诲繆鍓濈换娑㈠矗婢规繍浜崺銏狀吋婢跺﹤鑰垮┑鐐村灦閻熝囧储閽樺鏀介幒鎶藉磹閹剧粯鍤勯柛顐ｆ礃閸庢鈧厜鍋撻柛鏇ㄥ墰閸橀亶姊洪崷顓炲妺闁圭鎽滅划顓㈠箳濡や胶鍘撻柣鐘叉处閻擄繝宕ｉ崟顒夋闁绘劕寮堕崰妯汇亜閵忊槅娈滅€规洘甯掗…銊╁川椤撶姰鍋婇梻鍌氬€搁崐宄懊归崶顒夋晪鐟滄柨鐣峰▎鎾村仼鐎光偓閳ь剛绮堟繝鍥ㄧ厱闁斥晛鍟伴埥澶岀磼閳ь剟宕奸悢铏诡啎闂佺懓鐡ㄩ悷銉╂倶椤忓牊鐓曢幖绮规闊剟鏌＄仦鍓ф创妞ゃ垺娲熼幃鈺呭箵閹烘埈娼ラ梻鍌欑劍婵炲﹪寮ㄩ柆宥呭瀭闁秆勵殔閽冪喐绻涢幋鐐冩艾危閸喐鍙忔俊銈傚亾闁绘妫欑€靛ジ骞囬鐘电槇濠电偛鐗嗛悘婵嗏枍濞嗘垹纾奸柣妯哄暱閻忓瓨绻濋埀顒佹媴缁洘鏂€闂佺粯顭堥婊冾啅閵夆晜鍊垫慨妯煎帶濞呭秹鏌熼姘辩劯妤犵偞甯掕灃濞达絽鎼獮宥嗕繆閻愵亜鈧牕煤閺嶎灛娑樷槈濮橆剙袣闂侀€炲苯澧摶鏍煟濮椻偓濞佳勭濠婂嫨浜滈柟瀛樼箥濡偓閻庢鍣崑濠傜暦閹烘埈鐓ラ柛鏇ㄥ亝閻庮參姊绘担鐟邦嚋缂佽鍊歌灋婵°倕鎷嬮弫鍌滄喐閻楀牆绗氶柍閿嬪浮閺屾稓浠﹂崜褎鍣梺绋跨箰閺堫剟濡甸崟顖氼潊闁绘瑥鎳撻崥顐︽倵鐟欏嫭绀冮柛銊ユ健閻涱噣宕堕鈧痪褔鎮规笟顖滃帨缂佽精椴哥换婵嬫偨闂堟稐娌梺鍓茬厛閸ㄨ泛鐣疯ぐ鎺戞嵍妞ゆ挾濮烽悞鍏肩節閵忥絾纭炬い鎴濇瀹曪綀绠涢弮鈧崣蹇斾繆閵堝倸浜惧┑鈽嗗亝椤ㄥ棝寮查懜鐢电瘈婵﹩鍘鹃崢浠嬫⒑閸濆嫬鈧湱鈧瑳鍥佸鎮╃紒妯煎幍闂佸憡鐟ラˇ浼村磹閹邦収娈介柣鎰▕閸庢棃鏌熼鐣屾噰鐎殿喖鐖奸獮瀣攽閸涱垳顦伴梻鍌氬€搁崐椋庢濮橆剦鐒界憸鏃堝箖瑜斿畷鍗灻归弶鎸庡枠妞ゃ垺鐩幃娆撳级閹存粎妫?
+                
                 builder.part("input_reference",
                     new ByteArrayResource(imageBytes) {
                         @Override
@@ -793,8 +955,11 @@ public class NewApiClient {
             // 2026-08-10 修复:优先用 task_id(NewAPI 真实任务 ID)而不是 id(任务包装 ID)。
             // 之前用 id,但 NewAPI /v1/videos/{id} 接口可能只认 task_id,导致后续 poll 一直 404,
             // 然后被 markFailed 误判任务不存在。
-            // NewAPI 兼容 OpenAI Sora API,这两个字段语义不同:id 是请求包装 ID,task_id 才是 NewAPI 内部真实任务 ID。
-            String taskId = response.path("task_id").asText(response.path("id").asText(""));
+            // 2026-08-14 FIX:按 v3.0 接口手册"用 id 字段轮询,不要用 task_id"修正:
+            //   id 是 NewAPI 中转站暴露给客户端的"请求 id",在 GET /v1/videos/{id} 时中转站做 ID 翻译,
+            //   同一个 token 创建 + 同一个 token 轮询时,**id 字段是中转站自身持久化的**,
+            //   而 task_id 是 aicoming 上游内部字段(中转站不暴露给客户端),用 task_id 轮询会 400 not_found。
+            String taskId = response.path("id").asText(response.path("task_id").asText(""));
             if (taskId.isEmpty()) {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI /v1/videos 响应格式错误, 缺少 id/task_id:" + response);
@@ -839,7 +1004,8 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.INVALID_PARAM, "prompt 不能为空");
         }
         log.info("[VIDEO-T2V] 文生视频: promptLen={}, options={}", prompt.length(), options);
-        return submitVideo(prompt, null, options).taskId();
+        SubmitResult r = submitVideo(prompt, null, options);
+        return r.taskId();
     }
 
     /**
@@ -869,7 +1035,8 @@ public class NewApiClient {
         }
         log.info("[VIDEO-MI2V] 多图生视频: promptLen={}, images={}, options={}",
             prompt.length(), valid.size(), options);
-        return submitVideo(prompt, valid, options).taskId();
+        SubmitResult r = submitVideo(prompt, valid, options);
+        return r.taskId();
     }
 
     /**
@@ -1278,84 +1445,170 @@ public class NewApiClient {
     }
 
     /**
-     * 调用 NewAPI 图片编辑接口（/v1/images/edits）
-     * 将用户引用的图片作为素材，结合提示词生成新图片。
-     * 使用 multipart/form-data 格式上传引用图片。
+     * 2026-08-13 FIX:多图生图 — 把所有参考图上传到 :8090/v1/assets,拿到 asset_url 数组,
+     * 提交 /v1/images/generations 用 {@code images: [...]} 数组字段。
      *
-     * @param prompt          生成提示词
-     * @param referenceImages 引用图片列表（base64 data URI 格式，如 data:image/png;base64,...）
+     * <p>依据 2026-08-13 18:38 实测:聚融中转站 /v1/images/generations 实际支持以下字段:
+     * <pre>
+     *   "images": ["asset://aic_人物id", "asset://aic_衣服id"]  # 推荐(数组)
+     *   "image":  ["url1","url2"]                                # 也支持(数组)
+     *   "image":  "url"                                          # 单图(降级)
+     * </pre>
+     * 实测 2 张 asset:// 图成功生成(上游 200, 2.2 MB 图片),耗时约 60s。
+     * client timeout 必须 ≥ 120s(实测 i2i 生成约 60s)。
+     *
+     * <p>流程:
+     *   (1) 遍历 referenceImages,每张 base64 → uploadAssetByMultipart → pollUntilActive
+     *   (2) POST /v1/images/generations body={model, prompt, images:[asset_url...], n:1}
+     *
+     * @param prompt          生成提示词(描述清楚每张参考图的角色: "图1穿图2的衣服...")
+     * @param referenceImages 引用图片列表(base64 data URI),至少 1 张;上游图应放第一张
      * @param size            图片尺寸
      * @param quality         图片质量
-     * @param style           图片风格
-     * @return 生成的图片（base64 data URI 格式或 URL）
+     * @param style           图片风格(中转站暂不识别, 仅留接口签名)
+     * @return 生成的图片(URL)
      */
     public String editImage(String prompt, List<String> referenceImages,
                             String size, String quality, String style) {
-        if (!checkHealth()) {
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 服务不可用，请稍后再试");
+        if (referenceImages == null || referenceImages.isEmpty()) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "editImage: referenceImages 为空");
         }
 
-        // 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳缍婇弻鐔兼⒒鐎靛壊妲紒鎯у⒔閹虫捇鈥旈崘顏佸亾閿濆簼绨奸柟鐧哥秮閺岋綁顢橀悙鎼闂侀潧妫欑敮鎺楋綖濠靛鏅查柛娑卞墮椤ユ艾鈹戞幊閸婃鎱ㄩ悜钘夌；闁绘劗鍎ら崑瀣煟濡崵婀介柍褜鍏涚欢姘嚕閹绢喖顫呴柍鈺佸暞閻濇洜绱撻崒姘偓鐑芥倿閿曚焦鎳屾繝鐢靛仜閹冲酣鎮ч幘鎰佹綎缂備焦蓱婵挳鏌涘☉姗堝伐闁哄棗鐗婄换娑㈠箻鐎靛壊鏆″銈冨妼閿曘倝鎮鹃悿顖樹汗闁圭儤绻冮弲婊堟⒑閸撴彃浜濈紒璇插閺佸秴鈽夐姀鈾€鎷洪梺闈╁瘜閸樺吋绂嶆ィ鍐╃厱闁瑰墽顥愭竟妯汇亜椤撶偞鍠橀柛鈺嬬節瀹曘劑顢欓幆褍绠洪梻鍌欑濠€閬嶅磻閹惧绠惧┑鐘叉祩閺佷焦淇婇妶鍕濞存粍绮嶉妵鍕箛闂堟稐绨绘繛瀛樼矌閸嬬喓妲?multipart 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐烘偡濠婂啰绠荤€殿喗濞婇弫鍐磼濞戞艾骞堟俊鐐€ら崢浠嬪垂閸偆顩叉繝闈涱儐閻撴洘绻涢崱妤冪缂佺姴顭烽弻锛勪沪缁嬪灝鈷夐悗鍨緲鐎氼噣鍩€椤掑﹦绉靛ù婊勭箞椤㈡瑩宕ㄩ娑欐杸闂佺粯鍔曞鍫曞煝閺囩伝鐟邦煥閸愵亜鐓熼悗娈垮櫘閸嬪﹤鐣烽崼鏇ㄦ晢濞达絽鎼敮楣冩⒒婵犲骸浜滄繛璇х畱鐓ら柡宓嫭鐦庨梻鍌氬€风粈渚€骞夐敍鍕床闁告劦鍠撻埀顒€鍟换婵嬪磼閵堝棛绋佺紓鍌氬€烽悞锕傗€﹂崶顒佸仭鐟滅増甯楅悡鏇㈡煏婢跺鐏ラ柛鐘宠壘椤洭鎳￠妶鍥╋紳闂佺鏈悷褔藝閿斿浜滈柨鏇炲€烽幉鍓р偓娈垮櫘閸嬪棝骞忛悩缁樺殤妞ゆ帊鐒﹂鏇㈡⒒娴ｅ憡鎯堟繛灞傚灲瀹曞綊宕烽鐘辩瑝闂佹寧绻傞ˇ浼存偂閵夆晜鐓涢柛鎰╁妼閳ь剛鎳撻埢宥夊即閵忥紕鍘卞┑鈽嗗灡鐎笛囁夋径鎰厓閻熸瑥瀚悘锔筋殽閻愯韬柡灞剧⊕缁绘繈宕橀妸銉綒闁诲氦顫夊ú姗€宕归崸妤冨祦婵☆垵鍋愮壕鍏间繆椤栨粌甯舵鐐搭殕缁绘繂顕ラ柨瀣凡闁逞屽墯閸旀瑥鐣烽幋锕€绠荤紓浣诡焽閸欏棝姊洪崫鍕闁挎岸鏌涢弮鎾愁洭闁?
-        // 2026-08-13 FIX: WebClient multipart -> RestTemplate multipart (avoid chunked encoding issue)
-        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-
-        // 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄闁挎繂妫Λ鍕⒑閸濆嫷鍎庣紒鑸靛哺瀵鎮㈤崗灏栨嫽闁诲酣娼ф竟濠偽ｉ鍓х＜闁绘劦鍓欓崝銈嗙箾绾绡€鐎殿喖顭烽幃銏㈡偘閳ュ厖澹曢梺姹囧灪椤旀牠鎮炴ィ鍐ㄧ柈闁告縿鍎崇壕钘壝归敐鍡楃祷濞存粎鍋撶换婵嬫偨闂堟刀銏＄箾鐠囇呯暤闁诡噯绻濆畷姗€顢旈崨顓熺€炬繝鐢靛Т閿曘倝鎮ч崱娆戠焼闁割偆鍠愰崣蹇斾繆椤栨稑顕滅痪顓熷劤椤╁ジ宕ㄧ€涙ǚ鎷洪梺鍛婄☉閿曘儲寰勯崟顖涚厱闁靛鍊曞畵鍡欌偓瑙勬穿缁绘繈鐛惔銊﹀殟闁靛／鍐ㄧ疄闂傚倷鐒﹂弸濂稿疾濞戙垹绐楁慨姗嗗厴閺嬫棃鏌￠崘锝呬壕闂侀潧娲ょ€氼垳绮诲☉銏℃櫜闁告洦鍨版禒鎰版⒒娴ｅ憡鎯堥柡鍫墰缁瑩骞嬮敃鈧悡婵嬪箹濞ｎ剙鈧鎮块埀顒勬⒑閸濆嫭宸濆┑顖ｅ弮瀹曨垳鈧綆鍠楅埛鎺懨归敐鍛暈闁诡垰鐗撻弻锝夘敇閻戝棙楔缂備浇浜崑鐐电箔閻旂厧鐒垫い鎺戝閸嬫ɑ銇勯弴妤€浜鹃悗瑙勬礀閻栧ジ銆佸Δ浣哥窞閻庯綆鍋呴悵婊勭節閻㈤潧浠╅柟娲讳簽瀵板﹪宕稿Δ鈧粻鐘绘煙閹规劦鍤欑紒鈧崼銉︾厱妞ゎ厽鍨垫禍鐐电磼閳锯偓閸嬫挾绱撴担绋库挃濠⒀勵殙閹筋偄顪冮妶搴′簻闁挎洦浜璇测槈濮橈絽浜鹃柨婵嗙凹缁ㄥジ鏌涢妶鍛枠闁哄备鍓濋幏鍛矙閹稿孩顔掑┑鐘愁問閸犳帡宕戦幘缁樷拺闂傚牊绋撴晶鏇㈡煙閾忣偅宕屾鐐搭殜瀵挳鎮欓埡鍌涙澑闂備胶绮崝鏍ь焽濞嗘挻鍊堕柣鏂垮悑閻撴洟鏌曟繛褍瀚▓宀勬⒑鏉炴壆璐伴柛锝忕到椤繒绱掑Ο璇差€撻梺鑽ゅ枛閸嬪﹪宕电€ｎ剛纾藉ù锝囩摂閸ゆ瑩鏌涙繝鍌涘仴闁绘侗鍠楃换婵嬪礃閳轰礁濡抽梻渚€娼ц墝闁瑰啿娲畷鎴﹀箻鐠囨彃鍞ㄩ梺闈涱焾閸庡磭绮ｉ悙鐑樷拺鐟滅増甯掓禍浼存煕濡粯鍊愭鐐茬箰鐓ゆい蹇撴噳閹锋椽姊婚崒姘卞闁哄懏鐩幆浣割煥閸喓鍘卞┑鈽嗗灡娴滀粙宕戦姀鈶╁亾鐟欏嫭纾搁柛銊ㄦ椤曪綁宕奸弴鐐电枃闂侀潧臎閸曨偅鐣俊鐐€ら崢褰掑礉閹存繄鏆︽慨妞诲亾妞ゃ垺妫冨畷鐔碱敇閻愯尙顔戦梻鍌欐祰椤曆呪偓娑掓櫊椤㈡瑩寮介鐐电崶濠电偞鍨崺鍕极鐎ｎ剚鍠愰柡鍐ㄧ墕閺勩儵鏌曟径娑氱暠缂佸墎鍋涢埞鎴︽倷椤忓嫮浼勯梺鍝ュУ閻楃姴顕ｆ繝姘╃憸澶愬磻閹剧粯鏅查幖绮光偓鍐茬闂備胶顭堥鍡涘箰閼姐倖宕叉繝闈涙－濞尖晜銇勯幘妤€瀚峰Λ鍛攽閿涘嫬浜奸柛濠冪墵瀹曟繈骞嬮敃鈧崹鍌炴煟閹寸伝顏嗘閻愮儤鐓曢柡鍥ュ妼閻忥繝鏌ｉ幘瀵告噰闁哄本绋戦埥澶婎潨閸喐鏆伴梺璇茬箰妤犲繑淇婇崶顒€鐒垫い鎺戝枤濞兼劖绻涢崣澶涜€跨€规洖缍婂畷绋课旈崘銊с偊婵犳鍠楅妵娑㈠磻閹剧粯鐓熸繛鎴濆船閺嬬喓鈧灚婢樼€氭澘鐣烽妸锔剧瘈闁告洦鍓涚粙渚€姊婚崒姘偓鎼佸磹妞嬪海鐭嗗ù锝夋交閼板潡姊洪鈧粔瀵稿閸ф鐓忛柛顐ｇ箥濡叉悂鏌涢妸銉モ偓鍧楀蓟閵堝洨鐭欓悹鎭掑妺缁數绱?
-        body.add("model", "gpt-image-2-2k");
-        body.add("prompt", prompt);
-        body.add("size", size != null ? size : "1024x1024");
-        if (quality != null) body.add("quality", quality);
-        if (style != null) body.add("style", style);
-        body.add("response_format", "b64_json");
-
-        // 解码 base64 引用图片并添加为 multipart 文件
-        int imgIndex = 0;
-        for (String dataUri : referenceImages) {
-            try {
-                byte[] imageBytes = decodeDataUri(dataUri);
-                String mimeType = getMimeTypeFromDataUri(dataUri);
-                String ext = mimeType.equals("image/jpeg") ? ".jpg" : ".png";
-                final int currentIdx = imgIndex;
-
-                // gpt-image 婵犵數濮烽弫鍛婃叏閻戣棄鏋侀柛娑橈攻閸欏繘鏌ｉ幋锝嗩棄闁哄绶氶弻娑樷槈濮楀牊鏁鹃梺鍛婄懃缁绘﹢寮婚敐澶婄婵犲灚鍔栫紞妤呮⒑闁偛鑻晶顕€鏌涙繝鍌涘仴妤犵偞鍔栫换婵嬪礃椤忓棗楠勯梻浣稿暱閹碱偊顢栭崶鈺冪煋妞ゆ棃鏁崑鎾舵喆閸曨剛锛橀梺鍛婃⒐閸ㄧ敻顢氶敐澶婇唶闁哄洨鍋熼鍝勨攽閻樼粯娑ч柣妤€鍟村畷鎴﹀箻濞茬粯鏅ｉ梺缁樺灥濡瑧鈧潧鐭傚娲濞戞艾顣洪梺纭呮珪閸旀鍒掔紒妯侯嚤閻庢稒顭囬崢钘夆攽鎺抽崐鎰板磻閹剧繝绻嗘い鎰剁悼缁犵偞顨ラ悙鎻掓殻闁诡喗鐟╁畷顐﹀礋椤愩倐鍋撻鐑嗘富闁靛牆妫楁慨澶娾攽椤旇偐锛嶉柤楦块哺缁绘繂顫濋娑欏闂備浇宕甸崰鎾存櫠濡ゅ懎绠氶柛顐ゅ枍缁诲棙銇勯幇鍓佺У婵炲牊娲滅槐鎺楀磼濮樻瘷褏鈧娲樼划蹇浰囩€靛摜妫柟顖嗕礁浠梺鍝勬湰閻╊垶鐛Ο浣曟棃鍩€椤掆偓铻炴繛鍡樻惄閺佷焦淇婇妶鍛櫤闁抽攱鍨块弻娑樷槈濮楀牆濮涢梺鐟板暱閸熸挳寮诲☉銏″亜闁告稑锕︾粙鍥⒑娴兼瑧鍒伴柛銏ｅ皺閸欏懎顪冮妶鍛閻庢凹鍣ｅ畷婵嬫晝閳ь剟鈥旈崘顔嘉ч柛鈩冾殘閻熸劙姊婚崒姘仼缂佸鏁哥划瀣吋閸滀胶鍙嗛梺鍓插亞閸犳捇宕㈤悽鍛娾拺缂備焦锚閻忥箓鏌ㄥ鑸电厽闊洤顑呴崝锕傛煛鐏炵晫啸妞ぱ傜窔閺屾盯骞橀弶鎴濇懙濡ょ姷鍋涢崯鏉戠暦閹烘埈娼╅弶鍫涘妽椤旀洟姊绘笟鈧褏鎹㈤崱娑樼疇闁搞儺鍓欑壕濠氭煙閸撗呭笡闁稿鍔戦弻锝夊閵忕姳鍖栭梺閫炲苯澧柨鏇ㄤ邯瀵鈽夊锝呬壕闁挎繂楠告禍婵嬫倶韫囷絽寮柡灞界Ф缁辨帒螣鐠囪尙锛撻柣搴ゎ潐濞叉牜绱炴繝鍥モ偓浣糕枎閹炬潙浠奸柣蹇曞仩閸嬫劙骞愭径鎰拻闁稿本鑹鹃埀顒勵棑缁牊绗熼埀顒勭嵁婢舵劕鐏抽柟棰佺劍缂嶅酣鎮峰鍛暭閻㈩垱甯″畷褰掑磼閻愬鍘遍悷婊冮叄閵嗗啴宕ㄩ幍顔绢啍濠电姷鏁搁崑鐘诲箵椤忓棗绶ら悹鎭掑妽閸忔粓鎮规潪鎵Э闁挎繂顦柋鍥煟閺傚灝顣崇紒鐘宠壘椤啴濡堕崱娆忊拡闂佺顑囬崑銈咁嚕椤愶絾缍囬柕濠忕导缁ㄨ顪冮妶鍡楀闁搞劏顕ч悺顓㈡⒒娴ｅ摜鏋冩い顐㈩樀瀹曞綊宕稿Δ鈧弰銉╂煏婢跺棙娅呮鐐灪娣囧﹪濡堕崨顓熸闂佸憡绻冮〃濠傤潖缂佹ɑ濯撮柛娑橈工閺嗗牓姊洪悡搴ｇШ缂佺姵鐗犻妴渚€寮介鐐茬獩闂佸搫顦伴崹鑸垫綇閸儲鈷戦悗鍦У閵嗗啴鎮规担鍦弨鐎殿喓鍔嶇粋鎺斺偓锝庡亞閸樿棄鈹戦埥鍡楃仴婵炲拑绲剧粋鎺戔槈閵忥紕鍘搁梺绯曗偓宕囩婵炲懎鎳橀弻宥囨喆閸曨偆浼屽銈冨灪閻熝囧箯閻樿绠甸柟鐑樻煟閸嬫牠姊虹拠鍙夊攭妞ゎ偄顦叅婵犻潧顑戠紞鏍ь熆鐠鸿櫣鐏辩紒鎲嬬畵閺岋綁鏁愰崨顖滀紘闂佹椿鍘介悷鈺呭蓟閻旇櫣鐭欓柛顭戝櫘閸斿鎮跺鍓хМ婵﹤顭峰畷鎺戔枎閹搭厽袦闂備礁婀遍埛鍫ュ磻閸℃瑥鍨濇繛鍡樺姉閻熷綊鏌嶈閸撴瑩鎮鹃悜钘夘潊闁挎稑瀚峰ù鍕煟鎼搭垳绉靛ù婊勭矒楠炲棝鎮欓悜妯衡偓鐢告煕韫囨搩妲稿ù婊堢畺濮婃椽宕ㄦ繝鍐槱闂佸憡鎸婚惄顖氱暦閵忋倖鐒肩€广儱妫岄幏娲⒑闂堚晛鐦滈柛妯哄悑缁傚秹鎮欓鍙ョ盎闂侀潧顭堥崕鏌ュ闯娴犲鐓冪憸婊堝礈濮樿埖鍤屽Δ锝呭暙鎼村﹪鏌＄仦璇插姉闁逞屽墾缁犳挸鐣烽崼鏇ㄦ晢濞达綁鏅茬花濠氭⒒娴ｄ警鐒剧紒缁樺姍閹啴鎮滈挊澶岊唵濠电偛妯婃禍婵嬪煕閹达附鐓曟繛鎴烇公閺€濠氭倶韫囨柨顥嬮柟鍙夋倐瀵爼宕归鑺ヮ唹缂傚倷绀侀崐鍝ョ矓閹绢喖鐓橀柟杈剧畱閻愬﹪鏌嶉崫鍕灓闁哥喎閰ｅ缁樻媴閸涘﹤鏆堥梺鑽ゅ枂閸庝絻妫熼柡澶婄墑閸斿秴鈻嶉悩缁樼厽闁靛繒濮甸崯鐐烘煟閹惧鎳勯柕鍥у瀵粙濡搁妶鍕劉闂佽瀛╅惌顕€宕￠幎钘夌闁割偅娲栭崘鈧銈嗘尵閸犳捇宕㈤崡鐐╂斀闁绘劖娼欓悘銉р偓瑙勬处閸撶喎顕ｉ幖浣肝у璺侯儑閸樺崬鈹戦濮愪粶闁稿鎸搁湁婵犲﹤鍟伴崺锝団偓娈垮枛椤兘寮幇鏉块唶闁靛繈鍨哄鎴︽⒒娴ｅ憡鎯堟繛灞傚姂瀹曟垵螣閻撳骸鐏婇梺鐓庢憸閺佸摜寮ч埀顒勬⒑閸愯尙娈遍柛瀣崌閺屾盯鍩勯崘锔跨凹闂佽鍎抽悡鍕償閵娿儳鍊為悷婊勭箞閻擃剟顢楅崒妤€浜鹃悷娆忓缁€鈧梺缁樼墪閵堟悂濡存担鑲濇梹鎷呴悷閭︹偓鎾绘⒑閸涘﹦绠撻悗姘煎墰缁鎮欓悜妯锋嫽婵炶揪绲块悺鏃堝吹濞嗘挻鐓曢柟瀵稿У濞呮洜绱掓潏鈺佷槐鐎规洖宕埥澶娢熺涵椋庡耿闂傚倷绀侀幉鈩冪瑹濡ゅ懎鍌ㄥΔ锝呭暙濮规煡鏌ㄩ弮鍫熸殰闁稿鎹囧畷妤佸緞婵犱礁顥氶梻鍌欑窔閳ь剛鍋涢懟顖涙櫠閹绢喗鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜閹烘绐楁慨姗嗗墻閻掍粙鏌熼柇锕€骞樼紒鐘荤畺閺屾稑鈻庤箛锝嗩€嗛梺鍏兼緲濞硷繝寮婚埄鍐╁缂佸瀵у▓缁樼節濞堝灝鏋撻柛瀣崌濮婃椽鎮欓挊澶婂Г闁诲繐绻戦悷褏鍒掔拠宸僵闁煎摜顣介幏娲偡濠婂懎顣奸悽顖涱殜閺佸秹鎮㈤崗鑲╁幗闂佺娅ｉ崑鐔兼偩閻㈢鍋撳▓鍨灍鐟滄澘鍟撮垾锕傚Ω閳轰礁绐涘銈嗙墬缁絿妲愰崘娴嬫斀闁绘劘鍩栬ぐ褏绱撳鍕槮妞ゎ厼娲╅ˇ褰掓煙椤旀枻鑰挎い銏℃瀹曞ジ鎮㈤崫鍕闂傚倷绶氬褔鎮ч崱姗嗘缂佸绨遍弸宥団偓骞垮劚濡瑩宕ｈ箛鎾斀闁绘ɑ褰冩禍鐐烘煟閹剧懓浜归柍褜鍓濋～澶娒哄Ο鍏兼殰闁圭儤顨呴悡婵嬪箹濞ｎ剙濡肩紒鐙呯稻缁绘繈妫冨☉娆欑礊闂佽瀛╅幐鍐差潖缂佹ɑ濯寸紒娑橆儏濞堫厼鈹戦悙宸殶闁稿繑锕㈤獮鍐倻閽樺顔呴梺鑺ッˇ顖滅玻濞戞﹩娓婚柕鍫濇婢ь剛绱掗濂稿弰鐎规洏鍨介、娑㈡倷缁瀚藉┑鐐舵彧缁插潡宕曢妶澶婂惞闁逞屽墮椤啴濡堕崱妯侯槱闂佸憡鐟ラ崯顐︽偩閻戣棄绠ｉ柨鏃囨娴滄粓姊虹粙璺ㄧ闁汇劎鍏橀獮鎰板礃椤旇В鎷洪梺鍛婄☉閿曘儲寰勯崟顖涚厱闁靛ň鏅欓幉楣冩煙椤斿厜鍋撻弬銉︻潔闂侀潧楠忕槐鏇㈠储闁秵鈷戦悷娆忓缁舵彃顭胯闁帮絽鐣峰璺虹骇婵☆偆鏁搁幊鎾烩€﹂妸鈺佺闁靛鍨虹€垫牜绱撻崒娆愮グ濡炲瓨鎮傞獮鎰節濮橆剛顔嗛梺鍛婄☉閻°劑骞嗛悙鐑樼厽闁绘梻顭堥ˉ瀣亜閹邦兙鍋㈡慨濠勭帛閹峰懘宕崟顐⑿曢梻浣告惈閹冲寮查悩鑼殾閻熸瑥瀚閬嶆倵濞戞顏呯婵傚憡鈷戠紓浣姑悘杈ㄤ繆椤愩垹顏柡灞筋儔瀹曞爼顢楁担鍝勫箰闂備焦鎮堕崕顖炲磿鏉堛劋绻嗗ù鐘差儐閻撴盯鏌涘☉鍗炰簻闁诲浚浜炵槐鎺旂磼濡皷濮囧┑鐐靛帶缁绘ê鐣峰鍡╂Ь閻炴熬绠撳缁樻媴閸涘﹥鍎撻梺纭呮珪閹哥偓绂嶇粙搴撴瀻闁瑰鍎愬?image 闂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌熼梻瀵割槮缁炬儳婀遍埀顒傛嚀鐎氼參宕崇壕瀣ㄤ汗闁圭儤鍨归崐鐐差渻閵堝棗绗掓い锔垮嵆瀵煡顢旈崼鐔蜂画濠电姴锕ら崯鎵不婵犳碍鐓曢柍瑙勫劤娴滅偓淇婇悙顏勨偓鏍暜婵犲洦鍤勯柛顐ｆ礀閻撴繈鏌熼崜褏甯涢柣鎾寸洴閺屾稑鈽夐崡鐐寸亾缂備胶濮甸敃銏ゅ蓟濞戙垹绠抽柟鎯х－閻熴劑姊虹€圭媭鍤欓梺甯秮閻涱喖螣閾忚娈鹃梺鎼炲劥濞夋盯寮挊澶嗘斀闁绘ɑ顔栭弳婊呯磼鏉堛劍绀嬬€规洘鍨甸埥澶愬閳ュ啿澹勯梻浣虹帛閸ㄧ厧螞閸曨厼顥氬┑鐘崇閻撴瑩鏌熺憴鍕Е闁搞倖鐟х槐鎺楀焵椤掑嫬绀冮柍鐟般仒缁ㄥ姊洪崫鍕殭闁稿﹤鎽滈弫顕€宕奸弴鐔哄幘闂佸搫顦冲▔鏇熺閵忋倖鐓冮悷娆忓閻忔挳鏌熼鐣屾噰鐎殿喖鐖奸獮瀣偐鏉堚晝顦ㄥ┑鐘殿暜缁辨洟宕戝☉銏″仱闁靛ň鏅涚粻鏍煕鐏炴儳鍤柛?
-                // 2026-08-13 FIX: LinkedMultiValueMap.add 返回 void,不能链式 .contentType()
-                // RestTemplate 也不需要显式 contentType(用 application/octet-stream 默认即可)
-                body.add("image", new ByteArrayResource(imageBytes) {
-                    @Override
-                    public String getFilename() {
-                        return "reference_" + currentIdx + ext;
+        // 1) 把所有参考图(base64)上传到 :8090 素材库,拿到 asset_url 数组
+        //    2026-08-14 FIX:支持失败回滚(上传成功的 asset_id 在异常时全部删除)+ 1 次重试,
+        //    解决 aicoming 素材库配额满(403 asset_quota_exceeded)导致多图换装失败的 bug。
+        java.util.List<String> assetUrls = new java.util.ArrayList<>(referenceImages.size());
+        java.util.List<String> uploadedAssetIds = new java.util.ArrayList<>(referenceImages.size());
+        BusinessException lastException = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            assetUrls.clear();
+            uploadedAssetIds.clear();
+            boolean allOk = true;
+            for (int idx = 0; idx < referenceImages.size(); idx++) {
+                String dataUri = referenceImages.get(idx);
+                byte[] bytes;
+                String mime;
+                try {
+                    bytes = decodeDataUri(dataUri);
+                    mime = getMimeTypeFromDataUri(dataUri);
+                } catch (Exception e) {
+                    allOk = false;
+                    lastException = new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                        "editImage: 解码参考图 #" + (idx + 1) + " 失败: " + e.getMessage());
+                    break;
+                }
+                String ext = (mime != null && mime.contains("jpeg")) ? ".jpg" : ".png";
+                String filename = "edit_" + idx + "_" + System.currentTimeMillis() + ext;
+                try {
+                    JsonNode raw = aicomingAssetsClient.uploadAssetByMultipart(
+                        bytes, filename, mime, "edit-image-input");
+                    String assetId = raw.path("id").asText("");
+                    if (assetId.isEmpty()) {
+                        allOk = false;
+                        lastException = new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                            "editImage: 参考图 #" + (idx + 1) + " 上传未返回 id: " + raw);
+                        break;
                     }
-                });
-                imgIndex++;
-            } catch (Exception e) {
-                log.warn("编辑第{}张图片失败: {}", imgIndex, e.getMessage());
-                imgIndex++;
+                    // 等素材入库到 active 状态(否则下游 image=asset://xxx 会被中转站 400)
+                    JsonNode active = aicomingAssetsClient.pollUntilActive(assetId, 60, 3);
+                    String assetUrl = active.path("asset_url").asText("");
+                    if (assetUrl.isBlank()) {
+                        allOk = false;
+                        lastException = new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+                            "editImage: 参考图 #" + (idx + 1) + " 入库后未返回 asset_url: " + active);
+                        break;
+                    }
+                    assetUrls.add(assetUrl);
+                    uploadedAssetIds.add(assetId);
+                    log.info("editImage: 参考图 #{} 入库: asset_url={}", idx + 1, assetUrl);
+                } catch (BusinessException e) {
+                    allOk = false;
+                    lastException = e;
+                    log.error("editImage: 上传参考图 #{} 到素材库失败 (attempt {}/2): {}",
+                        idx + 1, attempt, e.getMessage());
+                    break;
+                }
+            }
+            if (allOk) {
+                // 全部上传成功,跳出重试循环
+                break;
+            }
+            // 上传失败,回滚本轮已上传成功的素材(避免占配额)
+            for (String aid : uploadedAssetIds) {
+                try {
+                    boolean deleted = aicomingAssetsClient.deleteAsset(aid);
+                    log.info("editImage: 回滚删除素材: id={}, deleted={}", aid, deleted);
+                } catch (Exception ignore) {
+                    log.warn("editImage: 回滚删除素材失败: id={}, err={}", aid, ignore.getMessage());
+                }
+            }
+            if (attempt == 2) {
+                // 第 2 次仍失败,抛出最后一次异常
+                log.error("editImage: 上传参考图失败,已重试 2 次,放弃");
+                throw lastException != null
+                    ? lastException
+                    : new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "editImage: 素材上传失败");
+            }
+            // 第 1 次失败,稍等 2s 让服务端处理配额/限流,再重试
+            log.warn("editImage: 第 1 次上传失败,等待 2s 后重试 (剩余配额大概率已回滚)");
+            try {
+                Thread.sleep(2000L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "editImage: 重试被中断");
             }
         }
 
-        if (imgIndex == 0) {
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "引用图片解码失败，无法进行图片编辑");
+        // 2) 构造 /v1/images/generations JSON body
+        //    2026-08-14 v5:按 v3.0 接口手册 §5.4 多图输入格式"实测过"的规范:
+        //      - image: [...] JSON 数组(单字段多图,中转站自动翻译成 images: [{image_url:...}])
+        //      - 单图场景:image 单字符串(降级兼容)
+        //      - prompt 用"图1是主图,图2是参考图"自然语言引用
+        //    08-13 18:38 实测:2 张 asset:// 图成功生成(2.2MB),client timeout ≥ 120s
+        Map<String, Object> body = new HashMap<>();
+        body.put("model", "gpt-image-2-1k");
+        body.put("prompt", prompt == null ? "" : prompt);
+        // 多图场景用 image: [...] 数组(单字段多图,不是 images: [...])
+        if (assetUrls.size() == 1) {
+            body.put("image", assetUrls.get(0));
+        } else {
+            body.put("image", assetUrls);  // ★ v3.0 §5.4:用 image 字段+数组,中转站自动翻译
         }
+        body.put("n", 1);
+        body.put("size", (size != null && !size.isBlank()) ? size : "1024x1024");
+        if (quality != null && !quality.isBlank()) {
+            body.put("quality", quality);
+        }
+        // style 字段中转站不识别, 暂不传
 
-        log.info("NewAPI /v1/images/edits: promptLen={}, refImageCount={}", prompt.length(), imgIndex);
+        log.info("NewAPI /v1/images/generations: promptLen={}, refCount={}, size={}",
+            prompt == null ? 0 : prompt.length(), assetUrls.size(), body.get("size"));
 
+        // 3) POST /v1/images/generations (application/json)
+        //    2026-08-13 FIX:实测 i2i 生成约 60s,client timeout 必须 ≥ 120s,
+        //    这里设 180s 留余量。
         try {
-            // 2026-08-13 FIX: 用 RestTemplate 替换 WebClient,避免 Transfer-Encoding: chunked 400
-            RestTemplate editRestTemplate = new RestTemplate();
-            // 设置 10 分钟 timeout
-            editRestTemplate.getMessageConverters().stream()
-                .filter(c -> c instanceof org.springframework.http.converter.FormHttpMessageConverter)
+            // 显式设 connect/read timeout,默认 RestTemplate 用 JRE URLConnection 无超时
+            org.springframework.http.client.SimpleClientHttpRequestFactory factory =
+                new org.springframework.http.client.SimpleClientHttpRequestFactory();
+            factory.setConnectTimeout(30_000);   // 30s 建连超时
+            factory.setReadTimeout(180_000);     // 180s 读超时(i2i 实测 ~60s)
+            RestTemplate imgRestTemplate = new RestTemplate(factory);
+            imgRestTemplate.getMessageConverters().stream()
+                .filter(c -> c instanceof org.springframework.http.converter.StringHttpMessageConverter)
                 .findFirst()
-                .ifPresent(c -> ((org.springframework.http.converter.FormHttpMessageConverter) c)
-                    .setCharset(java.nio.charset.StandardCharsets.UTF_8));
+                .ifPresent(c -> ((org.springframework.http.converter.StringHttpMessageConverter) c)
+                    .setDefaultCharset(java.nio.charset.StandardCharsets.UTF_8));
 
             HttpHeaders headers = new HttpHeaders();
-            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+            headers.setContentType(MediaType.APPLICATION_JSON);
             headers.set("Authorization", "Bearer " + token);
 
-            HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
+            HttpEntity<String> requestEntity = new HttpEntity<>(
+                objectMapper.writeValueAsString(body), headers);
 
-            ResponseEntity<String> respEntity = editRestTemplate.exchange(
-                baseUrl + "/v1/images/edits",
+            ResponseEntity<String> respEntity = imgRestTemplate.exchange(
+                baseUrl + "/v1/images/generations",
                 HttpMethod.POST,
                 requestEntity,
                 String.class
@@ -1366,48 +1619,36 @@ public class NewApiClient {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "Image edit returned empty body");
             }
 
-            JsonNode response = new ObjectMapper().readTree(respBody);
+            JsonNode response = objectMapper.readTree(respBody);
 
             if (response == null) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑返回为空（响应为 null）");
+                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑返回为空(响应为 null)");
             }
 
-            // 打印响应结构用于调试
             java.util.List<String> topFields = new java.util.ArrayList<>();
             response.fieldNames().forEachRemaining(topFields::add);
             log.info("NewAPI editImage 响应字段: {}", topFields);
 
-            // 解析响应（与 generateImage 相同的逻辑）
-            if (!response.has("data")) {
-                if (response.has("url") && response.get("url").isTextual()) {
-                    return response.get("url").asText();
-                }
-                if (response.has("b64_json") && response.get("b64_json").isTextual()) {
-                    return "data:image/png;base64," + response.get("b64_json").asText();
-                }
+            // 4) 解析响应(data[0].url / b64_json / error)
+            if (!response.has("data") || !response.get("data").isArray()
+                || response.get("data").size() == 0) {
                 String errMsg = response.has("error") ? response.get("error").toString() : "未知错误";
-                log.error("NewAPI editImage 返回错误: {}, 完整响应: {}", errMsg, response.toString());
+                log.error("NewAPI editImage 返回错误: {}, 完整响应: {}", errMsg, response);
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 返回错误: " + errMsg);
             }
 
-            JsonNode dataArray = response.get("data");
-            if (!dataArray.isArray() || dataArray.size() == 0) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑 data 数组为空");
-            }
-
-            JsonNode first = dataArray.get(0);
+            JsonNode first = response.get("data").get(0);
             java.util.List<String> firstFieldNames = new java.util.ArrayList<>();
             first.fieldNames().forEachRemaining(firstFieldNames::add);
             log.info("NewAPI editImage data[0] 字段: {}", firstFieldNames);
 
-            // 检查 b64_json
+            // 优先 b64_json
             if (first.has("b64_json") && first.get("b64_json").isTextual()) {
                 String b64Data = first.get("b64_json").asText();
                 log.info("NewAPI editImage OK (b64_json): b64Len={}", b64Data.length());
                 return "data:image/png;base64," + b64Data;
             }
-
-            // 检查 URL 字段
+            // 其次 url
             String[] urlFields = {"url", "image_url", "imageUrl"};
             for (String field : urlFields) {
                 if (first.has(field) && first.get(field).isTextual()) {
@@ -1422,10 +1663,10 @@ public class NewApiClient {
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                 "NewAPI data[0] 缺少字段:" + firstFieldNames);
         } catch (Exception e) {
-            // 2026-08-13 FIX: 用 instanceof pattern matching,避免 throw e 编译错误 (Java 21 严格)
             if (e instanceof BusinessException be) throw be;
             if (e instanceof org.springframework.web.client.HttpClientErrorException he) {
-                log.error("NewAPI /v1/images/edits failed: {} {}", he.getStatusCode(), he.getResponseBodyAsString());
+                log.error("NewAPI /v1/images/generations failed: {} body={}",
+                    he.getStatusCode(), he.getResponseBodyAsString());
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                     "NewAPI 调用失败:" + he.getStatusCode() + " " + he.getStatusText());
             }
@@ -1434,11 +1675,7 @@ public class NewApiClient {
         }
     }
 
-    /**
-     * 从 base64 data URI 中解码图片字节
-     * 支持格式：data:image/png;base64,xxxx 或 data:image/jpeg;base64,xxxx
-     */
-    private byte[] decodeDataUri(String dataUri) {
+private byte[] decodeDataUri(String dataUri) {
         String base64Data;
         if (dataUri.startsWith("data:")) {
             // data:image/png;base64,xxxx
@@ -1911,7 +2148,11 @@ public class NewApiClient {
         }
         log.info("│  [NewAPI-DEBUG] 响应: fields=[{}]", collectFieldNames(response));
         log.info("│  [NewAPI-DEBUG] 响应 body(前 1000 字符): {}", response.toString().length() < 1000 ? response.toString() : response.toString().substring(0, 1000) + "...");
-        String taskId = response.path("task_id").asText(response.path("id").asText(""));
+        // 2026-08-14 FIX:按 v3.0 接口手册"用 id 字段轮询,不要用 task_id"修正。
+        //   之前 task_id 优先导致存到 job.comfyuiPromptId 的值,后续 @Scheduled 调
+        //   pollVideo(task_id) 拿到 400 task_not_exist → markFailed → 视频生成失败。
+        //   改:优先取 id 字段(task_id 仅作为兜底)。
+        String taskId = response.path("id").asText(response.path("task_id").asText(""));
         // 2026-08-13 18:30 修复:NewAPI 3000 中转站对部分模型(如 doubao-seedance-2.0)返回
         //   {"id":"none", "task_status":"submitted", ...} 占位响应。
         //   "none" 字符串非空,会被误当成真 taskId 存到 job,后续 poll 404。
