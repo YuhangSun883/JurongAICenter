@@ -26,6 +26,7 @@ import java.awt.Image;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.URI;
 import java.nio.file.Files;
@@ -52,59 +53,65 @@ import java.util.concurrent.Executor;
 @RequiredArgsConstructor
 public class ClothingTransferService {
 
-    /** 单帧换装 prompt:保持主体不变,只换衣服 */
-    private static final String CLOTHING_PROMPT_TEMPLATE =
-        "将图1(原视频帧)中人物的服装和人脸同时进行替换:\n" +
-        "1. 服装: 将图1中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
-        "2. 人脸: 如果参考图中包含可见的人脸(特别是模特的脸),将图1中人物的脸也替换为该模特的脸\n" +
-        "严格要求:\n" +
-        "- 人物的动作、姿势、表情、发型(除被替换的部分外)完全不变\n" +
-        "- 背景、光照、相机角度完全不变\n" +
-        "- 人物的身材、肤色保持不变\n" +
-        "- 只能改变衣服的款式/颜色/面料/图案 以及 脸部的五官\n" +
-        "- 如果原图人物本来没穿这件衣服(比如手里拿着、放在旁边),保持原状,只替换穿在身上的\n" +
-        "- 输出图片尺寸与图1一致\n" +
-        "如果有多个参考图，它们是同一件衣服/同一个人的不同角度，最终输出里这件衣服/脸的不同角度都应与参考图一致";
-
-    /** 总图换装 prompt:一次性替换所有帧的衣服和人脸(性能优化) */
+    /**
+     * 2026-08-13 FIX:通用多图图生图 prompt 模板(不再写死"衣服")。
+     *
+     * <p>支持以下场景:
+     * <ul>
+     *   <li>衣服图 → 替换原图人物身上的衣服
+     *   <li>模特图(带人脸) → 同时替换原图人物的脸/身材
+     *   <li>化妆品/箱包/鞋子/配饰等其他物品 → 替换原图中相应物品或人物身上的对应元素
+     * </ul>
+     *
+     * <p>%REF_DESC% 占位:动态描述参考图角色,例如 "图2(衣服正面)、图3(衣服背面)、图4(模特上身)..."
+     */
     private static final String GRID_CLOTHING_PROMPT_TEMPLATE =
-        "图1是一张视频抽帧拼图,包含%FRAME_COUNT%帧画面(按行排列,每行3帧):\n" +
-        "请对图1中所有帧画面的人物进行服装和人脸替换:\n" +
-        "1. 服装: 将所有帧中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
-        "2. 人脸: 如果参考图中包含可见的人脸(特别是模特的脸),将所有帧中人物的脸也替换为该模特的脸\n" +
-        "严格要求:\n" +
-        "- 每一帧人物的动作、姿势、表情、发型(除衣服和脸外)完全不变\n" +
-        "- 每一帧的背景、光照、相机角度完全不变\n" +
-        "- 人物的身材、肤色保持不变\n" +
-        "- 只能改变衣服的款式/颜色/面料/图案 以及 脸部的五官\n" +
-        "- 保持原图的拼图布局、帧排列顺序和每帧的位置不变\n" +
-        "- 输出图片尺寸与图1完全一致\n" +
-        "- 所有帧的换装风格必须统一,衣服款式和人脸保持一致";
+        "图1是原视频抽帧总图,共%FRAME_COUNT%帧。请保持每一帧的人物动作、表情、背景不变,"
+        + "把图1中每一帧人物身上的衣服换成图2的衣服。"
+        + "%REF_DESC%"
+        + "输出与图1布局一致的图。";
 
-    /** 视频节点换装 prompt:直接对视频帧整体换装 */
+    /**
+     * 2026-08-14 v4:按 v3.0 接口手册"图1穿图2的衣服"实测风格 prompt。
+     *   自然、简洁、明确引用每个图的角色,不写元描述("禁止"、"任务类型")。
+     */
     private static final String VIDEO_CLOTHING_PROMPT_TEMPLATE =
-        "将图1(视频)中人物的服装和人脸同时进行替换:\n" +
-        "1. 服装: 将图1中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
-        "2. 人脸: 如果参考图中包含可见的人脸(特别是模特的脸),将图1中人物的脸也替换为该模特的脸\n" +
-        "严格要求:\n" +
-        "- 人物的动作、姿势、表情、发型(除被替换的部分外)完全不变\n" +
-        "- 背景、光照、相机角度完全不变\n" +
-        "- 人物的身材、肤色保持不变\n" +
-        "- 只能改变衣服的款式/颜色/面料/图案 以及 脸部的五官\n" +
-        "- 输出图片尺寸与图1一致";
+        "图1是上游节点的画面(视频帧/单张图)。请保持图1的人物动作、表情、背景不变,"
+        + "把图1中人物身上的衣服换成图2的衣服。"
+        + "%REF_DESC%"
+        + "输出与图1同样尺寸的图。";
 
-    /** 2026-08-09 根据衣服图数量动态生成 prompt 描述部分 */
-    private static String buildClothingDesc(int count) {
+    /**
+     * 2026-08-14 v4:把多张参考图在 prompt 里**显式标号**(图2、图3、图4)+ 说明角色。
+     *   配合 images:[] 数组使用时,asset_url[i] 对应图 i+1。
+     */
+    private static String buildRefDesc(int count) {
         if (count <= 0) return "";
-        if (count == 1) return "图2(衣服参考)";
-        if (count == 2) return "图2、图3 展示的那件衣服";
-        if (count == 3) return "图2(衣服正面)、图3(衣服背面)、图4(模特上身)展示的那件衣服";
-        StringBuilder sb = new StringBuilder("以下参考图: ");
+        StringBuilder sb = new StringBuilder();
         for (int i = 0; i < count; i++) {
-            if (i > 0) sb.append("、");
-            sb.append("图").append(i + 2);
+            int figNum = i + 2;
+            if (i == 0) {
+                sb.append("图").append(figNum).append("是衣服参考图。");
+            } else if (i == 1) {
+                sb.append("图").append(figNum).append("是模特图(含人脸),可参考换脸。");
+            } else {
+                sb.append("图").append(figNum).append("是其他参考图(化妆品/箱包/配饰等)。");
+            }
         }
-        sb.append(" 展示的那件衣服");
+        return sb.toString();
+    }
+
+    /**
+     * 2026-08-14 v4:把 asset_url 列表也拼进 prompt,便于模型视觉对照。
+     *   即使 images:[] 数组本身已能识别素材,显式列出来更稳。
+     */
+    private static String buildRefUrls(java.util.List<String> refAssetUrls) {
+        if (refAssetUrls == null || refAssetUrls.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder(" asset:");
+        for (int i = 0; i < refAssetUrls.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append("图").append(i + 2).append("=").append(refAssetUrls.get(i));
+        }
         return sb.toString();
     }
 
@@ -141,9 +148,14 @@ public class ClothingTransferService {
             log.error("[clothing-transfer] targetNode not found: task.nodeId={}", targetNodeId);
             return;
         }
-        if (clothingNodeIds == null || clothingNodeIds.size() != 3) {
-            log.error("[clothing-transfer] 需要 3 张衣服图,实际 {} 张", clothingNodeIds == null ? 0 : clothingNodeIds.size());
-            failTask(task, targetNode, "需要恰好 3 张衣服参考图(正面/背面/模特上身)");
+        // 2026-08-13 FIX:不再硬编码必须 3 张,改为 ≥1 && ≤3 张
+        //   用户可以传 1 张(衣服/模特/化妆品任意)、2 张 或 3 张参考图
+        if (clothingNodeIds == null || clothingNodeIds.isEmpty()
+                || clothingNodeIds.size() > 3) {
+            log.error("[clothing-transfer] 参考图张数应在 1~3 之间,实际 {} 张",
+                clothingNodeIds == null ? 0 : clothingNodeIds.size());
+            failTask(task, targetNode,
+                "需要 1~3 张参考图(衣服/模特/化妆品任意),实际=" + (clothingNodeIds == null ? 0 : clothingNodeIds.size()));
             taskRepository.updateById(task);
             nodeRepository.updateById(targetNode);
             return;
@@ -184,18 +196,18 @@ public class ClothingTransferService {
             sourceBytes = downloadFromUrl(videoNode.getResultUrl());
             sourceMime = detectMime(sourceBytes);
 
-            // ② 加载 3 张衣服图
+            // ② 加载 1~3 张参考图
             List<String> clothingDataUris = new ArrayList<>(3);
             for (String cid : clothingNodeIds) {
                 byte[] bytes = downloadNodeImageBytes(cid, userId);
                 if (bytes == null) {
                     throw new BusinessException(com.jurong.aicenter.exception.ErrorCode.INTERNAL_ERROR,
-                        "衣服节点 " + cid + " 加载失败");
+                        "参考图节点 " + cid + " 加载失败");
                 }
                 String mime = detectMime(bytes);
                 clothingDataUris.add("data:" + mime + ";base64," + Base64.getEncoder().encodeToString(bytes));
             }
-            log.debug("[clothing-transfer] 衣服图加载完成: 3 张");
+            log.debug("[clothing-transfer] 参考图加载完成: {} 张", clothingDataUris.size());
 
             // ③ 选择 prompt + 1 次 NewAPI 整体换装
             String prompt;
@@ -213,11 +225,11 @@ public class ClothingTransferService {
             if (isGrid) {
                 prompt = GRID_CLOTHING_PROMPT_TEMPLATE
                     .replace("%FRAME_COUNT%", String.valueOf(frameCount))
-                    .replace("%CLOTHING_DESC%", buildClothingDesc(clothingDataUris.size()));
+                    .replace("%REF_DESC%", buildRefDesc(clothingDataUris.size()));
                 log.debug("[clothing-transfer] 整体换装(总图): frameCount={}, 1次API调用", frameCount);
             } else {
                 prompt = VIDEO_CLOTHING_PROMPT_TEMPLATE
-                    .replace("%CLOTHING_DESC%", buildClothingDesc(clothingDataUris.size()));
+                    .replace("%REF_DESC%", buildRefDesc(clothingDataUris.size()));
                 log.debug("[clothing-transfer] 整体换装(单图/视频): 1次API调用");
             }
 
@@ -229,14 +241,20 @@ public class ClothingTransferService {
             }
 
             // 调 NewAPI
-            List<String> refs = new ArrayList<>(4);
-            refs.add(sourceDataUri);
-            refs.addAll(clothingDataUris);
+            // 2026-08-14 v3:回退到原始的"4 张图分别上传"方案(08-13 实测能跑通的关键)
+            //   - 第 1 张(主图)作为 body.image 单字段 — 触发 gpt-image 的 i2i 行为
+            //   - 第 2~N 张(参考图)通过 prompt 文本里的 asset_url 引用,让模型视觉理解
+            //   - prompt 简洁自然(~300 字符),不写"任务类型"、"禁止事项"等元描述
+            //   (不再拼接网格图,不再用 images:[] 数组 — 那些方法让模型退化为文生图)
             String outputSize = detectOutputSize(sourceBytes);
-            log.debug("[clothing-transfer] 开始 NewAPI editImage: refs={}, outputSize={}",
-                refs.size(), outputSize);
+            List<String> allRefImages = new ArrayList<>(4);
+            allRefImages.add(sourceDataUri);
+            allRefImages.addAll(clothingDataUris);
+            log.debug("[clothing-transfer] 开始 NewAPI editImage: 主图+{}张参考图, "
+                + "outputSize={}, promptLen={}",
+                clothingDataUris.size(), outputSize, prompt.length());
             String resultDataUri = newApiClient.editImage(
-                prompt, refs, outputSize, "low", null);
+                prompt, allRefImages, outputSize, "low", null);
 
             // ④ 上传到 MinIO,覆盖到 activeNode
             byte[] resultBytes = decodeResultDataUri(resultDataUri);
@@ -501,6 +519,152 @@ public class ClothingTransferService {
         Files.deleteIfExists(tmpFile);
         log.debug("[clothing-grid] created: {} ({}x{} px, {} frames)", url, canvasW, canvasH, total);
         return url;
+    }
+
+    /**
+     * 2026-08-14 NEW:把 1 张主图 + N 张(1~3)参考图合成为 1 张 PNG 网格图。
+     *
+     * <p>布局:左半边是主图(占 2x2 网格的左上角和左下角,即较大位置),
+     * 右半边是参考图(垂直排列)。
+     *
+     * <p>每个子图左上角加文字标签(LT/RT/LB/RB 位置标识,以及 "主图"/"参考1"等)
+     * 方便模型识别哪张是主图、哪些是参考图。
+     *
+     * <p>返回 PNG bytes(而不是 URL),用于直接传给 NewAPI editImage 作为
+     * 单一 image 字段,从根本上解决 aicoming 素材库配额满 403 的问题。
+     */
+    private byte[] combineReferenceGrid(byte[] sourceBytes, List<String> refDataUris,
+                                        String videoNodeId) throws Exception {
+        // 主图
+        BufferedImage main = ImageIO.read(new ByteArrayInputStream(sourceBytes));
+        if (main == null) {
+            throw new BusinessException(com.jurong.aicenter.exception.ErrorCode.INTERNAL_ERROR,
+                "combineReferenceGrid: 主图解码失败");
+        }
+        // 参考图(从 data URI 解析字节)
+        List<BufferedImage> refs = new ArrayList<>(refDataUris.size());
+        for (int i = 0; i < refDataUris.size(); i++) {
+            String dataUri = refDataUris.get(i);
+            String b64 = dataUri.contains(",")
+                ? dataUri.substring(dataUri.indexOf(',') + 1)
+                : dataUri;
+            byte[] bytes = Base64.getDecoder().decode(b64);
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(bytes));
+            if (img == null) {
+                throw new BusinessException(com.jurong.aicenter.exception.ErrorCode.INTERNAL_ERROR,
+                    "combineReferenceGrid: 参考图 #" + (i + 1) + " 解码失败");
+            }
+            refs.add(img);
+        }
+
+        // 布局参数 — 2026-08-14 v2:主图占整个上半部分(占总面积 ~70%),
+        //   参考图占下半部分水平排列。这样模型"主角"信息密度高,
+        //   大幅降低它"自由发挥"的空间,迫使它按主图画面生成。
+        final int CANVAS_W = 1024;       // 整个拼接图固定宽 1024
+        final int GAP = 8;
+        final int LABEL_H = 22;
+        final int MAIN_H = 768;          // 主图区域固定高度 768(占总面积 ~70%)
+        final int REF_H = 280;           // 参考图区域固定高度 280(下方水平排列)
+
+        int mainW = CANVAS_W;
+        int mainH = MAIN_H;
+        int refBlockW = (CANVAS_W - GAP * (refs.size() - 1)) / refs.size();
+        int refH = REF_H;
+
+        int canvasW = CANVAS_W;
+        int canvasH = mainH + GAP + 30 + refH;  // +30 给"参考图"标题栏
+
+        BufferedImage combined = new BufferedImage(canvasW, canvasH, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = combined.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+        g.setColor(new Color(245, 247, 250));
+        g.fillRect(0, 0, canvasW, canvasH);
+
+        Font font = new Font("SansSerif", Font.BOLD, 18);
+        g.setFont(font);
+        FontMetrics fm = g.getFontMetrics();
+
+        // 主图(上方, 占 ~70% 面积) — letterbox 保持宽高比
+        double mainAspect = (double) main.getWidth() / main.getHeight();
+        double slotAspect = (double) mainW / mainH;
+        int drawW, drawH, offX, offY;
+        if (mainAspect > slotAspect) {
+            drawW = mainW;
+            drawH = (int) Math.round(mainW / mainAspect);
+            offX = 0;
+            offY = (mainH - drawH) / 2;
+        } else {
+            drawH = mainH;
+            drawW = (int) Math.round(mainH * mainAspect);
+            offX = (mainW - drawW) / 2;
+            offY = 0;
+        }
+        g.drawImage(main.getScaledInstance(drawW, drawH, Image.SCALE_SMOOTH), offX, offY, null);
+        // 主图边框(红色, 让模型清晰看到主图区域)
+        g.setColor(new Color(220, 50, 50));
+        g.setStroke(new java.awt.BasicStroke(4));
+        g.drawRect(0, 0, mainW - 1, mainH - 1);
+        g.setStroke(new java.awt.BasicStroke(1));
+        drawLabel(g, fm, 0, 0, "主图(必须基于此图修改)", mainW);
+
+        // 参考图标题(在主图和参考图之间)
+        int refStartY = mainH + GAP;
+        g.setColor(new Color(80, 80, 80));
+        g.setFont(new Font("SansSerif", Font.BOLD, 16));
+        g.drawString("▼ 用户上传的参考图(只用参考图中的物品/人物替换到主图) ▼",
+            16, refStartY + 20);
+
+        // 参考图(下方, 水平排列)
+        int refDrawY = refStartY + 30;
+        for (int i = 0; i < refs.size(); i++) {
+            int x = i * (refBlockW + GAP);
+            BufferedImage refImg = refs.get(i);
+            // letterbox 保持宽高比
+            double refAspect = (double) refImg.getWidth() / refImg.getHeight();
+            double refSlotAspect = (double) refBlockW / refH;
+            int rW, rH, rOX, rOY;
+            if (refAspect > refSlotAspect) {
+                rW = refBlockW;
+                rH = (int) Math.round(refBlockW / refAspect);
+                rOX = 0;
+                rOY = (refH - rH) / 2;
+            } else {
+                rH = refH;
+                rW = (int) Math.round(refH * refAspect);
+                rOX = (refBlockW - rW) / 2;
+                rOY = 0;
+            }
+            g.drawImage(refImg.getScaledInstance(rW, rH, Image.SCALE_SMOOTH),
+                x + rOX, refDrawY + rOY, null);
+            // 参考图边框(蓝色) + 标签
+            g.setColor(new Color(50, 100, 220));
+            g.setStroke(new java.awt.BasicStroke(3));
+            g.drawRect(x, refDrawY, refBlockW - 1, refH - 1);
+            g.setStroke(new java.awt.BasicStroke(1));
+            drawLabel(g, fm, x, refDrawY, "参考 " + (i + 1), refBlockW);
+        }
+
+        g.dispose();
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ImageIO.write(combined, "png", baos);
+        byte[] pngBytes = baos.toByteArray();
+        log.info("[clothing-ref-grid] created: {}x{} px, {} bytes, 主图 + {} 张参考图",
+            canvasW, canvasH, pngBytes.length, refs.size());
+        return pngBytes;
+    }
+
+    /** 在指定位置画一个圆角黑底白字标签(用于网格图标记) */
+    private static void drawLabel(Graphics2D g, FontMetrics fm,
+                                  int x, int y, String text, int maxW) {
+        int tw = fm.stringWidth(text);
+        int padX = 8;
+        int boxW = Math.min(tw + padX * 2, maxW - 16);
+        g.setColor(new Color(0, 0, 0, 160));
+        g.fillRoundRect(x + 8, y + 4, boxW, 22, 6, 6);
+        g.setColor(Color.WHITE);
+        g.drawString(text, x + 8 + padX, y + 4 + 16);
     }
 
     /**

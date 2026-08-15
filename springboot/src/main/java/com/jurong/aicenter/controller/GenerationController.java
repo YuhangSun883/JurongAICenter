@@ -64,6 +64,7 @@ public class GenerationController {
         //   之前 L61 写死 null,导致前端 GET /api/jobs/{id} 永远拿不到视频 URL
         //   这是 useTaskPolling 看不到视频的核心 bug。
         java.util.List<String> resultUrls = null;
+        Long mediaAssetId = null;
         String raw = job.getResultUrls();
         if (raw != null && !raw.isBlank()) {
             try {

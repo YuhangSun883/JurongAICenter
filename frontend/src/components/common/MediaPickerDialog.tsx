@@ -753,7 +753,7 @@ function AssetsView({
             {/* 已通过服务器上传的素材会同时出现在 assets 中，这里需要去重 */}
             {showUploaded && uploadedFiles
               .filter((u) => u.type === tabToType[tab])
-              .filter((u) => !assets.some((a) => a.url === u.url))
+              .filter((u) => !assetUrls.has(u.url))
               .map((a) => {
                 const selected = pickedIds.has(a.id);
                 return (

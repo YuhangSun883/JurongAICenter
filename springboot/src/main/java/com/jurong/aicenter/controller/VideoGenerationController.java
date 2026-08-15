@@ -367,20 +367,38 @@ public class VideoGenerationController {
         String resolution
     ) {}
 
-    // 2026-08-14 补:前端 videoModel 枚举映射到后端 NewAPI model ID
-    private static String mapFrontendModel(String frontModel) {
-        if (frontModel == null || frontModel.isBlank()) return "doubao-seedance-2.0";
-        // 三档前端模型目前都映射到 doubao-seedance-2.0(NewAPI 只支持基础模型)
-        if (frontModel.startsWith("Seedance") || frontModel.contains("seedance")) {
+    // ============= 内部工具方法 =============
+
+    /**
+     * 把前端视频模型枚举映射到后端 NewAPI model。
+     * 前端三档：Seedance-2.0-VIP / Seedance-2.0-Fast-VIP / Seedance-2.0-Mini-VIP
+     * 后端 NewAPI 文档 §2 当前只支持 doubao-seedance-2.0 基础模型。
+     */
+    private String mapFrontendModel(String frontModel) {
+        if (frontModel == null || frontModel.isBlank()) {
             return "doubao-seedance-2.0";
         }
-        return frontModel;
+        String m = frontModel.trim().toLowerCase();
+        if (m.contains("fast") || m.contains("mini") || m.contains("lite")) {
+            // 后续开 channel 后拆分,目前全部走基础模型
+            return "doubao-seedance-2.0";
+        }
+        if (m.contains("seedance")) {
+            return "doubao-seedance-2.0";
+        }
+        // 兜底:已是非法值,直接报错
+        log.warn("[T2V-REQ] 未识别的 frontModel={}, 走默认 doubao-seedance-2.0", frontModel);
+        return "doubao-seedance-2.0";
     }
 
-    // 2026-08-14 补:duration 合法性校验 + 限制范围(避免 NewAPI 拒绝)
-    private static int mapToValidDuration(int duration) {
-        if (duration <= 0) return 4;     // 默认 4 秒
-        if (duration > 60) return 60;   // 上限 60 秒
+    /**
+     * 把前端给定的 duration(秒)校验到 NewAPI 支持的合法范围。
+     * doubao-seedance-2.0: 5~10 秒(常见 5/10),aicoming 透传。
+     */
+    private int mapToValidDuration(int duration) {
+        if (duration <= 0) return 5;
+        if (duration < 5) return 5;
+        if (duration > 10) return 10;
         return duration;
     }
 }

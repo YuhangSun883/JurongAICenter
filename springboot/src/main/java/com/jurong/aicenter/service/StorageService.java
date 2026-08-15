@@ -45,6 +45,14 @@ public interface StorageService {
 
     String getPresignedUrl(String objectKey, int expiryHours);
 
+    InputStream getFileStream(String objectKey);
+
+    /**
+     * 2026-08-13 新增:获取 MinIO 对象的输入流(用于视频/音频流式播放)。
+     * 调用方负责关闭 InputStream。
+     */
+    InputStream getFileStream(String objectKey);
+
     /**
      * 2026-08-13 新增:MinIO 兜底轮询 - 按前缀列对象
      *
