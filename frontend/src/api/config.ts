@@ -23,6 +23,7 @@ export const APIS = [
   'media',      // 素材库 / 角色库 / 上传
   'creations',  // 统一创作入口（视频 / 图片 / Agent 三合一）
   'canvas',     // 画布节点 / 节点生成
+  'product-image', // 商详套图（一张图生成一套商品详情图）
   // 新增独立领域在这里加一行 ↓
   // 'image',    // 图片生成（示例）
 ] as const;

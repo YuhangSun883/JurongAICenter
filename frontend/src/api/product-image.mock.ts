@@ -1,6 +1,7 @@
 import type {
   CreateProductImageRequest,
   FormatOption,
+  ProductImageAnalysisTask,
   ProductImageExample,
   ProductImageModel,
   ProductImageTask,
@@ -133,4 +134,37 @@ export async function getProductImageTask(taskId: string): Promise<ProductImageT
     createdAt: Date.now() - n * 1000,
     imageUrls: status === 'success' ? EXAMPLES.slice(0, 4).map((e) => e.imageUrl) : undefined,
   });
+}
+
+/** mock 套图类型名称 */
+export async function listRoles(): Promise<string[]> {
+  return delay(['主视图', '卖点图', '细节图', '成分图', '场景图', '结构图', '对比图', '包装图', '收尾图']);
+}
+
+/** mock 商品详解分析：直接返回 success 示例条目 */
+export async function createAnalysis(req: CreateProductImageRequest): Promise<ProductImageAnalysisTask> {
+  const count = parseInt(req.count.replace(/[^0-9]/g, '') || '8', 10);
+  const roles = ['主视图', '卖点图', '细节图', '成分图', '场景图', '结构图', '对比图', '包装图', '收尾图'];
+  return delay({
+    taskId: 'pia_' + Math.random().toString(36).slice(2, 10),
+    status: 'success',
+    createdAt: Date.now(),
+    items: Array.from({ length: count }, (_, i) => ({
+      refLabel: `@图片${(i % Math.max(1, req.assetIds.length)) + 1}`,
+      role: roles[i % roles.length],
+      ratio: '1:1',
+      sections: [
+        { key: '画布尺寸', value: '资产类型：高端电商主图，正方形 1:1，1200x1200。' },
+        { key: '引用图', value: '参考商品外观、材质与品牌标识。' },
+        { key: '锁定主体', value: '严格保持参考图中商品外观一致。' },
+        { key: '画面环境', value: '简洁专业的商业摄影背景，柔和自然光。' },
+        { key: '画面文字', value: '左上角简洁标题文案。' },
+        { key: '负面约束', value: '避免杂乱背景、过度反光和低分辨率纹理。' },
+      ],
+    })),
+  }, 400);
+}
+
+export async function getAnalysis(taskId: string): Promise<ProductImageAnalysisTask> {
+  return delay({ taskId, status: 'success', createdAt: Date.now(), items: [] });
 }

@@ -21,6 +21,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -192,17 +193,27 @@ public class ImageController {
         }
 
         // URL 格式：下载图片字节，编码为 base64 data URI
-        try (InputStream is = new URI(originalData).toURL().openStream()) {
-            byte[] imageBytes = is.readAllBytes();
-            String base64 = Base64.getEncoder().encodeToString(imageBytes);
-            String dataUri = "data:image/png;base64," + base64;
-            log.info("图片(URL)已转换为 base64 data URI: originalLen={}, base64Len={}",
-                imageBytes.length, dataUri.length());
-            return dataUri;
+        try {
+            log.info("开始下载中转站返回的图片 URL: {}", originalData);
+            HttpURLConnection conn = (HttpURLConnection) new URI(originalData).toURL().openConnection();
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(60_000);
+            try (InputStream is = conn.getInputStream()) {
+                byte[] imageBytes = is.readAllBytes();
+                String base64 = Base64.getEncoder().encodeToString(imageBytes);
+                String dataUri = "data:image/png;base64," + base64;
+                log.info("图片(URL)已转换为 base64 data URI: originalLen={}, base64Len={}",
+                    imageBytes.length, dataUri.length());
+                return dataUri;
+            } finally {
+                conn.disconnect();
+            }
         } catch (Exception e) {
-            log.error("图片(URL)转换为 base64 失败: {}", e.getMessage(), e);
-            throw new BusinessException(ErrorCode.INTERNAL_ERROR,
-                "图片生成成功但转换格式失败，请稍后重试");
+            // 下载失败（多为中转站返回了本机不可达的内网/未开放端口地址）：
+            // 不阻断整个请求，回退返回原始 URL 由前端直接加载
+            log.error("图片(URL)下载失败，回退返回原始 URL: url={}, err={}",
+                originalData, e.getMessage());
+            return originalData;
         }
     }
 

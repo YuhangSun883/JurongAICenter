@@ -88,3 +88,28 @@
 .scrollbar-hidden::-webkit-scrollbar-track {
   background: transparent;
 }
+
+/* 分析等待：阶段文案切换时的淡入动画（配合 animate-[fadeIn_.4s_ease]） */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* 细滚动条：分析卡片列表 / 生成结果网格超高时使用，保留滚动能力又不占地 */
+.scrollbar-slim {
+  scrollbar-width: thin;                       /* Firefox */
+  scrollbar-color: rgba(0, 0, 0, 0.16) transparent;
+}
+.scrollbar-slim::-webkit-scrollbar {
+  width: 6px;
+}
+.scrollbar-slim::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.14);
+  border-radius: 9999px;
+}
+.scrollbar-slim::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.28);
+}
+.scrollbar-slim::-webkit-scrollbar-track {
+  background: transparent;
+}

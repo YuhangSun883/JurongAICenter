@@ -1,6 +1,7 @@
 import type {
   CreateProductImageRequest,
   FormatOption,
+  ProductImageAnalysisTask,
   ProductImageExample,
   ProductImageModel,
   ProductImageTask,
@@ -38,4 +39,19 @@ export async function createProductImageTask(req: CreateProductImageRequest): Pr
 /** 轮询任务状态 */
 export async function getProductImageTask(taskId: string): Promise<ProductImageTask> {
   return request<ProductImageTask>(`/api/product-image/tasks/${taskId}`);
+}
+
+/** 拉取套图类型名称（分析卡片类型下拉选项） */
+export async function listRoles(): Promise<string[]> {
+  return request<string[]>('/api/product-image/roles');
+}
+
+/** 提交商品详解分析 → 返回分析任务（LLM 多模态生成，文案语言 = 用户语种） */
+export async function createAnalysis(req: CreateProductImageRequest): Promise<ProductImageAnalysisTask> {
+  return request<ProductImageAnalysisTask>('/api/product-image/analysis', { method: 'POST', body: req });
+}
+
+/** 轮询分析任务状态 */
+export async function getAnalysis(taskId: string): Promise<ProductImageAnalysisTask> {
+  return request<ProductImageAnalysisTask>(`/api/product-image/analysis/${taskId}`);
 }

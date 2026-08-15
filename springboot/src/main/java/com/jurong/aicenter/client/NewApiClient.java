@@ -35,6 +35,7 @@ import java.util.Map;
 public class NewApiClient {
 
     private final WebClient.Builder webClientBuilder;
+    private final AicomingAssetsClient assetsClient;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${newapi.base-url}")
@@ -46,8 +47,9 @@ public class NewApiClient {
     @Value("${newapi.vision-model:qwen-vl-max}")
     private String visionModel;
 
-    public NewApiClient(WebClient.Builder webClientBuilder) {
+    public NewApiClient(WebClient.Builder webClientBuilder, AicomingAssetsClient assetsClient) {
         this.webClientBuilder = webClientBuilder;
+        this.assetsClient = assetsClient;
     }
 
     /**
@@ -649,64 +651,8 @@ public class NewApiClient {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片生成返回为空（响应为 null）");
             }
 
-            // 打印响应结构用于调试
-            java.util.List<String> topFields = new java.util.ArrayList<>();
-            response.fieldNames().forEachRemaining(topFields::add);
-            log.info("NewAPI 响应顶层字段: {}", topFields);
-
-            // 检查 data 数组
-            if (!response.has("data")) {
-                // 有些 NewAPI 可能直接返回 URL 在顶层
-                if (response.has("url") && response.get("url").isTextual()) {
-                    String imageUrl = response.get("url").asText();
-                    log.info("NewAPI image generated OK (top-level url): {}", imageUrl);
-                    return imageUrl;
-                }
-                // 检查顶层 b64_json
-                if (response.has("b64_json") && response.get("b64_json").isTextual()) {
-                    String b64Data = response.get("b64_json").asText();
-                    log.info("NewAPI image generated OK (top-level b64_json): b64Len={}", b64Data.length());
-                    return "data:image/png;base64," + b64Data;
-                }
-                // 返回错误信息
-                String errMsg = response.has("error") ? response.get("error").toString() : "未知错误";
-                log.error("NewAPI generateImage 返回错误: {}, 完整响应: {}", errMsg, response.toString());
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 返回错误: " + errMsg);
-            }
-
-            JsonNode dataArray = response.get("data");
-            if (!dataArray.isArray() || dataArray.size() == 0) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片生成 data 数组为空");
-            }
-
-            JsonNode first = dataArray.get(0);
-            // 打印 data[0] 字段名用于调试
-            java.util.List<String> firstFieldNames = new java.util.ArrayList<>();
-            first.fieldNames().forEachRemaining(firstFieldNames::add);
-            log.info("NewAPI data[0] 字段: {}", firstFieldNames);
-
-            // 尝试多种可能的 URL 字段名
-            String[] urlFields = {"url", "image_url", "imageUrl", "img_url", "imgUrl"};
-            for (String field : urlFields) {
-                if (first.has(field) && first.get(field).isTextual()) {
-                    String imageUrl = first.get(field).asText();
-                    log.info("NewAPI image generated OK ({}): promptLen={}", field, prompt.length());
-                    return imageUrl;
-                }
-            }
-
-            // 检查 b64_json 字段 — 返回 data URI 前缀的 base64 字符串
-            if (first.has("b64_json") && first.get("b64_json").isTextual()) {
-                String b64Data = first.get("b64_json").asText();
-                log.info("NewAPI image generated OK (b64_json): promptLen={}, b64Len={}", prompt.length(), b64Data.length());
-                return "data:image/png;base64," + b64Data;
-            }
-
-            // data[0] 中未找到图片数据字段，将实际字段名包含在错误信息中
-            String dataContent = first.toString().length() > 500 ? first.toString().substring(0, 500) : first.toString();
-            log.error("NewAPI data[0] 中未找到图片数据字段。data[0] 字段: {}, 内容: {}", firstFieldNames, dataContent);
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                "图片生成响应中未找到图片数据字段，data[0] 包含字段: " + firstFieldNames);
+            // 解析响应（与图生图 editImage 共用同一套逻辑）
+            return parseImageGenerationResponse(response, prompt, "generateImage");
         } catch (Exception e) {
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI generateImage failed: {}", e.getMessage());
@@ -725,9 +671,18 @@ public class NewApiClient {
     }
 
     /**
-     * 调用 NewAPI 图片编辑接口（/v1/images/edits）
-     * 将用户引用的图片作为素材，结合提示词生成新图片。
-     * 使用 multipart/form-data 格式上传引用图片。
+     * 图生图：将用户引用的图片作为素材，结合提示词生成新图片。
+     *
+     * <p>按聚融中转站接口手册 v3.0 的图生图协议实现（两段式）：
+     * <ol>
+     *   <li>引用图解码后上传素材库（{@link AicomingAssetsClient}，POST /v1/assets），
+     *       轮询到 status=active，拿到 asset_url（asset://aic_xxx）</li>
+     *   <li>POST /v1/images/generations（JSON），body 里带 "image": "asset://aic_xxx"</li>
+     * </ol>
+     *
+     * <p>注意：旧实现走 OpenAI 标准 multipart /v1/images/edits，聚融中转站不支持该路线，
+     * 上游会报 400 "image is required"，已废弃。
+     * 手册中图生图只支持单张 image 字段，多张引用图时仅使用第一张。
      *
      * @param prompt          生成提示词
      * @param referenceImages 引用图片列表（base64 data URI 格式，如 data:image/png;base64,...）
@@ -738,62 +693,81 @@ public class NewApiClient {
      */
     public String editImage(String prompt, List<String> referenceImages,
                             String size, String quality, String style) {
+        return editImage(prompt, referenceImages, size, quality, style, null);
+    }
+
+    /**
+     * 图生图（可指定模型），{@link #editImage(String, List, String, String, String)} 的重载。
+     *
+     * @param model 模型名（如 gpt-image-2-1k / gpt-image-2-2k），空则默认 gpt-image-2-2k
+     */
+    public String editImage(String prompt, List<String> referenceImages,
+                            String size, String quality, String style, String model) {
+        final String useModel = (model != null && !model.isBlank()) ? model : "gpt-image-2-2k";
         if (!checkHealth()) {
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 服务不可用，请稍后再试");
         }
-
-        // 构建 multipart 请求体
-        MultipartBodyBuilder bodyBuilder = new MultipartBodyBuilder();
-
-        // 添加文本参数
-        bodyBuilder.part("model", "gpt-image-2-2k");
-        bodyBuilder.part("prompt", prompt);
-        bodyBuilder.part("size", size != null ? size : "1024x1024");
-        if (quality != null) bodyBuilder.part("quality", quality);
-        if (style != null) bodyBuilder.part("style", style);
-        bodyBuilder.part("response_format", "b64_json");
-
-        // 解码 base64 引用图片并添加为 multipart 文件
-        int imgIndex = 0;
-        for (String dataUri : referenceImages) {
-            try {
-                byte[] imageBytes = decodeDataUri(dataUri);
-                String mimeType = getMimeTypeFromDataUri(dataUri);
-                String ext = mimeType.equals("image/jpeg") ? ".jpg" : ".png";
-                final int currentIdx = imgIndex;
-
-                // gpt-image 模型支持多张参考图，使用 image 字段
-                bodyBuilder.part("image", new ByteArrayResource(imageBytes) {
-                    @Override
-                    public String getFilename() {
-                        return "reference_" + currentIdx + ext;
-                    }
-                }).contentType(MediaType.parseMediaType(mimeType));
-                imgIndex++;
-            } catch (Exception e) {
-                log.warn("解码引用图片 {} 失败: {}", imgIndex, e.getMessage());
-                imgIndex++;
-            }
+        if (referenceImages == null || referenceImages.isEmpty()) {
+            throw new BusinessException(ErrorCode.INVALID_PARAM, "图生图至少需要一张引用图片");
+        }
+        if (referenceImages.size() > 1) {
+            log.warn("图生图协议仅支持单张引用图，传入 {} 张，仅使用第一张", referenceImages.size());
         }
 
-        if (imgIndex == 0) {
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "引用图片解码失败，无法进行图片编辑");
-        }
-
-        log.info("调用 NewAPI /v1/images/edits: promptLen={}, refImageCount={}", prompt.length(), imgIndex);
-
+        String assetId = null;
         try {
+            // 1. 解码引用图（data URI → 字节）
+            String dataUri = referenceImages.get(0);
+            byte[] imageBytes;
+            try {
+                imageBytes = decodeDataUri(dataUri);
+            } catch (Exception e) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM, "引用图片解码失败: " + e.getMessage());
+            }
+            if (imageBytes == null || imageBytes.length == 0) {
+                throw new BusinessException(ErrorCode.INVALID_PARAM, "引用图片内容为空");
+            }
+            String mimeType = getMimeTypeFromDataUri(dataUri);
+            String ext = "image/jpeg".equals(mimeType) ? ".jpg" : ".png";
+
+            // 2. 上传素材库并轮询到 active（手册建议 maxWaitSec=90, intervalSec=3）
+            JsonNode uploadData = assetsClient.uploadAssetByMultipart(
+                imageBytes, "reference_0" + ext, mimeType, null);
+            assetId = uploadData.path("id").asText(null);
+            if (assetId == null || assetId.isBlank()) {
+                throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED, "素材上传响应缺少 id: " + uploadData);
+            }
+            JsonNode activeData = assetsClient.pollUntilActive(assetId, 90, 3);
+            String assetUrl = activeData.path("asset_url").asText(null);
+            if (assetUrl == null || assetUrl.isBlank()) {
+                assetUrl = "asset://" + assetId;
+            }
+            log.info("引用图已入素材库: assetId={}, assetUrl={}, size={}B", assetId, assetUrl, imageBytes.length);
+
+            // 3. JSON 调 /v1/images/generations，image 字段引用 asset_url（手册 v3.0 图生图协议）
+            Map<String, Object> body = new HashMap<>();
+            body.put("model", useModel);
+            body.put("prompt", prompt);
+            body.put("size", size != null ? size : "1024x1024");
+            if (quality != null) body.put("quality", quality);
+            if (style != null) body.put("style", style);
+            body.put("response_format", "b64_json");
+            body.put("image", assetUrl);
+
+            log.info("调用 NewAPI /v1/images/generations (图生图): promptLen={}, image={}",
+                prompt.length(), assetUrl);
+
             JsonNode response = webClientBuilder.baseUrl(baseUrl).build()
                 .post()
-                .uri("/v1/images/edits")
+                .uri("/v1/images/generations")
                 .header("Authorization", "Bearer " + token)
-                .contentType(MediaType.MULTIPART_FORM_DATA)
-                .bodyValue(bodyBuilder.build())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
                 .retrieve()
                 .bodyToMono(JsonNode.class)
                 .timeout(Duration.ofSeconds(300))  // 5 分钟超时
                 .onErrorMap(WebClientResponseException.class, e -> {
-                    log.error("NewAPI /v1/images/edits failed: {} {}",
+                    log.error("NewAPI /v1/images/generations (图生图) failed: {} {}",
                         e.getStatusCode(), e.getResponseBodyAsString());
                     return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
                         "图片编辑失败: " + e.getStatusCode() + " " + e.getStatusText());
@@ -809,60 +783,92 @@ public class NewApiClient {
                 throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑返回为空（响应为 null）");
             }
 
-            // 打印响应结构用于调试
-            java.util.List<String> topFields = new java.util.ArrayList<>();
-            response.fieldNames().forEachRemaining(topFields::add);
-            log.info("NewAPI editImage 响应顶层字段: {}", topFields);
-
-            // 解析响应（与 generateImage 相同的逻辑）
-            if (!response.has("data")) {
-                if (response.has("url") && response.get("url").isTextual()) {
-                    return response.get("url").asText();
-                }
-                if (response.has("b64_json") && response.get("b64_json").isTextual()) {
-                    return "data:image/png;base64," + response.get("b64_json").asText();
-                }
-                String errMsg = response.has("error") ? response.get("error").toString() : "未知错误";
-                log.error("NewAPI editImage 返回错误: {}, 完整响应: {}", errMsg, response.toString());
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 返回错误: " + errMsg);
-            }
-
-            JsonNode dataArray = response.get("data");
-            if (!dataArray.isArray() || dataArray.size() == 0) {
-                throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑 data 数组为空");
-            }
-
-            JsonNode first = dataArray.get(0);
-            java.util.List<String> firstFieldNames = new java.util.ArrayList<>();
-            first.fieldNames().forEachRemaining(firstFieldNames::add);
-            log.info("NewAPI editImage data[0] 字段: {}", firstFieldNames);
-
-            // 检查 b64_json
-            if (first.has("b64_json") && first.get("b64_json").isTextual()) {
-                String b64Data = first.get("b64_json").asText();
-                log.info("NewAPI editImage OK (b64_json): b64Len={}", b64Data.length());
-                return "data:image/png;base64," + b64Data;
-            }
-
-            // 检查 URL 字段
-            String[] urlFields = {"url", "image_url", "imageUrl"};
-            for (String field : urlFields) {
-                if (first.has(field) && first.get(field).isTextual()) {
-                    String imageUrl = first.get(field).asText();
-                    log.info("NewAPI editImage OK ({}): {}", field, imageUrl);
-                    return imageUrl;
-                }
-            }
-
-            String dataContent = first.toString().length() > 500 ? first.toString().substring(0, 500) : first.toString();
-            log.error("NewAPI editImage data[0] 中未找到图片数据字段。字段: {}, 内容: {}", firstFieldNames, dataContent);
-            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
-                "图片编辑响应中未找到图片数据字段，data[0] 包含字段: " + firstFieldNames);
+            // 4. 解析响应（与文生图同一套逻辑）
+            return parseImageGenerationResponse(response, prompt, "editImage");
         } catch (Exception e) {
             if (e instanceof BusinessException) throw e;
             log.error("NewAPI editImage failed: {}", e.getMessage());
             throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片编辑失败: " + e.getMessage());
+        } finally {
+            // 生成结束后清理素材（best-effort，失败仅告警；与视频链路的 asset 清理策略一致）
+            if (assetId != null && !assetId.isBlank()) {
+                try {
+                    assetsClient.deleteAsset(assetId);
+                } catch (Exception ex) {
+                    log.warn("清理引用图素材失败（不影响结果）: assetId={}, err={}", assetId, ex.getMessage());
+                }
+            }
         }
+    }
+
+    /**
+     * 解析 /v1/images/generations 响应，返回图片 URL 或 base64 data URI。
+     * 文生图（generateImage）与图生图（editImage）共用。
+     *
+     * @param response 响应 JSON
+     * @param prompt   提示词（仅用于日志）
+     * @param opName   操作名（仅用于日志，如 generateImage / editImage）
+     * @return 图片 URL 或 data:image/png;base64,... data URI
+     */
+    private String parseImageGenerationResponse(JsonNode response, String prompt, String opName) {
+        // 打印响应结构用于调试
+        java.util.List<String> topFields = new java.util.ArrayList<>();
+        response.fieldNames().forEachRemaining(topFields::add);
+        log.info("NewAPI {} 响应顶层字段: {}", opName, topFields);
+
+        // 检查 data 数组
+        if (!response.has("data")) {
+            // 有些 NewAPI 可能直接返回 URL 在顶层
+            if (response.has("url") && response.get("url").isTextual()) {
+                String imageUrl = response.get("url").asText();
+                log.info("NewAPI {} OK (top-level url): {}", opName, imageUrl);
+                return imageUrl;
+            }
+            // 检查顶层 b64_json
+            if (response.has("b64_json") && response.get("b64_json").isTextual()) {
+                String b64Data = response.get("b64_json").asText();
+                log.info("NewAPI {} OK (top-level b64_json): b64Len={}", opName, b64Data.length());
+                return "data:image/png;base64," + b64Data;
+            }
+            // 返回错误信息
+            String errMsg = response.has("error") ? response.get("error").toString() : "未知错误";
+            log.error("NewAPI {} 返回错误: {}, 完整响应: {}", opName, errMsg, response.toString());
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "NewAPI 返回错误: " + errMsg);
+        }
+
+        JsonNode dataArray = response.get("data");
+        if (!dataArray.isArray() || dataArray.size() == 0) {
+            throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE, "图片生成 data 数组为空");
+        }
+
+        JsonNode first = dataArray.get(0);
+        // 打印 data[0] 字段名用于调试
+        java.util.List<String> firstFieldNames = new java.util.ArrayList<>();
+        first.fieldNames().forEachRemaining(firstFieldNames::add);
+        log.info("NewAPI {} data[0] 字段: {}", opName, firstFieldNames);
+
+        // 尝试多种可能的 URL 字段名
+        String[] urlFields = {"url", "image_url", "imageUrl", "img_url", "imgUrl"};
+        for (String field : urlFields) {
+            if (first.has(field) && first.get(field).isTextual()) {
+                String imageUrl = first.get(field).asText();
+                log.info("NewAPI {} OK ({}): promptLen={}, url={}", opName, field, prompt.length(), imageUrl);
+                return imageUrl;
+            }
+        }
+
+        // 检查 b64_json 字段 — 返回 data URI 前缀的 base64 字符串
+        if (first.has("b64_json") && first.get("b64_json").isTextual()) {
+            String b64Data = first.get("b64_json").asText();
+            log.info("NewAPI {} OK (b64_json): promptLen={}, b64Len={}", opName, prompt.length(), b64Data.length());
+            return "data:image/png;base64," + b64Data;
+        }
+
+        // data[0] 中未找到图片数据字段，将实际字段名包含在错误信息中
+        String dataContent = first.toString().length() > 500 ? first.toString().substring(0, 500) : first.toString();
+        log.error("NewAPI {} data[0] 中未找到图片数据字段。字段: {}, 内容: {}", opName, firstFieldNames, dataContent);
+        throw new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,
+            "图片生成响应中未找到图片数据字段，data[0] 包含字段: " + firstFieldNames);
     }
 
     /**

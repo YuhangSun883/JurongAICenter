@@ -49,7 +49,12 @@ public class AicomingAssetsClient {
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    @Value("${newapi.base-url}")
+    /**
+     * 素材库（aicoming proxy）直连地址。
+     * 手册 v3.0：素材库 http://192.140.163.161:8090，与 NewAPI 中转站（:3000）不同。
+     * 素材 CRUD 必须直连这里，走 NewAPI 会 404（channel 白名单拒绝 /v1/assets）。
+     */
+    @Value("${aicoming.assets.base-url:${newapi.base-url}}")
     private String baseUrl;
 
     @Value("${newapi.token}")
