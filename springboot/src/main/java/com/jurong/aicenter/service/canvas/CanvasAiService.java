@@ -31,13 +31,37 @@ public interface CanvasAiService {
     String generateImage(String prompt, String upstreamContent);
 
     /**
+     * 2026-08-11 新增:图生图(调 ComfyUI image-to-image workflow + NewAPI /v1/images/edits)
+     * 用于:用户上游是图片节点(抽帧总图/换装结果),在下游 image 节点输入描述修改图片。
+     *
+     * @param imageUrl        上游图片的公网 URL(会被上传到 ComfyUI input 目录)
+     * @param prompt          用户的转换描述,如"把人物改成三视图"、"换沐浴露瓶"
+     * @param upstreamContent 上游节点输出(可空,作为风格参考)
+     * @return 新图片的公网 URL(MinIO)
+     */
+    String editImage(String imageUrl, String prompt, String upstreamContent);
+
+    /**
      * 生成视频（调 ComfyUI image-to-video workflow + NewAPI 等结果）
      * @param prompt          最终 prompt
-     * @param imageUrl        上游图片节点产物的公网 URL
+     * @param imageUrl        上游图片节点产物的公网 URL（单图，向后兼容）
      * @param upstreamContent 上游节点输出（可空）
      * @return 视频公网 URL
      */
     String generateVideo(String prompt, String imageUrl, String upstreamContent);
+
+    /**
+     * 2026-08-11 新增:多图版生成视频(支持三视图+换装帧图+其他参考图作为 image_urls 传给 NewAPI)
+     *
+     * <p>应用场景:视频节点上游连多个 image 节点(三视图角色参考 + 换装服装参考 + 其他),
+     * 把所有 URL 传给 NewAPI /v1/videos 的 image_urls 参数,实现"多参考图"生视频。</p>
+     *
+     * @param prompt          最终 prompt(分镜描述 + 口播文案)
+     * @param imageUrls       上游所有 image 节点产物的 URL 列表(可空,空则走纯文生视频)
+     * @param upstreamContent 上游 text 节点输出(可空,作为风格参考)
+     * @return 视频公网 URL
+     */
+    String generateVideoMulti(String prompt, java.util.List<String> imageUrls, String upstreamContent);
 
     /**
      * 合并用户输入与上游润色文案，生成最终 prompt。

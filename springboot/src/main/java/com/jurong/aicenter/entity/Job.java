@@ -21,6 +21,14 @@ public class Job {
 
     private String templateId;
 
+    /**
+     * 2026-08-13 字段名误导(历史包袱):
+     *   字段名 comfyuiPromptId 来自早期项目 ComfyUI 时代,实际语义已偏移 ——
+     *   现在存的是 <b>NewAPI 中转站的 task_id</b>(aicoming-proxy 也用同一个字段存它的 task_id),
+     *   与 ComfyUI prompt_id 无关。
+     *   未来重构应迁移到 {@code newapiTaskId} 字段,保持向后兼容。
+     */
+    @Deprecated
     private String comfyuiPromptId;
 
     /** PENDING / RUNNING / COMPLETED / FAILED / CANCELLED */

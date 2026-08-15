@@ -26,6 +26,11 @@ public enum ErrorCode {
     NEWAPI_TASK_FAILED(3008, "newapi task failed"),
     NEWAPI_TASK_TIMEOUT(3009, "newapi task timeout"),
     NEWAPI_VIDEO_URL_MISSING(3010, "newapi video url missing"),
+    NEWAPI_REQUEST_INVALID(3011, "newapi request invalid (4xx, business rejected)"),
+    // 2026-08-12 added: 区分 task not found (400) 与其他 4xx 错误
+    // 400 task not found 不一定是任务失败 —— 可能是 NewAPI 元数据被清理但视频文件还在 CDN 上
+    // 调用方应根据 syncUrl / assetUrl 等兜底,而不是立即 FAILED
+    NEWAPI_TASK_NOT_FOUND(3012, "newapi task not found (TTL expired or cleaned, but video may still exist on CDN)"),
 
     WORKFLOW_NOT_FOUND(4001, "workflow not found"),
     WORKFLOW_ACCESS_DENIED(4002, "workflow access denied"),
@@ -35,6 +40,10 @@ public enum ErrorCode {
     ADMIN_OPERATION_DENIED(6001, "admin operation denied"),
     ADMIN_CANNOT_CHANGE_OWN_ROLE(6002, "cannot change own role"),
     ADMIN_CANNOT_DISABLE_SELF(6003, "cannot disable self"),
+    // 2026-08-14 added: 管理员账号禁止从普通 /login 页登录
+    // 普通登录页不允许 ADMIN 角色登录，管理员必须走 /admin/login 专属入口（未来）
+    // 注：原 6003 已占用，用新 code 6010
+    ADMIN_LOGIN_FORBIDDEN_ON_USER_ENTRY(6010, "admin login forbidden on user login page"),
     GROUP_NAME_DUPLICATE(6004, "group name duplicate"),
     GROUP_IS_DEFAULT_CANNOT_DELETE(6005, "default group cannot be deleted"),
     GROUP_IS_DEFAULT_CANNOT_UNSET(6006, "default group cannot be unset"),

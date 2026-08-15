@@ -78,8 +78,12 @@ public class CanvasAsyncExecutor {
                     node.setContent(text);
                     break;
                 case "image":
-                    // 生图：上游若有文本节点，把它的 content 作为 upstreamContent
+                    // 2026-08-11 新增:上游有 image 节点 → 走图生图(editImage)
+                    // 上游无 image 节点 → 走文字生图(generateImage)
+                    String userPromptForImage = req.getPrompt();
                     String upstreamTextForImage = pickUpstreamText(upstreamNodes);
+                    String upstreamImageForImage = pickUpstreamImageUrl(upstreamNodes);
+
                     // 关键：润色后文案可能几百字,ComfyUI 处理超长 prompt 会超时
                     // 截断到 500 字符（优先在句号/逗号/空格处断开）
                     if (upstreamTextForImage != null && upstreamTextForImage.length() > 500) {
@@ -87,7 +91,6 @@ public class CanvasAsyncExecutor {
                                  upstreamTextForImage.length());
                         upstreamTextForImage = truncateAtBoundary(upstreamTextForImage, 500);
                     }
-                    String userPromptForImage = req.getPrompt();
                     // 2026-08-08: 后端兜底验证 — 不提交空 prompt 给 ComfyUI(它会 500)
                     // 前端有检查但可能漏掉(state 同步/点击过快),后端更可靠
                     if ((userPromptForImage == null || userPromptForImage.isBlank())
@@ -95,19 +98,37 @@ public class CanvasAsyncExecutor {
                         throw new BusinessException(ErrorCode.INVALID_PARAM,
                             "请先输入提示词,或从节点左侧/右侧 + 拖一个上游文本节点来引用");
                     }
-                    url = aiService.generateImage(userPromptForImage, upstreamTextForImage);
+
+                    if (upstreamImageForImage != null && !upstreamImageForImage.isBlank()) {
+                        // 上游是 image 节点 → 走图生图
+                        log.info("Canvas image-edit (上游图): imageUrl={}, promptLen={}",
+                            "(set)", userPromptForImage == null ? 0 : userPromptForImage.length());
+                        url = aiService.editImage(upstreamImageForImage, userPromptForImage, upstreamTextForImage);
+                    } else {
+                        // 上游无 image 节点 → 走文字生图(原逻辑)
+                        log.info("Canvas image-generate (纯文生图): promptLen={}",
+                            userPromptForImage == null ? 0 : userPromptForImage.length());
+                        url = aiService.generateImage(userPromptForImage, upstreamTextForImage);
+                    }
                     task.setResultUrl(url);
                     node.setResultUrl(url);
                     break;
                 case "video":
-                    // 视频：上游若有图片节点 → image-to-video；上游若有文本节点 → 润色后文本作为 prompt 上下文
-                    String upstreamImageUrl = pickUpstreamImageUrl(upstreamNodes);
+                    // 上游连接：把 image/grid/text/script/breakdown 节点的输出拼到最终 prompt
+                    // video 节点输入框(userPrompt) = 分镜/动作描述,会被拼到 finalPrompt
+                    String userPromptForVideo = req.getPrompt();
+                    // 2026-08-11:收集所有上游 image 节点 URL(支持多图参考:三视图+换装帧图+其他)
+                    java.util.List<String> upstreamImageUrls = pickAllUpstreamImageUrls(upstreamNodes);
+                    String upstreamImageUrl = (upstreamImageUrls != null && !upstreamImageUrls.isEmpty())
+                        ? upstreamImageUrls.get(0) : null;
                     if (upstreamImageUrl == null || upstreamImageUrl.isBlank()) {
                         // 没上游图片：fallback 到视频节点自己的 resultUrl / content（防御性）
                         upstreamImageUrl = node.getResultUrl();
                         if (upstreamImageUrl == null || upstreamImageUrl.isBlank()) {
                             upstreamImageUrl = req.getContent();
                         }
+                        upstreamImageUrls = (upstreamImageUrl != null && !upstreamImageUrl.isBlank())
+                            ? java.util.List.of(upstreamImageUrl) : java.util.List.of();
                     }
                     String upstreamTextForVideo = pickUpstreamText(upstreamNodes);
                     // 同样：上游润色文案过长会拖慢 NewAPI/aicoming，截断到 800 字符
@@ -129,11 +150,20 @@ public class CanvasAsyncExecutor {
                     // 2026-08-08 改:不再强制要求 prompt — image_to_video.py 开了 enable_prompt_optimize=true
                     // 会自动用 VL 模型描述图片 + 加默认动作(主体自然动态)
                     // 空 prompt 也能跑,但建议用户输入具体动作(图片是一头猪,输入"跳舞"→生成猪跳舞)
-                    String userPromptForVideo = req.getPrompt();
                     if (userPromptForVideo != null && userPromptForVideo.isBlank()) {
                         userPromptForVideo = null; // 规范成 null,让 ComfyUI 节点用默认
                     }
-                    url = aiService.generateVideo(userPromptForVideo, upstreamImageUrl, upstreamTextForVideo);
+                    // 2026-08-11:支持多图参考(三视图+换装帧图+其他)
+                    if (upstreamImageUrls != null && upstreamImageUrls.size() > 1) {
+                        // 多图:用 generateVideoMulti
+                        log.info("Canvas video (multi-image): imageUrls={}, promptLen={}",
+                            upstreamImageUrls.size(),
+                            userPromptForVideo == null ? 0 : userPromptForVideo.length());
+                        url = aiService.generateVideoMulti(userPromptForVideo, upstreamImageUrls, upstreamTextForVideo);
+                    } else {
+                        // 单图或纯文:用 generateVideo(向后兼容)
+                        url = aiService.generateVideo(userPromptForVideo, upstreamImageUrl, upstreamTextForVideo);
+                    }
                     task.setResultUrl(url);
                     node.setResultUrl(url);
                     break;
@@ -260,6 +290,20 @@ public class CanvasAsyncExecutor {
             }
         }
         return null;
+    }
+
+    /**
+     * 2026-08-11 新增:收集所有上游 image 节点的 resultUrl,返回 List(支持多图生视频)。
+     */
+    private java.util.List<String> pickAllUpstreamImageUrls(List<CanvasNode> upstreamNodes) {
+        java.util.List<String> urls = new java.util.ArrayList<>();
+        for (CanvasNode n : upstreamNodes) {
+            if ("image".equalsIgnoreCase(n.getType()) && n.getResultUrl() != null
+                && !n.getResultUrl().isBlank()) {
+                urls.add(n.getResultUrl());
+            }
+        }
+        return urls;
     }
 
     /**

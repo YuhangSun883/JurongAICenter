@@ -12,8 +12,10 @@
 /** 单一开关：true = 走前端 mock；false = 走真后端 */
 export const USE_MOCK = process.env.NEXT_PUBLIC_USE_MOCK !== 'false';
 
-/** 后端 API base（前端所有请求都走它） */
-export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:4000';
+/** 后端 API base（前端所有请求都走它）
+ * 默认值与 springboot/src/main/resources/application.yml 的 server.port=8080 保持一致
+ */
+export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8080';
 
 /** 已注册的业务域 —— 用来自动生成文档和健康检查 */
 export const APIS = [

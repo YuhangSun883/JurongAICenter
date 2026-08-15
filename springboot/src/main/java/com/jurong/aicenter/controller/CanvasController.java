@@ -202,7 +202,10 @@ public class CanvasController {
     /**
      * 2026-08-09 新增:换装(clothing transfer)
      * 路径参数:{id} = 视频节点 ID
-     * 请求 body:{"clothingNodeIds":["衣服正面节点ID","衣服背面节点ID","衣服模特上身节点ID"]}
+     * 请求 body:{"clothingNodeIds":["衣服正面节点ID","衣服背面节点ID","衣服模特上身节点ID"],
+     *            "modelImageNodeId":"模特图节点ID"(可选)}
+     * - 不传 modelImageNodeId:只换服装,保留原脸(向后兼容)
+     * - 传 modelImageNodeId:用模特图的人脸/身材替换原帧的人物
      * 返回:pending 状态的任务,前端轮询 /tasks/{taskId} 看进度
      */
     @PostMapping("/nodes/{id}/transfer-clothing")
@@ -219,7 +222,36 @@ public class CanvasController {
         for (Object o : (List<?>) raw) {
             if (o != null) clothingNodeIds.add(o.toString());
         }
-        return canvasService.transferClothing(user.id(), id, clothingNodeIds);
+        // Controller 直接调用时 targetNodeId 既是 source 也是 target;调 4 参数重载,source=target
+        return canvasService.transferClothing(user.id(), id, id, clothingNodeIds);
+    }
+
+    /**
+     * 2026-08-10 新增:画布视频生成
+     * 路径参数:{id} = 视频生成节点 ID(节点 type=video-generation,upstreamIds 含 text + image)
+     * 请求 body:{"duration": 9, "resolution": "720P"}
+     * 返回:pending 状态的任务,前端轮询 /tasks/{taskId} 看进度
+     */
+    @PostMapping("/nodes/{id}/generate-video")
+    public GenerateCanvasNodeResponse generateVideo(
+            @AuthenticationPrincipal AuthenticatedUser user,
+            @PathVariable String id,
+            @RequestBody(required = false) Map<String, Object> body) {
+        requireUser(user);
+        int duration = 9;       // 默认 9 秒
+        String resolution = "720P";  // 默认 720P
+        if (body != null) {
+            Object d = body.get("duration");
+            if (d instanceof Number) duration = ((Number) d).intValue();
+            else if (d instanceof String) {
+                try { duration = Integer.parseInt((String) d); } catch (NumberFormatException ignore) {}
+            }
+            Object r = body.get("resolution");
+            if (r instanceof String && !((String) r).isBlank()) {
+                resolution = (String) r;
+            }
+        }
+        return canvasService.generateVideoFromCanvas(user.id(), id, duration, resolution);
     }
 
     private void requireUser(AuthenticatedUser user) {

@@ -6,12 +6,16 @@ import com.jurong.aicenter.dto.generation.GenerateRequest;
 import com.jurong.aicenter.dto.generation.GenerateResponse;
 import com.jurong.aicenter.dto.job.JobResponse;
 import com.jurong.aicenter.entity.Job;
+import com.jurong.aicenter.entity.MediaAsset;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
+import com.jurong.aicenter.repository.MediaAssetRepository;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
 import com.jurong.aicenter.service.GenerationService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -22,6 +26,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+@Slf4j
 @RestController
 @RequestMapping("/api")
 @RequiredArgsConstructor
@@ -29,6 +34,7 @@ public class GenerationController {
 
     private final GenerationService generationService;
     private final ObjectMapper objectMapper;
+    private final MediaAssetRepository mediaAssetRepository;
 
     @PostMapping("/generate")
     public GenerateResponse generate(
@@ -54,11 +60,36 @@ public class GenerationController {
             @PathVariable Long id) {
         if (principal == null) throw new BusinessException(ErrorCode.UNAUTHORIZED);
         Job job = generationService.getJob(id, principal.id());
-        List<String> resultUrls = null;
-        if (job.getResultUrls() != null && !job.getResultUrls().isBlank()) {
+        // 2026-08-13 16:40 修复:解析 result_urls JSON 字符串为 List<String>
+        //   之前 L61 写死 null,导致前端 GET /api/jobs/{id} 永远拿不到视频 URL
+        //   这是 useTaskPolling 看不到视频的核心 bug。
+        java.util.List<String> resultUrls = null;
+        String raw = job.getResultUrls();
+        if (raw != null && !raw.isBlank()) {
             try {
-                resultUrls = objectMapper.readValue(job.getResultUrls(), new TypeReference<>() {});
-            } catch (Exception ignored) {}
+                com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+                resultUrls = mapper.readValue(raw,
+                    mapper.getTypeFactory().constructCollectionType(
+                        java.util.List.class, String.class));
+            } catch (Exception e) {
+                log.warn("[jobs.getJob] 解析 resultUrls 失败,降级为 null: id={}, raw={}, err={}",
+                    id, raw.length() > 200 ? raw.substring(0, 200) + "..." : raw,
+                    e.getMessage());
+            }
+        }
+        // 反查该任务产出的媒体资产 ID（media_assets.source_task_id = jobId），前端用于收藏/引用
+        Long mediaAssetId = null;
+        try {
+            MediaAsset asset = mediaAssetRepository.selectOne(
+                new LambdaQueryWrapper<MediaAsset>()
+                    .eq(MediaAsset::getSourceTaskId, String.valueOf(job.getId()))
+                    .last("LIMIT 1"));
+            if (asset != null) {
+                mediaAssetId = asset.getId();
+            }
+        } catch (Exception e) {
+            log.warn("[jobs.getJob] 反查 mediaAssetId 失败,降级为 null: id={}, err={}", id, e.getMessage());
         }
         return new JobResponse(
             job.getId(),
@@ -70,7 +101,8 @@ public class GenerationController {
             resultUrls,
             job.getErrorMessage(),
             job.getCreatedAt(),
-            job.getCompletedAt()
+            job.getCompletedAt(),
+            mediaAssetId
         );
     }
 

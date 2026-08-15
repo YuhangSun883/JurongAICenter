@@ -14,7 +14,7 @@ public interface VideoSyncService {
      * 同步视频到 MinIO
      * @param userId 当前用户
      * @param jobId 关联的本地 jobId（用于写 resultUrls）
-     * @param newApiTaskId NewAPI 返回的 task_id
+     * @param newApiTaskId NewAPI 返回的 id(中转站 id,用于 GET /v1/videos/{id} 轮询,见 v3.0 文档 L92)
      * @return 更新后的 Job
      */
     Job syncVideoFromNewApi(Long userId, Long jobId, String newApiTaskId);

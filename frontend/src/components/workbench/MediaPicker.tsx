@@ -97,7 +97,17 @@ export function MediaPicker() {
                 // eslint-disable-next-line @next/next/no-img-element
                 <img src={r.url} alt={r.name} className="h-24 w-full object-cover" />
               ) : r.type === 'video' ? (
-                <video src={r.url} className="h-24 w-full object-cover" muted />
+                <video
+                  src={r.url}
+                  className="h-24 w-full object-cover"
+                  muted
+                  playsInline
+                  preload="metadata"
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    if (v.currentTime < 0.1) v.currentTime = 0.1;
+                  }}
+                />
               ) : (
                 <div className="grid h-24 place-items-center text-xs text-fg-muted">
                   <Music className="h-6 w-6" />

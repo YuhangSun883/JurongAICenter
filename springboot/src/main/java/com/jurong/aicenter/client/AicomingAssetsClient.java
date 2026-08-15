@@ -54,10 +54,10 @@ public class AicomingAssetsClient {
      * 手册 v3.0：素材库 http://192.140.163.161:8090，与 NewAPI 中转站（:3000）不同。
      * 素材 CRUD 必须直连这里，走 NewAPI 会 404（channel 白名单拒绝 /v1/assets）。
      */
-    @Value("${aicoming.assets.base-url:${newapi.base-url}}")
+    @Value("${aicoming.assets.base-url:${aicoming.proxy.base-url}}")
     private String baseUrl;
 
-    @Value("${newapi.token}")
+    @Value("${aicoming.proxy.token}")
     private String token;
 
     public AicomingAssetsClient(WebClient.Builder webClientBuilder) {
@@ -106,6 +106,9 @@ public class AicomingAssetsClient {
         // aicoming-proxy 的 nginx 拒绝 chunked multipart 请求返回 400。
         // RestTemplate 会设置 Content-Length，与 curl 行为一致。
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        // v2.1 文档 §9.2 明确:type 必填,值必须是 image / video / audio(不能是 avatar)
+        //   没有默认值,缺这个字段上游会直接 400 asset_type_unsupported
+        body.add("type", "image");
         if (name != null && !name.isBlank()) {
             body.add("name", name);
         }
@@ -120,32 +123,58 @@ public class AicomingAssetsClient {
 
         HttpEntity<MultiValueMap<String, Object>> requestEntity = new HttpEntity<>(body, headers);
 
-        try {
-            ResponseEntity<String> respEntity = restTemplate.postForEntity(
-                baseUrl + "/v1/assets", requestEntity, String.class);
+        // 2026-08-10 修复:上传 asset 时 Connection reset 重试 3 次。
+        // aicoming-proxy 在重负载下会主动 RST 连接(nginx worker 关闭),200KB 图片偶发失败。
+        // 不重试的话,每次失败要用户重试一次任务,体验差。
+        // 重试 3 次,间隔 1s/2s/4s 指数退避,最后一次失败才抛异常。
+        Exception lastException = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                // 2026-08-13 修复:curl 实测 3001 服务端实际接收的是
+                //   POST /v1/assets(GET 同路径返回素材列表)。
+                //   文档 §十 写的 /v1/assets/upload 路径返回 405 METHOD_NOT_ALLOWED。
+                //   这里用 /v1/assets 才是正确路径。
+                ResponseEntity<String> respEntity = restTemplate.postForEntity(
+                    baseUrl + "/v1/assets", requestEntity, String.class);
 
-            String respStr = respEntity.getBody();
-            log.info("[ASSET-UP] ← HTTP {}: {}", respEntity.getStatusCode(), truncateForLog(respStr, 2000));
+                String respStr = respEntity.getBody();
+                log.info("[ASSET-UP] ← HTTP {}: {}", respEntity.getStatusCode(), truncateForLog(respStr, 2000));
 
-            JsonNode resp = objectMapper.readTree(respStr);
-            JsonNode data = unwrapData(resp, Op.UPLOAD);
-            log.info("[ASSET-UP] ← 上传成功: id={}, asset_url={}, status={}, name={}",
-                data.path("id").asText(),
-                data.path("asset_url").asText(),
-                data.path("status").asText(),
-                data.path("name").asText());
-            return data;
-        } catch (BusinessException e) {
-            throw e;
-        } catch (org.springframework.web.client.HttpClientErrorException e) {
-            String respBody = e.getResponseBodyAsString();
-            log.error("[ASSET-UP] ← HTTP {}: body={}", e.getStatusCode(), respBody);
-            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
-                e.getStatusCode() + " | " + respBody);
-        } catch (Exception e) {
-            log.error("[ASSET-UP] ← 异常: {}", e.getMessage(), e);
-            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED, e.getMessage());
+                JsonNode resp = objectMapper.readTree(respStr);
+                JsonNode data = unwrapData(resp, Op.UPLOAD);
+                log.info("[ASSET-UP] ← 上传成功: id={}, asset_url={}, status={}, name={}",
+                    data.path("id").asText(),
+                    data.path("asset_url").asText(),
+                    data.path("status").asText(),
+                    data.path("name").asText());
+                return data;
+            } catch (BusinessException e) {
+                // 业务异常(比如响应格式错),不重试,直接抛
+                throw e;
+            } catch (org.springframework.web.client.HttpClientErrorException e) {
+                // 4xx 错误:服务端收到请求但拒绝,重试无意义
+                String respBody = e.getResponseBodyAsString();
+                log.error("[ASSET-UP] ← HTTP {}: body={}", e.getStatusCode(), respBody);
+                throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                    e.getStatusCode() + " | " + respBody);
+            } catch (Exception e) {
+                // 网络异常(Connection reset / timeout 等):重试 3 次
+                lastException = e;
+                log.warn("[ASSET-UP] ← 第{}次上传失败,准备重试: {}", attempt, e.getMessage());
+                if (attempt < 3) {
+                    try {
+                        Thread.sleep(1000L * (1L << (attempt - 1))); // 1s, 2s
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
+        // 3 次都失败
+        log.error("[ASSET-UP] ← 3 次重试后仍失败: {}", lastException != null ? lastException.getMessage() : "unknown");
+        throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+            lastException != null ? lastException.getMessage() : "asset upload failed after 3 retries");
     }
 
     /**
@@ -156,31 +185,53 @@ public class AicomingAssetsClient {
      */
     public JsonNode getAsset(String assetId) {
         log.debug("[ASSET-GET] → GET {}/v1/assets/{}", baseUrl, assetId);
-        try {
-            JsonNode resp = webClientBuilder.baseUrl(baseUrl).build()
-                .get()
-                .uri("/v1/assets/{id}", assetId)
-                .header("Authorization", "Bearer " + token)
-                .retrieve()
-                .bodyToMono(JsonNode.class)
-                .timeout(Duration.ofSeconds(30))
-                .block();
-            log.debug("[ASSET-GET] ← 响应: {}", truncateForLog(resp == null ? "null" : resp.toString(), 1000));
-            return unwrapData(resp, Op.QUERY);
-        } catch (WebClientResponseException.NotFound e) {
-            log.warn("[ASSET-GET] ← 404 asset 不存在: {}", assetId);
-            return null;
-        } catch (WebClientResponseException e) {
-            log.error("[ASSET-GET] ← HTTP {}: body={}", assetId, e.getStatusCode(), e.getResponseBodyAsString());
-            throw new BusinessException(ErrorCode.ASSET_NOT_ACTIVE,
-                "查询素材失败: " + e.getStatusCode());
-        } catch (BusinessException e) {
-            // unwrapData 抛出来的 ASSET_NOT_ACTIVE 直接传
-            throw e;
-        } catch (Exception e) {
-            log.error("[ASSET-GET] ← 异常: assetId={}, err={}", assetId, e.getMessage(), e);
-            throw new BusinessException(ErrorCode.ASSET_NOT_ACTIVE, e.getMessage());
+        // 2026-08-10 修复:getAsset 也加重试。aicoming proxy 在轮询期间偶发 PrematureClose
+        // (服务端在响应前关闭 TCP 连接),不重试的话 pollUntilActive 中途失败会标 FAILED。
+        // 重试 3 次,间隔 1s/2s 指数退避,Network/IO 异常才重试,业务异常立即抛。
+        Exception lastException = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                JsonNode resp = webClientBuilder.baseUrl(baseUrl).build()
+                    .get()
+                    .uri("/v1/assets/{id}", assetId)
+                    .header("Authorization", "Bearer " + token)
+                    .retrieve()
+                    .bodyToMono(JsonNode.class)
+                    .timeout(Duration.ofSeconds(30))
+                    .block();
+                log.debug("[ASSET-GET] ← 响应: {}", truncateForLog(resp == null ? "null" : resp.toString(), 1000));
+                return unwrapData(resp, Op.QUERY);
+            } catch (WebClientResponseException.NotFound e) {
+                // 404 不重试,直接返 null(按原行为)
+                log.warn("[ASSET-GET] ← 404 asset 不存在: {}", assetId);
+                return null;
+            } catch (WebClientResponseException e) {
+                // 其它 4xx/5xx 不重试,直接抛(服务端明确错误,重试无意义)
+                log.error("[ASSET-GET] ← HTTP {}: body={}", e.getStatusCode(), e.getResponseBodyAsString());
+                throw new BusinessException(ErrorCode.ASSET_NOT_ACTIVE,
+                    "查询素材失败: " + e.getStatusCode());
+            } catch (BusinessException e) {
+                // unwrapData 抛出来的 ASSET_NOT_ACTIVE 不重试,直接抛
+                throw e;
+            } catch (Exception e) {
+                // 网络异常(PrematureClose / ConnectException / SocketException 等):重试
+                lastException = e;
+                log.warn("[ASSET-GET] ← 第{}次轮询失败,准备重试: assetId={}, err={}",
+                    attempt, assetId, e.getMessage());
+                if (attempt < 3) {
+                    try {
+                        Thread.sleep(1000L * (1L << (attempt - 1))); // 1s, 2s
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
         }
+        log.error("[ASSET-GET] ← 3 次重试后仍失败: assetId={}, err={}",
+            assetId, lastException != null ? lastException.getMessage() : "unknown");
+        throw new BusinessException(ErrorCode.ASSET_NOT_ACTIVE,
+            lastException != null ? lastException.getMessage() : "getAsset failed after 3 retries");
     }
 
     /**
@@ -318,5 +369,68 @@ public class AicomingAssetsClient {
         if (s == null) return "null";
         if (s.length() <= maxLen) return s;
         return s.substring(0, maxLen) + "...(truncated, totalLen=" + s.length() + ")";
+    }
+
+    /**
+     * 上传 base64 data URI 图片并返回 active 状态的 asset_url。
+     * <p>
+     * 用于"单图生图"流程：先把用户的引用图上传到 aicoming-proxy（手册 §4.1.1），
+     * 拿到 {@code asset://aic_xxx} 后再传给 NewAPI 的 {@code /v1/images/generations} 的
+     * {@code image} 字段（手册 v3.0 §图生图）。
+     *
+     * @param dataUri   {@code data:image/png;base64,xxxx} 格式
+     * @param assetName 资产名（用于后台溯源）
+     * @return active 状态的 asset_url（{@code asset://aic_xxx}）
+     */
+    public String uploadDataUriAsAssetUrl(String dataUri, String assetName) {
+        if (dataUri == null || dataUri.isBlank()) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED, "dataUri 为空");
+        }
+        // 1) 解析 base64 → 字节
+        byte[] bytes;
+        String mime = "image/png";
+        String ext = ".png";
+        try {
+            String base64Data;
+            if (dataUri.startsWith("data:")) {
+                int commaIdx = dataUri.indexOf(",");
+                if (commaIdx == -1) {
+                    throw new IllegalArgumentException("无效的 data URI 格式");
+                }
+                String header = dataUri.substring(0, commaIdx);
+                base64Data = dataUri.substring(commaIdx + 1);
+                if (header.contains("image/jpeg") || header.contains("image/jpg")) {
+                    mime = "image/jpeg";
+                    ext = ".jpg";
+                } else if (header.contains("image/webp")) {
+                    mime = "image/webp";
+                    ext = ".webp";
+                }
+            } else {
+                base64Data = dataUri;
+            }
+            bytes = java.util.Base64.getDecoder().decode(base64Data);
+        } catch (Exception e) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "data URI 解码失败: " + e.getMessage());
+        }
+
+        // 2) 上传到 aicoming-proxy
+        String filename = "skill_ref_" + System.currentTimeMillis() + ext;
+        com.fasterxml.jackson.databind.JsonNode data =
+            uploadAssetByMultipart(bytes, filename, mime, assetName);
+        String assetId = data.path("id").asText("");
+        String assetUrl = data.path("asset_url").asText("");
+        log.info("[ASSET-SINGLE-IMG] ← 上传成功: id={}, asset_url={}, size={}B",
+            assetId, assetUrl, bytes.length);
+        if (assetUrl.isBlank()) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "aicoming-proxy 返回的 asset_url 为空");
+        }
+
+        // 3) 轮询等到 active 才能传给 NewAPI（手册 §4.2）
+        pollUntilActive(assetId, 90, 3);
+        log.info("[ASSET-SINGLE-IMG] ← 资产 active, 可用于 NewAPI image 字段: {}", assetUrl);
+        return assetUrl;
     }
 }

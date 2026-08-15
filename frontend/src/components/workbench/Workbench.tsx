@@ -17,6 +17,7 @@ import {
   PanelRightClose,
   Play,
   Plus,
+  RefreshCw,
   Search,
   Sparkles,
   Star,
@@ -734,6 +735,31 @@ export function Workbench() {
                     <div className="mt-4 h-1.5 overflow-hidden rounded-full bg-[#ebeef3]">
                       <div className="h-full rounded-full bg-[#4f7cff]" style={{ width: `${Math.min(100, selectedTask.progress)}%` }} />
                     </div>
+                    {/* FAILED 时显示"补刀"按钮：检查 NewAPI 是否其实已完成 */}
+                    {selectedTask.status === 'failed' && (
+                      <button
+                        onClick={async () => {
+                          try {
+                            const r: any = await videoApi.retry(selectedTask.id);
+                            if (r?.recovered) {
+                              // 补刀成功 → 重新加载任务状态
+                              const fresh = await videoApi.getTask(selectedTask.id);
+                              useWorkbenchStore.getState().upsertTask(fresh);
+                            } else {
+                              alert(`NewAPI 上任务尚未完成：${r?.reason ?? ''}`);
+                              // 仍然刷新一下，可能状态变了
+                              const fresh = await videoApi.getTask(selectedTask.id);
+                              useWorkbenchStore.getState().upsertTask(fresh);
+                            }
+                          } catch (e) {
+                            alert('补刀失败：' + (e instanceof Error ? e.message : String(e)));
+                          }
+                        }}
+                        className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-[#4f7cff] px-4 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ce5]"
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" /> 检查并补刀
+                      </button>
+                    )}
                   </div>
                 ) : (
                   <div className="text-center text-[#747b86]">
@@ -792,7 +818,7 @@ export function Workbench() {
                         {fav.thumbnailUrl ? (
                           <img src={fav.thumbnailUrl} alt="" className="h-full w-full object-cover" />
                         ) : (
-                          <video src={fav.resultUrl} className="h-full w-full object-cover" muted />
+                          <video src={fav.resultUrl} className="h-full w-full object-cover" muted playsInline preload="metadata" onLoadedMetadata={(e) => { const v = e.currentTarget; if (v.currentTime < 0.1) v.currentTime = 0.1; }} />
                         )}
                         <button
                           type="button"
@@ -877,7 +903,7 @@ export function Workbench() {
                       {t.status === 'succeeded' && t.thumbnailUrl ? (
                         <img src={t.thumbnailUrl} alt="" className="aspect-video w-full object-cover" />
                       ) : t.status === 'succeeded' && t.resultUrl ? (
-                        <video src={t.resultUrl} className="aspect-video w-full object-cover" muted />
+                        <video src={t.resultUrl} className="aspect-video w-full object-cover" muted playsInline preload="metadata" onLoadedMetadata={(e) => { const v = e.currentTarget; if (v.currentTime < 0.1) v.currentTime = 0.1; }} />
                       ) : (
                         <div className="flex aspect-video w-full flex-col items-center justify-center bg-[#f4f5f7] text-[#9ca2ad]">
                           <Loader2 className={cn('h-4 w-4', t.status === 'running' && 'animate-spin text-[#4f7cff]')} />

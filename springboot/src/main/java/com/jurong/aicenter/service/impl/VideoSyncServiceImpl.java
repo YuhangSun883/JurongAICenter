@@ -6,18 +6,19 @@ import com.jurong.aicenter.entity.Job;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.repository.JobRepository;
+import com.jurong.aicenter.service.MediaService;
 import com.jurong.aicenter.service.StorageService;
 import com.jurong.aicenter.service.VideoSyncService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,7 +42,7 @@ public class VideoSyncServiceImpl implements VideoSyncService {
     private final NewApiClient newApiClient;
     private final JobRepository jobRepository;
     private final StorageService storageService;
-    private final WebClient.Builder webClientBuilder;
+    private final MediaService mediaService;
 
     @Override
     public Job syncVideoFromNewApi(Long userId, Long jobId, String newApiTaskId) {
@@ -58,15 +59,26 @@ public class VideoSyncServiceImpl implements VideoSyncService {
             throw new BusinessException(ErrorCode.FORBIDDEN, "无权访问此 Job");
         }
 
-        // 2. 同步视频
+        // 2. 同步视频（内部已完成 recordAiGenerated）
         String url = downloadAndUpload(userId, jobId, newApiTaskId);
 
-        // 3. 写回 job（追加到 resultUrls）
+        // 3. 写回 job（追加到 resultUrls，并标 COMPLETED）
         List<String> urls = parseResultUrls(job.getResultUrls());
         if (!urls.contains(url)) {
             urls.add(url);
         }
         job.setResultUrls(toJsonArray(urls));
+        // 恢复被误判为 FAILED 的 job：直接标 COMPLETED
+        if (!"COMPLETED".equalsIgnoreCase(job.getStatus())) {
+            job.setStatus("COMPLETED");
+            if (job.getStartedAt() != null) {
+                job.setCompletedAt(java.time.LocalDateTime.now());
+                job.setDurationMs((int) java.time.Duration.between(
+                    job.getStartedAt(), job.getCompletedAt()).toMillis());
+            } else {
+                job.setCompletedAt(java.time.LocalDateTime.now());
+            }
+        }
         jobRepository.updateById(job);
 
         log.info("Video synced to MinIO: userId={}, jobId={}, newApiTaskId={}, url={}",
@@ -108,30 +120,44 @@ public class VideoSyncServiceImpl implements VideoSyncService {
         }
         log.info("Downloaded video: {} bytes", bytes.length);
 
-        // 4. 上传 MinIO
+        // 4. 上传 MinIO（统一走 ai-platform/ 路径，跟 VideoGenerationServiceImpl 保持一致）
         try (InputStream is = new ByteArrayInputStream(bytes)) {
-            String url = storageService.uploadFile(userId, jobId, filename, is, "video/mp4");
-            log.info("Uploaded to MinIO: {}", url);
+            String objectKey = String.format("ai-platform/%d/%d/%s",
+                userId, jobId, filename);
+            String url = storageService.uploadObject(objectKey, is, "video/mp4");
+            log.info("Uploaded to MinIO: key={}, url={}", objectKey, url);
             return url;
         } catch (Exception e) {
             throw new BusinessException(ErrorCode.INTERNAL_ERROR, "上传 MinIO 失败: " + e.getMessage());
         }
     }
 
-    /** 简单 GET 下载（用 WebClient，跟项目风格一致） */
+    /** 简单 GET 下载视频字节（火山 TOS 对 WebClient/ReactorNetty UA 返回 400，改用 JDK HttpClient 强制带 Chrome UA） */
     private byte[] downloadBytes(String url) {
-        return webClientBuilder.build()
-            .get()
-            .uri(url)
-            .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_OCTET_STREAM_VALUE)
-            .retrieve()
-            .bodyToMono(byte[].class)
-            .timeout(Duration.ofSeconds(300))
-            .onErrorMap(e -> {
-                log.error("Download video failed: {} - {}", url, e.getMessage());
-                return new BusinessException(ErrorCode.INTERNAL_ERROR, "下载视频失败: " + e.getMessage());
-            })
-            .block();
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofSeconds(300))
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .header("Accept", "*/*")
+                .GET()
+                .build();
+            HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            log.info("Download video: status={}, bytes={}", resp.statusCode(), resp.body() == null ? 0 : resp.body().length);
+            if (resp.statusCode() / 100 != 2) {
+                throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                    "下载视频失败: HTTP " + resp.statusCode());
+            }
+            return resp.body();
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Download video failed: {} - {}", url, e.getMessage());
+            throw new BusinessException(ErrorCode.INTERNAL_ERROR, "下载视频失败: " + e.getMessage());
+        }
     }
 
     private List<String> parseResultUrls(String json) {

@@ -27,7 +27,7 @@ import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
-import java.net.URL;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
@@ -52,7 +52,7 @@ import java.util.concurrent.Executor;
 @RequiredArgsConstructor
 public class ClothingTransferService {
 
-    /** 换装专用 prompt:严格保持主体不变,只换衣服 */
+    /** 单帧换装 prompt:保持主体不变,只换衣服 */
     private static final String CLOTHING_PROMPT_TEMPLATE =
         "将图1(原视频帧)中人物的服装和人脸同时进行替换:\n" +
         "1. 服装: 将图1中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
@@ -65,6 +65,33 @@ public class ClothingTransferService {
         "- 如果原图人物本来没穿这件衣服(比如手里拿着、放在旁边),保持原状,只替换穿在身上的\n" +
         "- 输出图片尺寸与图1一致\n" +
         "如果有多个参考图，它们是同一件衣服/同一个人的不同角度，最终输出里这件衣服/脸的不同角度都应与参考图一致";
+
+    /** 总图换装 prompt:一次性替换所有帧的衣服和人脸(性能优化) */
+    private static final String GRID_CLOTHING_PROMPT_TEMPLATE =
+        "图1是一张视频抽帧拼图,包含%FRAME_COUNT%帧画面(按行排列,每行3帧):\n" +
+        "请对图1中所有帧画面的人物进行服装和人脸替换:\n" +
+        "1. 服装: 将所有帧中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
+        "2. 人脸: 如果参考图中包含可见的人脸(特别是模特的脸),将所有帧中人物的脸也替换为该模特的脸\n" +
+        "严格要求:\n" +
+        "- 每一帧人物的动作、姿势、表情、发型(除衣服和脸外)完全不变\n" +
+        "- 每一帧的背景、光照、相机角度完全不变\n" +
+        "- 人物的身材、肤色保持不变\n" +
+        "- 只能改变衣服的款式/颜色/面料/图案 以及 脸部的五官\n" +
+        "- 保持原图的拼图布局、帧排列顺序和每帧的位置不变\n" +
+        "- 输出图片尺寸与图1完全一致\n" +
+        "- 所有帧的换装风格必须统一,衣服款式和人脸保持一致";
+
+    /** 视频节点换装 prompt:直接对视频帧整体换装 */
+    private static final String VIDEO_CLOTHING_PROMPT_TEMPLATE =
+        "将图1(视频)中人物的服装和人脸同时进行替换:\n" +
+        "1. 服装: 将图1中人物穿的衣服,替换为%CLOTHING_DESC%展示的那件衣服\n" +
+        "2. 人脸: 如果参考图中包含可见的人脸(特别是模特的脸),将图1中人物的脸也替换为该模特的脸\n" +
+        "严格要求:\n" +
+        "- 人物的动作、姿势、表情、发型(除被替换的部分外)完全不变\n" +
+        "- 背景、光照、相机角度完全不变\n" +
+        "- 人物的身材、肤色保持不变\n" +
+        "- 只能改变衣服的款式/颜色/面料/图案 以及 脸部的五官\n" +
+        "- 输出图片尺寸与图1一致";
 
     /** 2026-08-09 根据衣服图数量动态生成 prompt 描述部分 */
     private static String buildClothingDesc(int count) {
@@ -100,16 +127,25 @@ public class ClothingTransferService {
      */
     @Async("captionExecutor")
     public void executeTransferAsync(CanvasTask task, CanvasNode videoNode,
-                                      List<String> clothingNodeIds, Long userId) {
+                                      List<String> clothingNodeIds, Long userId,
+                                      String userInstruction) {
         if (task == null || videoNode == null) {
             log.error("[clothing-transfer] task/videoNode null");
             return;
         }
+        // 2026-08-11 fix:target = user clicked, from task.nodeId (no longer source)
+        // fix: resultUrl writes back to target (no more 9 new image nodes on right)
+        String targetNodeId = task.getNodeId();
+        CanvasNode targetNode = nodeRepository.selectById(targetNodeId);
+        if (targetNode == null) {
+            log.error("[clothing-transfer] targetNode not found: task.nodeId={}", targetNodeId);
+            return;
+        }
         if (clothingNodeIds == null || clothingNodeIds.size() != 3) {
             log.error("[clothing-transfer] 需要 3 张衣服图,实际 {} 张", clothingNodeIds == null ? 0 : clothingNodeIds.size());
-            failTask(task, videoNode, "需要恰好 3 张衣服参考图(正面/背面/模特上身)");
+            failTask(task, targetNode, "需要恰好 3 张衣服参考图(正面/背面/模特上身)");
             taskRepository.updateById(task);
-            nodeRepository.updateById(videoNode);
+            nodeRepository.updateById(targetNode);
             return;
         }
 
@@ -120,7 +156,7 @@ public class ClothingTransferService {
         task.setStatus("running");
         task.setStartedAt(LocalDateTime.now());
         taskRepository.updateById(task);
-        log.info("=== [clothing-transfer] START taskId={} source={} clothing={} ===",
+        log.debug("=== [clothing-transfer] START taskId={} source={} clothing={} ===",
             taskId, nodeId, clothingNodeIds);
 
         long start = System.currentTimeMillis();
@@ -129,25 +165,26 @@ public class ClothingTransferService {
         List<String> createdIds = new ArrayList<>();
 
         try {
-            List<FrameMeta> frames;
-            if ("image".equalsIgnoreCase(videoNode.getType())) {
-                // 2026-08-09:image 节点本身是拼图(image_1 就是拼图),直接当作 1 帧
-                frames = new ArrayList<>();
-                // 必须先创建 tmpDir,否则 Files.copy 报 NoSuchFileException
-                java.nio.file.Files.createDirectories(tmpDir);
-                java.io.InputStream in = new java.net.URL(videoNode.getResultUrl()).openStream();
-                Path tmpFrame = tmpDir.resolve("frame-0001.jpg");
-                java.nio.file.Files.copy(in, tmpFrame, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                in.close();
-                frames.add(new FrameMeta(0, 0, tmpFrame));
-                log.info("[clothing-transfer] image 节点不抽帧,只使用原图: 1 帧, videoNodeId={}", nodeId);
-            } else {
-                // video 节点:正常抽帧
-                frames = extractor.extractFrames(videoNode.getResultUrl(), tmpDir, 1.0);
-                log.info("[clothing-transfer] 抽帧完成: {} 帧, videoNodeId={}", frames.size(), nodeId);
-            }
+            // 2026-08-11 fix:整体换装(1次 NewAPI 调用,用户实测 3.5 分钟)
+            // 关键改进:task.setResultUrl(combinedUrl) → 前端轮询拿到后 flushSync 更新 activeNode
+            //          task.setCreatedNodeIds(null) → 前端不会创建新节点
+            //          整个流程不创建任何新节点,直接覆盖到 activeNode(用户上传衣服图的节点)
 
-            // ② 加载 3 张衣服图,转 base64 data URI
+            // ① 加载源图(总图或单图)
+            byte[] sourceBytes;
+            String sourceMime;
+            boolean isGrid = false;
+            int frameCount = 0;
+
+            if ("image".equalsIgnoreCase(videoNode.getType())) {
+                frameCount = parseFrameCount(videoNode.getSettings());
+                isGrid = frameCount > 1;
+                log.debug("[clothing-transfer] image 节点 frameCount={}, isGrid={}", frameCount, isGrid);
+            }
+            sourceBytes = downloadFromUrl(videoNode.getResultUrl());
+            sourceMime = detectMime(sourceBytes);
+
+            // ② 加载 3 张衣服图
             List<String> clothingDataUris = new ArrayList<>(3);
             for (String cid : clothingNodeIds) {
                 byte[] bytes = downloadNodeImageBytes(cid, userId);
@@ -158,110 +195,88 @@ public class ClothingTransferService {
                 String mime = detectMime(bytes);
                 clothingDataUris.add("data:" + mime + ";base64," + Base64.getEncoder().encodeToString(bytes));
             }
-            log.info("[clothing-transfer] 衣服图加载完成: 3 张, totalBytes={}",
-                clothingDataUris.stream().mapToInt(s -> s.length()).sum());
+            log.debug("[clothing-transfer] 衣服图加载完成: 3 张");
 
-            // ③ 逐帧调 NewAPI /v1/images/edits(image_1=原帧、image_2/3/4=衣服参考)
-            List<String> transferResultUrls = new ArrayList<>();
-            int frameIdx = 0;
-            for (FrameMeta frame : frames) {
-                try {
-                    byte[] frameBytes = Files.readAllBytes(frame.path());
-                    String frameDataUri = "data:image/jpeg;base64," +
-                        Base64.getEncoder().encodeToString(frameBytes);
+            // ③ 选择 prompt + 1 次 NewAPI 整体换装
+            String prompt;
+            String sourceDataUri = "data:" + sourceMime + ";base64," +
+                Base64.getEncoder().encodeToString(sourceBytes);
 
-                    List<String> refs = new ArrayList<>(4);
-                    refs.add(frameDataUri);
-                    refs.addAll(clothingDataUris);
-
-                    log.info("[clothing-transfer] 帧 {}/{} 调 NewAPI editImage, promptLen={}, refs={}",
-                        frameIdx + 1, frames.size(), CLOTHING_PROMPT_TEMPLATE.length(), refs.size());
-
-                    String resultDataUri = newApiClient.editImage(
-                        CLOTHING_PROMPT_TEMPLATE.replace("%CLOTHING_DESC%", buildClothingDesc(clothingDataUris.size())),
-                        refs, detectOutputSize(frameBytes), "low", null);
-
-                    // resultDataUri 是 "data:image/png;base64,..." 或 URL,统一解析上传 MinIO
-                    byte[] resultBytes = decodeResultDataUri(resultDataUri);
-                    String key = "clothing-transfer/" + nodeId + "/frame-" + String.format("%02d", frameIdx) +
-                        "-" + System.currentTimeMillis() + ".png";
-                    String url;
-                    try (InputStream in = new ByteArrayInputStream(resultBytes)) {
-                        url = storageService.uploadObject(key, in, "image/png");
-                    }
-                    transferResultUrls.add(url);
-                    log.info("[clothing-transfer] 帧 {}/{} 完成 → {}", frameIdx + 1, frames.size(), url);
-                } catch (Exception frameErr) {
-                    log.warn("[clothing-transfer] 帧 {}/{} 失败: {}",
-                        frameIdx + 1, frames.size(), frameErr.getMessage());
-                    transferResultUrls.add(null);  // 占位,后续拼图时跳过
-                }
-                frameIdx++;
+            // 2026-08-11:根据 userInstruction 拼接约束(用户自然语言描述)
+            // - 如果为空,使用默认 GRID/VIDEO 换装模板(行为不变)
+            // - 如果非空,使用 GENERIC 通用模板 + 用户的具体要求
+            String userInstructionBlock = "";
+            if (userInstruction != null && !userInstruction.isBlank()) {
+                userInstructionBlock = "\n【用户的具体转换要求】\n" + userInstruction.trim() + "\n";
             }
 
-            int successCount = (int) transferResultUrls.stream().filter(u -> u != null).count();
-            log.info("[clothing-transfer] 全部帧完成: {}/{} 成功", successCount, frames.size());
+            if (isGrid) {
+                prompt = GRID_CLOTHING_PROMPT_TEMPLATE
+                    .replace("%FRAME_COUNT%", String.valueOf(frameCount))
+                    .replace("%CLOTHING_DESC%", buildClothingDesc(clothingDataUris.size()));
+                log.debug("[clothing-transfer] 整体换装(总图): frameCount={}, 1次API调用", frameCount);
+            } else {
+                prompt = VIDEO_CLOTHING_PROMPT_TEMPLATE
+                    .replace("%CLOTHING_DESC%", buildClothingDesc(clothingDataUris.size()));
+                log.debug("[clothing-transfer] 整体换装(单图/视频): 1次API调用");
+            }
 
-            if (successCount == 0) {
-                failTask(task, videoNode, "所有帧换装失败,NewAPI 可能不可达");
+            // 2026-08-11:如果用户有自定义描述,拼到 prompt 末尾作为强约束
+            if (!userInstructionBlock.isEmpty()) {
+                prompt = prompt + userInstructionBlock;
+                log.debug("[clothing-transfer] 用户自定义描述已拼接到 prompt: {} 字符",
+                    userInstruction.trim().length());
+            }
+
+            // 调 NewAPI
+            List<String> refs = new ArrayList<>(4);
+            refs.add(sourceDataUri);
+            refs.addAll(clothingDataUris);
+            String outputSize = detectOutputSize(sourceBytes);
+            log.debug("[clothing-transfer] 开始 NewAPI editImage: refs={}, outputSize={}",
+                refs.size(), outputSize);
+            String resultDataUri = newApiClient.editImage(
+                prompt, refs, outputSize, "low", null);
+
+            // ④ 上传到 MinIO,覆盖到 activeNode
+            byte[] resultBytes = decodeResultDataUri(resultDataUri);
+            String key = "clothing-transfer/" + nodeId + "/result-" + System.currentTimeMillis() + ".png";
+            String combinedUrl;
+            try (InputStream in = new ByteArrayInputStream(resultBytes)) {
+                combinedUrl = storageService.uploadObject(key, in, "image/png");
+            }
+            if (combinedUrl == null) {
+                failTask(task, targetNode, "换装失败,NewAPI 返回空结果");
                 taskRepository.updateById(task);
-                nodeRepository.updateById(videoNode);
+                nodeRepository.updateById(targetNode);
                 return;
             }
+            targetNode.setResultUrl(combinedUrl);
+            targetNode.setStatus("success");
+            targetNode.setUpdatedAt(LocalDateTime.now());
+            nodeRepository.updateById(targetNode);
+            log.debug("[clothing-transfer] 结果覆盖到 activeNode: targetNodeId={}, url={}", targetNodeId, combinedUrl);
 
-            // ④ 自动建 image 节点(每张成功换装图 1 个)
-            int imageNodeCount = 0;
-            for (int i = 0; i < transferResultUrls.size(); i++) {
-                String url = transferResultUrls.get(i);
-                if (url == null) continue;
-                CanvasNode imgNode = new CanvasNode();
-                imgNode.setUserId(videoNode.getUserId());
-                imgNode.setCanvasId(videoNode.getCanvasId());
-                imgNode.setType("image");
-                imgNode.setTitle("换装 #" + String.format("%02d", i + 1));
-                imgNode.setResultUrl(url);
-                // 位置:视频节点右边,4 列布局,行高 240
-                int col = imageNodeCount % 4;
-                int row = imageNodeCount / 4;
-                imgNode.setPositionX((videoNode.getPositionX() == null ? 0 : videoNode.getPositionX()) + 360 + col * 340);
-                imgNode.setPositionY((videoNode.getPositionY() == null ? 0 : videoNode.getPositionY()) + row * 240);
-                imgNode.setStatus("success");
-                LocalDateTime now = LocalDateTime.now();
-                imgNode.setCreatedAt(now);
-                imgNode.setUpdatedAt(now);
-                nodeRepository.insert(imgNode);
-                createdIds.add(imgNode.getId());
-                imageNodeCount++;
-            }
-            log.info("[clothing-transfer] 建 image 节点: {} 个", imageNodeCount);
-
-            // ⑤ 不再生成拼图节点(用户只要 frame-00-...png 单图)
-//    保留 combineTransferResults 方法代码备以后需要,但不调用
-
-            // ⑥ task SUCCESS
+            // ⑤ task SUCCESS - 同步 resultUrl + 清空 createdNodeIds
             task.setStatus("success");
+            task.setResultUrl(combinedUrl);  // 关键:前端轮询拿到后 flushSync → 无需刷新
+            task.setCreatedNodeIds(null);    // 关键:前端不创建新节点
             task.setDurationMs((int) (System.currentTimeMillis() - start));
             task.setCompletedAt(LocalDateTime.now());
-            try {
-                com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-                task.setCreatedNodeIds(mapper.writeValueAsString(createdIds));
-            } catch (Exception jsonErr) {
-                log.warn("[clothing-transfer] createdNodeIds JSON 失败(非致命): {}", jsonErr.getMessage());
-            }
-            log.info("[clothing-transfer] SUCCESS: taskId={}, frames={}, successFrames={}, imageNodes={}, durationMs={}",
-                taskId, frames.size(), successCount, createdIds.size(), task.getDurationMs());
-            log.info("=== [clothing-transfer] DONE taskId={} status=SUCCESS durationMs={} ===",
+            log.debug("[clothing-transfer] SUCCESS: taskId={}, isGrid={}, durationMs={}",
+                taskId, isGrid, task.getDurationMs());
+            log.debug("=== [clothing-transfer] DONE taskId={} status=SUCCESS durationMs={} ===",
                 taskId, task.getDurationMs());
         } catch (BusinessException e) {
             log.error("[clothing-transfer] BIZ_FAIL: taskId={}, err={}", taskId, e.getMessage());
             log.error("=== [clothing-transfer] DONE taskId={} status=FAILED reason=BIZ durationMs={} ===",
                 taskId, System.currentTimeMillis() - start);
-            failTask(task, videoNode, e.getMessage());
+            failTask(task, targetNode, e.getMessage());
         } catch (Exception e) {
             log.error("[clothing-transfer] FAIL: taskId={}, err={}", taskId, e.getMessage(), e);
             log.error("=== [clothing-transfer] DONE taskId={} status=FAILED reason=EXCEPTION durationMs={} ===",
                 taskId, System.currentTimeMillis() - start);
-            failTask(task, videoNode, e.getMessage() == null ? "未知错误" : e.getMessage());
+            failTask(task, targetNode, e.getMessage() == null ? "未知错误" : e.getMessage());
         } finally {
             try {
                 if (Files.exists(tmpDir)) {
@@ -271,7 +286,7 @@ public class ClothingTransferService {
                 }
             } catch (Exception ignore) {}
             taskRepository.updateById(task);
-            nodeRepository.updateById(videoNode);
+            nodeRepository.updateById(targetNode);
         }
     }
 
@@ -304,9 +319,63 @@ public class ClothingTransferService {
     }
 
     private byte[] downloadFromUrl(String url) throws Exception {
-        try (InputStream in = new URL(url).openStream()) {
-            return in.readAllBytes();
+        // 2026-08-12 修复:MinIO 24h 临时签名 URL 可能过期 (403),反引号/空格污染 URL,
+        //   上游维修期更常见。这里加 sanitize + 1 retry,容忍临时 5xx 抖动。
+        String cleanUrl = sanitizeUrlForDownload(url);
+        Exception last = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try (InputStream in = new URI(cleanUrl).toURL().openStream()) {
+                return in.readAllBytes();
+            } catch (Exception e) {
+                last = e;
+                int code = extractHttpCode(e);
+                // 4xx 客户端错误(包括 403 expired、404 not found)立刻抛
+                if (code >= 400 && code < 500 && code != 408 && code != 429) {
+                    String friendly = code == 403
+                        ? "图片访问被拒绝(403,通常是 MinIO 24h 签名 URL 过期)"
+                        : "图片访问失败 (HTTP " + code + ")";
+                    throw new RuntimeException(friendly + ": " + cleanUrl, e);
+                }
+                log.warn("[clothing-transfer] 下载图片失败(尝试 {}/2): code={}, err={}",
+                    attempt, code, e.getMessage());
+                try { Thread.sleep(800L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
         }
+        throw new RuntimeException("下载图片失败(已重试 2 次): " + cleanUrl, last);
+    }
+
+    /** 2026-08-12 新增:清洗 URL 前后反引号/引号/空格 (上游 resultUrl 偶发污染) */
+    private String sanitizeUrlForDownload(String url) {
+        if (url == null) return null;
+        String s = url.trim();
+        s = s.replaceAll("^`+|`+$", "");
+        s = s.replaceAll("^['\"]+|['\"]+$", "");
+        s = s.trim();
+        // 去除 URL 末尾可能存在的 `,` 或 `,`
+        if (s.endsWith(",") || s.endsWith(",")) {
+            s = s.substring(0, s.length() - 1).trim();
+        }
+        return s;
+    }
+
+    /** 从异常链里找 HTTP 状态码 (sun.net.www.protocol.http.HttpURLConnection 抛的) */
+    private int extractHttpCode(Exception e) {
+        Throwable t = e;
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null) {
+                if (msg.contains("HTTP response code: 403")) return 403;
+                if (msg.contains("HTTP response code: 404")) return 404;
+                if (msg.contains("HTTP response code: 410")) return 410;
+                if (msg.contains("HTTP response code: 408")) return 408;
+                if (msg.contains("HTTP response code: 429")) return 429;
+                if (msg.contains("HTTP response code: 500")) return 500;
+                if (msg.contains("HTTP response code: 502")) return 502;
+                if (msg.contains("HTTP response code: 503")) return 503;
+            }
+            t = t.getCause();
+        }
+        return -1;
     }
 
     /** 检测图片 MIME:从 magic bytes */
@@ -370,12 +439,9 @@ public class ClothingTransferService {
         int origW = firstImg.getWidth();
         int origH = firstImg.getHeight();
         final int FRAME_W = 320;
-        final int FRAME_H = (int) Math.round((double) FRAME_W * origH / origW);
-        if (FRAME_H < 100) FRAME_H_TYPE_HACK: {} // ignore, will set below
-        final int frameH;
-        if (FRAME_H < 100) frameH = 100;
-        else if (FRAME_H > 540) frameH = 540;
-        else frameH = FRAME_H;
+        int frameH = (int) Math.round((double) FRAME_W * origH / origW);
+        if (frameH < 100) frameH = 100;
+        else if (frameH > 540) frameH = 540;
 
         final int COLS = 4;
         final int GAP = 8;
@@ -433,7 +499,7 @@ public class ClothingTransferService {
             url = storageService.uploadObject(key, in, "image/jpeg");
         }
         Files.deleteIfExists(tmpFile);
-        log.info("[clothing-grid] created: {} ({}x{} px, {} frames)", url, canvasW, canvasH, total);
+        log.debug("[clothing-grid] created: {} ({}x{} px, {} frames)", url, canvasW, canvasH, total);
         return url;
     }
 
@@ -460,6 +526,101 @@ public class ClothingTransferService {
         } catch (Exception e) {
             return "1024x1024";  // fallback
         }
+    }
+
+    /**
+     * 从 settings JSON 中解析 frameCount
+     * settings 格式: {"frameCount":9,"source":"video-extract"}
+     * @return frameCount, 解析失败返回 0
+     */
+    private int parseFrameCount(String settings) {
+        if (settings == null || settings.isBlank()) return 0;
+        try {
+            com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(settings);
+            if (node.has("frameCount")) {
+                return node.get("frameCount").asInt(0);
+            }
+        } catch (Exception e) {
+            log.warn("[clothing-transfer] 解析 settings 失败: {}", e.getMessage());
+        }
+        return 0;
+    }
+
+    /**
+     * 将抽帧总图拆分成多帧
+     * 总图布局与 VideoFrameCaptionService.combineAndUploadFrames 一致:
+     *   - 3 列 (MAX_COLS = 3)
+     *   - 每帧宽 320px (FRAME_W = 320)
+     *   - 间距 8px (GAP = 8)
+     *   - 背景浅灰色 (245, 247, 250)
+     *
+     * @param gridUrl  总图 URL
+     * @param outDir   输出目录
+     * @param frameCount 帧数
+     * @return 拆分后的帧元数据列表
+     */
+    private List<FrameMeta> splitFrameGrid(String gridUrl, Path outDir, int frameCount) throws Exception {
+        // 下载总图
+        byte[] gridBytes;
+        try (java.io.InputStream in = new java.net.URI(gridUrl).toURL().openStream()) {
+            gridBytes = in.readAllBytes();
+        }
+        
+        // 读取总图
+        BufferedImage gridImg = ImageIO.read(new ByteArrayInputStream(gridBytes));
+        if (gridImg == null) {
+            throw new BusinessException(com.jurong.aicenter.exception.ErrorCode.INTERNAL_ERROR, "无法读取抽帧总图");
+        }
+        
+        int gridW = gridImg.getWidth();
+        int gridH = gridImg.getHeight();
+        log.debug("[clothing-transfer] 抽帧总图尺寸: {}x{} px, frameCount={}", gridW, gridH, frameCount);
+        
+        // 布局参数(与 combineAndUploadFrames 一致)
+        final int MAX_COLS = 3;
+        final int FRAME_W = 320;
+        final int GAP = 8;
+        
+        // 计算行数
+        int cols = Math.min(frameCount, MAX_COLS);
+        int rows = (frameCount + cols - 1) / cols;
+        
+        // 计算每帧高度(基于总图尺寸和布局)
+        int rowH = (gridH - (rows - 1) * GAP) / rows;
+        if (rowH < 100) rowH = 100;
+        
+        List<FrameMeta> frames = new ArrayList<>();
+        for (int i = 0; i < frameCount; i++) {
+            int col = i % cols;
+            int row = i / cols;
+            
+            // 计算帧在总图中的位置
+            int x = col * (FRAME_W + GAP);
+            int y = row * (rowH + GAP);
+            
+            // 边界检查
+            int frameW = Math.min(FRAME_W, gridW - x);
+            int frameHeight = Math.min(rowH, gridH - y);
+            
+            if (frameW <= 0 || frameHeight <= 0) {
+                log.warn("[clothing-transfer] 帧 {} 超出总图边界,跳过", i);
+                continue;
+            }
+            
+            // 裁剪帧
+            BufferedImage frameImg = gridImg.getSubimage(x, y, frameW, frameHeight);
+            
+            // 保存帧
+            String filename = String.format("frame-%04d.jpg", i + 1);
+            Path framePath = outDir.resolve(filename);
+            ImageIO.write(frameImg, "jpg", framePath.toFile());
+            
+            frames.add(new FrameMeta(i, i, framePath));
+            log.debug("[clothing-transfer] 帧 {} 拆分完成: x={}, y={}, {}x{}", i, x, y, frameW, frameHeight);
+        }
+        
+        log.debug("[clothing-transfer] 抽帧总图拆分完成: {} 帧", frames.size());
+        return frames;
     }
 
     private void failTask(CanvasTask task, CanvasNode node, String rawMsg) {

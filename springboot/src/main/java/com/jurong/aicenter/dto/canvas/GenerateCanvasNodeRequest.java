@@ -53,4 +53,11 @@ public class GenerateCanvasNodeRequest {
      * 其他场景: 忽略此字段,走正常生成流程
      */
     private List<String> materialNodeIds;
+
+    /**
+     * 2026-08-11 新增:用户的自然语言转换描述(如"换人脸+换沐浴露"、"只换衣服不换人脸"、
+     * "换商品包装,不换模特"等)。最终会拼到 prompt 里作为约束条件传给 NewAPI。
+     * 空/null 时按默认 prompt(换装模板)处理。
+     */
+    private String userInstruction;
 }

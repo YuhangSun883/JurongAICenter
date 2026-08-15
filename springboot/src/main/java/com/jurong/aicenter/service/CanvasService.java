@@ -101,10 +101,49 @@ public interface CanvasService {
      * 生成 N 张"只换了衣服、主体/背景全不变"的图 + 1 张拼图。
      *
      * @param userId          当前用户
-     * @param videoNodeId     视频节点 ID
-     * @param clothingNodeIds 3 个衣服 image 节点的 id,顺序为[正面,背面,模特上身]
+     * @param targetNodeId    结果落点节点(也即源节点,直接在节点上点换装)
+     * @param clothingNodeIds 衣服 image 节点的 id,顺序为[正面,背面,模特上身]
      * @return 立刻返回 pending 状态,前端轮询 /tasks/{taskId}
      */
-    GenerateCanvasNodeResponse transferClothing(Long userId, String videoNodeId,
+    GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
                                                 List<String> clothingNodeIds);
+
+    /**
+     * 2026-08-10 v5:换装(重载版) — 结果落在 target 节点,source 节点只读(不覆盖原图)。
+     * 从 generateNode 自动路由时调用:右侧激活节点是 target,上游抽帧图节点是 source。
+     *
+     * @param userId            当前用户
+     * @param targetNodeId      结果落点节点(右侧激活节点,写回 resultUrl)
+     * @param sourceNodeId      源节点(抽帧图/视频节点,只读,resultUrl 保持不变)
+     * @param clothingNodeIds   衣服 image 节点的 id 列表
+     * @return 立刻返回 pending 状态,前端轮询 /tasks/{taskId}
+     */
+    GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
+                                                String sourceNodeId, List<String> clothingNodeIds);
+
+    /**
+     * 2026-08-11 新增:5 参数重载,支持 userInstruction(用户的自然语言转换描述,如"换人脸+换沐浴露")
+     *
+     * @param userInstruction   用户的转换要求,会作为强约束拼到 NewAPI prompt 末尾。可空。
+     */
+    GenerateCanvasNodeResponse transferClothing(Long userId, String targetNodeId,
+                                                String sourceNodeId, List<String> clothingNodeIds,
+                                                String userInstruction);
+
+    /**
+     * 2026-08-10 新增:画布视频生成(从多源输入生成新视频)
+     * 1. 从 videoGenNode 的 upstreamIds 拿脚本拆解文本 + 换装总图
+     * 2. 合并 prompt(用户优先)
+     * 3. 调 VideoGenerationService(走 NewAPI 主路径)
+     * 4. 轮询 → 完成 → 建新视频节点
+     * 立刻返回 pending,前端轮询 /tasks/{taskId}。
+     *
+     * @param userId        当前用户
+     * @param videoGenNodeId 视频生成节点 ID(节点 type=video-generation,upstreamIds 含 text + image)
+     * @param duration      视频时长(秒),默认 9(跟原视频一致)
+     * @param resolution    视频分辨率,如 "720P",默认 "720P"
+     * @return pending 状态的任务,前端轮询看结果
+     */
+    GenerateCanvasNodeResponse generateVideoFromCanvas(Long userId, String videoGenNodeId,
+                                                       int duration, String resolution);
 }

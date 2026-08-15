@@ -105,7 +105,15 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(ErrorCode.INVALID_CREDENTIALS, "邮箱或密码错误");
         }
 
-        // 4. 返回响应
+        // 4. 2026-08-14 新增：管理员账号禁止从普通 /login 页登录
+        // 普通 /login 是用户入口，ADMIN 账号必须通过 /admin/login 独立入口登录
+        // （如果未来支持独立后台登录路由，校验逻辑可按 entrypoint 区分）
+        if ("ADMIN".equals(user.getRole())) {
+            throw new BusinessException(ErrorCode.ADMIN_LOGIN_FORBIDDEN_ON_USER_ENTRY,
+                    "管理员账号请通过管理后台专属入口登录");
+        }
+
+        // 5. 返回响应
         return buildAuthResponse(user);
     }
 

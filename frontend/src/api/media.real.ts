@@ -15,7 +15,6 @@ import type { PageResult } from '@/types/api';
 import { getAccessToken } from '@/lib/auth-store';
 
 const API = '/api/media';
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
 
 export async function listLibraries(): Promise<MediaLibrary[]> {
   const res = await request<MediaLibrary[]>(`${API}/libraries`);
@@ -78,7 +77,8 @@ export async function uploadAsset(file: File, libraryId?: number): Promise<Media
   const headers: Record<string, string> = {};
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(new URL(`${API}/assets`, API_BASE), {
+  // 走相对路径，由 Next.js rewrites 代理到 :8080
+  const res = await fetch(`${API}/assets`, {
     method: 'POST',
     headers,
     body: form,

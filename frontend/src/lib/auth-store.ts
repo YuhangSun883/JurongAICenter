@@ -174,7 +174,7 @@ export async function silentRefresh(): Promise<boolean> {
 }
 
 function buildApiUrl(path: string): string {
-  const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:4000';
+  const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://localhost:8080';
   return new URL(path, base).toString();
 }
 
