@@ -1,0 +1,145 @@
+# ============================================================
+# JWT 配置(HS256,密钥至少 32 字节)
+# 生产环境务必用环境变量覆盖:JWT_SECRET=xxx,别把密钥写进 yml 提交到 git
+# ============================================================
+jwt:
+  secret: ${JWT_SECRET:dev-only-secret-please-change-in-production-32bytes-min}
+  access-token-expiry: 2h
+  refresh-token-expiry: 7d
+  issuer: jurong-aicenter
+
+spring:
+  profiles:
+    active: dev
+  application:
+    name: aicenter
+  main:
+    allow-circular-references: true   # V8 资产库：MediaService ↔ MediaLibraryService 循环依赖
+  jackson:
+    default-property-inclusion: non_null
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 200MB       # 单文件最大（视频上传需要）
+      max-request-size: 220MB    # 整个 multipart 请求最大
+  mvc:
+    throw-exception-if-no-handler-found: false
+
+server:
+  port: 8080
+  servlet:
+    context-path: /
+  compression:
+    enabled: true
+    mime-types: application/json
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.jurong.aicenter.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+
+# ============================================================
+# NewAPI 中转站配置（视频生成 / 聊天统一走这里 :3000）
+# ============================================================
+newapi:
+  base-url: ${NEWAPI_BASE_URL:http://localhost:3000}
+  token: ${NEWAPI_TOKEN:}
+
+# ============================================================
+# aicoming-image-proxy 配置（素材库 CRUD 走这里 :8090）
+# 文档 §3 明说：
+#   - :8080 是 aicoming-video-proxy（视频生成），不管理素材库
+#   - :8090 是 aicoming-image-proxy（图像生成 + 素材库）
+#   - 素材上传到 :8080 会导致 asset_url 不被 :3000 识别（asset_line_unavailable）
+# 部署时通过环境变量覆盖
+# ============================================================
+aicoming:
+  proxy:
+    base-url: ${AICOMING_PROXY_BASE_URL:http://192.140.163.161:8090}
+    token: ${AICOMING_PROXY_TOKEN:${NEWAPI_TOKEN:}}   # 默认复用 newapi token
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    root: INFO
+    com.jurong.aicenter: INFO
+    com.baomidou.mybatisplus: WARN
+
+# ============================================================
+# LLM 配置（画布文本润色 / Agent 对话共用）
+# ============================================================
+llm:
+  model: claude-sonnet-4-6  # 多模态模型（NewAPI 实际可用），支持图片理解
+  max-tokens: 2048
+  system-prompt: |
+    你是 Jurong AI 助手。用户可能上传图片给你。
+
+    **任务**：
+    1. 先识别图片内容（如果上传了图片）
+    2. 根据用户意图决定是否需要跳转生成模块
+
+    **生成跳转规则**（满足时输出 tool_call JSON）：
+    - 用户动词包含"生成/做/画/创建/转换/变成/转成/换成/加上/做个"
+    - 描述了具体目标（如"红色背景""卡通风格""短视频"）
+    - 上传图片 + 想生成 → 用图片作素材
+
+    **不要跳转的情况**：
+    - "分析/描述/这是什么/看看/帮我看下/是什么东西" → 只回答，不跳转
+
+    **工具调用格式**（仅在需要跳转时输出，JSON 放在回复末尾）：
+    {"tool_call": {"action": "<action_name>", "prompt": "<用户意图>", "reason": "<简短解释>"}}
+
+    **支持的 action**：
+    - jump-to-image: 文生图（没有参考图）
+    - jump-to-image-edit: 图生图（有参考图，要编辑/转换）
+    - jump-to-video: 文生视频
+    - jump-to-image-to-video: 图生视频
+    - jump-to-product-image: 商详图
+    - jump-to-image-enhancer: 图像增强
+
+    **示例**：
+    用户："把这张图变成红色背景"
+    → 回复："我看到这是一张风景照。" + {"tool_call": {"action": "jump-to-image-edit", "prompt": "把背景换成红色", "reason": "图生图需求"}}
+
+    用户："这是什么花？"
+    → 回复："这是玫瑰花。"（不加 tool_call）
+
+    普通问题直接回答，输出简洁，不要 markdown 格式。
+  image-poll-timeout-sec: 600    # ComfyUI text-to-image 超时（10 分钟）
+  video-poll-timeout-sec: 1800   # NewAPI 视频生成超时（30 分钟）
+
+# 画布 workflow 模板位置（开发期用绝对路径指向项目根 workflows/目录）
+canvas:
+  workflows-dir: E:/8-10/JurongAICenter/workflows/
+  # 画布节点的默认模型参数（最便宜档位，节省测试费用）
+  defaults:
+    image-model: gpt-image-2-1k
+    image-size: 1024x1024    # ComfyUI 最小可用尺寸（512 不被节点接受）
+    image-quality: low        # 最低质量（节省点数）
+    video-model: doubao-seedance-2.0
+    video-duration: 4         # 秒，最小
+    video-resolution: 480P     # 最小分辨率
+    video-enable-prompt-optimize: true

@@ -1,0 +1,15 @@
+# 忽略 IDEA 和 VS Code 的配置
+.idea/
+.vscode/
+
+# 忽略 Java 编译产出
+springboot/target/
+springboot/out/
+
+# 忽略前端依赖
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# 忽略本地日志
+*.log
