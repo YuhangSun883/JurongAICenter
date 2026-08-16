@@ -1,14 +1,17 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { Plus, ArrowUp, Image as ImageIcon, Video as VideoIcon, Sparkles, Bot, X } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Plus, ArrowUp, Image as ImageIcon, Video as VideoIcon, Sparkles, Bot, X, User as UserIcon } from 'lucide-react';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
+import { MediaPreviewDialog } from '@/components/common/MediaPreviewDialog';
+import { ReferenceMediaThumbnail } from '@/components/common/ReferenceMediaThumbnail';
 import { InlineSelect } from '@/components/common/InlineSelect';
 import { InsufficientCreditsDialog } from '@/components/common/InsufficientCreditsDialog';
 import { useMaterials, type GlobalMaterial } from '@/contexts/MaterialsContext';
 import { creationsApi, type CreationType } from '@/api/creations';
 import { ApiError } from '@/lib/http';
+import { stripToolCall } from '@/lib/stripToolCall';
 import { cn } from '@/lib/utils';
 
 const HOME_MAX_REFS = 12;
@@ -39,6 +42,8 @@ export function ScriptCard() {
   });
   const [picked, setPicked] = useState<PickedMedia[]>([]);
   const [open, setOpen] = useState(false);
+  // 预览弹窗
+  const [preview, setPreview] = useState<PickedMedia | null>(null);
   // 素材库（全局共享，所有工具页面通用）
   const { materials, addMaterials, removeMaterial, dedupMaterials } = useMaterials();
   // 启动时清理历史重复项（按 name + size 去重）
@@ -47,6 +52,14 @@ export function ScriptCard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const remainingPickSlots = Math.max(0, HOME_MAX_REFS - picked.length);
+
+  // 对话历史（只用于 Agent 模式下的即时回显，刷新会清空）
+  type ChatMsg = { id: string; role: 'user' | 'agent'; text: string; ts: number };
+  const [chat, setChat] = useState<ChatMsg[]>([]);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [chat]);
 
   return (
     <section className="mt-6">
@@ -60,9 +73,7 @@ export function ScriptCard() {
             iconClassName="h-10 w-10"
           />
         ) : (
-          <button
-            type="button"
-            onClick={() => setOpen(true)}
+          <div
             className="group relative flex h-32 w-32 flex-none flex-col items-center justify-center overflow-hidden rounded-2xl bg-bg-soft text-fg-subtle transition sm:h-36 sm:w-36"
           >
             <>
@@ -80,19 +91,16 @@ export function ScriptCard() {
                 {picked.slice(0, 9).map((m) => (
                   <div
                     key={m.id}
-                    className="group/cell relative aspect-square overflow-hidden rounded-md border border-bg-line"
+                    onClick={() => setPreview(m)}
+                    className="group/cell relative aspect-square cursor-pointer overflow-hidden rounded-md border border-bg-line"
+                    title={`${m.name}（点击预览）`}
                   >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={m.url}
-                      alt={m.name}
-                      className="h-full w-full object-cover"
-                    />
+                    <ReferenceMediaThumbnail media={m} />
                     {/* hover 显示删除按钮 */}
                     <button
                       type="button"
                       onClick={(e) => {
-                        e.stopPropagation(); // 不触发打开弹窗
+                        e.stopPropagation(); // 不触发预览
                         setPicked((prev) => prev.filter((x) => x.id !== m.id));
                       }}
                       className="absolute right-0.5 top-0.5 grid h-5 w-5 place-items-center rounded-full bg-black/60 text-white opacity-0 transition group-hover/cell:opacity-100"
@@ -103,16 +111,25 @@ export function ScriptCard() {
                   </div>
                 ))}
               </div>
-              {/* 右下角 + 浮按钮（hover 显示） */}
-              <span className="absolute bottom-1.5 right-1.5 grid h-7 w-7 place-items-center rounded-full bg-white text-fg shadow-soft transition group-hover:scale-110">
+              {/* 右下角 + 浮按钮：点击打开上传素材弹窗 */}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setOpen(true);
+                }}
+                className="absolute bottom-1.5 right-1.5 grid h-7 w-7 place-items-center rounded-full bg-white text-fg shadow-soft transition group-hover:scale-110 hover:bg-brand hover:text-white"
+                title="添加素材"
+                aria-label="添加素材"
+              >
                 <Plus className="h-4 w-4" strokeWidth={2.5} />
-              </span>
+              </button>
               {/* 下方"已选 N" */}
               <span className="absolute -bottom-5 left-0 right-0 text-center text-[11px] text-brand">
                 已选 {picked.length}
               </span>
             </>
-          </button>
+          </div>
         )}
 
         {/* 右侧输入区 */}
@@ -179,7 +196,24 @@ export function ScriptCard() {
                         message: text,
                         materialIds: picked.map((p) => p.id),
                       });
-                      alert(`[Agent 回复] ${res.reply}`);
+                      // 剥离 reply 文本里内嵌的 tool_call JSON（后端临时格式，待后端修复后移除）
+                      const { clean, toolCall } = stripToolCall(res.reply || '');
+                      if (toolCall) console.info('[agent tool_call]', toolCall);
+                      // 把用户消息 + Agent 回复写入对话历史（不使用 alert）
+                      const userMsg: ChatMsg = {
+                        id: `u_${Date.now()}`,
+                        role: 'user',
+                        text,
+                        ts: Date.now(),
+                      };
+                      const agentMsg: ChatMsg = {
+                        id: `a_${Date.now()}`,
+                        role: 'agent',
+                        text: clean || '（Agent 没有返回可显示的内容）',
+                        ts: Date.now(),
+                      };
+                      setChat((prev) => [...prev, userMsg, agentMsg]);
+                      setText('');
                     } else {
                       // 视频 / 图片：调统一创作接口
                       const task = await creationsApi.create({
@@ -263,6 +297,9 @@ export function ScriptCard() {
         max={remainingPickSlots}
       />
 
+      {/* 素材预览弹窗（点击缩略图打开） */}
+      <MediaPreviewDialog media={preview} onClose={() => setPreview(null)} />
+
       {/* 积分不足弹窗（复用现成的 InsufficientCreditsDialog） */}
       <InsufficientCreditsDialog
         open={insufficient.open}
@@ -274,6 +311,46 @@ export function ScriptCard() {
           // 支付成功后用户可以再次点提交重试
         }}
       />
+
+      {/* Agent 对话历史（仅在 Agent 模式有意义；其他模式不展示） */}
+      {chat.length > 0 && mode === 'agent' && (
+        <div className="card mt-3 space-y-3 p-4 sm:p-5">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-medium text-fg-muted">Agent 对话</div>
+            <button
+              type="button"
+              onClick={() => setChat([])}
+              className="text-[11px] text-fg-subtle transition hover:text-fg"
+            >
+              清空
+            </button>
+          </div>
+          <div className="max-h-[60vh] space-y-3 overflow-y-auto pr-1">
+            {chat.map((m) =>
+              m.role === 'user' ? (
+                <div key={m.id} className="flex items-start justify-end gap-2">
+                  <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-2xl rounded-tr-md bg-brand px-3.5 py-2 text-sm text-white shadow-glow">
+                    {m.text}
+                  </div>
+                  <div className="grid h-7 w-7 flex-none place-items-center rounded-full bg-bg-soft text-fg-muted">
+                    <UserIcon className="h-3.5 w-3.5" />
+                  </div>
+                </div>
+              ) : (
+                <div key={m.id} className="flex items-start gap-2">
+                  <div className="grid h-7 w-7 flex-none place-items-center rounded-full bg-gradient-to-br from-[#7c5cff] to-[#5b3fe0] text-white">
+                    <Bot className="h-3.5 w-3.5" />
+                  </div>
+                  <div className="max-w-[78%] whitespace-pre-wrap break-words rounded-2xl rounded-tl-md bg-bg-soft px-3.5 py-2 text-sm text-fg">
+                    {m.text}
+                  </div>
+                </div>
+              )
+            )}
+            <div ref={chatEndRef} />
+          </div>
+        </div>
+      )}
     </section>
   );
 }

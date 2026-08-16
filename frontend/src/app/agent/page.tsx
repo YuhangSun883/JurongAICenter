@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { Sidebar } from '@/components/home/Sidebar';
 import { ChatHistory, type ChatSession } from '@/components/agent/ChatHistory';
@@ -9,6 +9,7 @@ import { InsufficientCreditsDialog } from '@/components/common/InsufficientCredi
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { agentApi } from '@/api/agent';
 import type { AgentMessage, AgentToolCall } from '@/types/agent';
+import { stripToolCall } from '@/lib/stripToolCall';
 import { Coins, Menu, Settings } from 'lucide-react';
 
 /** toolCall.action 到目标路由的映射 */
@@ -39,6 +40,16 @@ export default function AgentPage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
+  // 2026-08-16:渲染时最终兜底,所有 assistant 消息的 content 强制 stripToolCall 一次
+  // (无论 setMessages 时 m.content 写的是 raw 还是 clean,这里都再剥一次,确保无 JSON 残留)
+  const safeMessages = useMemo(
+    () => (messages ?? []).map(m =>
+      m.role === 'assistant'
+        ? { ...m, content: stripToolCall(m.content || '').clean }
+        : m
+    ),
+    [messages]
+  );
   const [credits, setCredits] = useState(0);
   const [sending, setSending] = useState(false);
   // 积分不足弹窗
@@ -67,7 +78,12 @@ export default function AgentPage() {
   const refreshMessages = useCallback(async (sessionId: string) => {
     try {
       const res = await agentApi.listMessages({ sessionId, pageSize: 50 });
-      setMessages(res.items);
+      // 兜底:历史 AI 回复里也可能残留 toolCall JSON,显示前统一剥离
+      setMessages(
+        res.items.map((m) =>
+          m.role === 'assistant' ? { ...m, content: stripToolCall(m.content || '').clean } : m
+        )
+      );
     } catch (err) {
       console.warn('[agent] listMessages failed:', err);
       setMessages([]);
@@ -256,6 +272,8 @@ export default function AgentPage() {
       const decoder = new TextDecoder();
       let accumulated = '';        // 累积的 AI 文本(不含 [META])
       let meta: any = null;         // 流结束时的元数据
+      let loggedToolCall = false;   // 是否已打印过 toolCall 调试日志(避免刷屏)
+      let loggedFirstToken = false; // 是否已打印过首个 token(用于确认后端格式)
       // 2026-08-14 兜底:90s 内 reader 没收到任何数据就主动中断,refreshMessages 拉 DB
       //   (避免 Next.js 代理 buffer 或网络层卡死导致 UI 一直"正在思考")
       const streamTimeoutMs = 90_000;
@@ -312,15 +330,26 @@ export default function AgentPage() {
             }
           }
 
-          // 更新 AI 气泡(去掉可能的 META 部分)
+          // 更新 AI 气泡 —— 实时剥离工具调用 JSON（避免用户看到"无关内容"闪一下再消失）
+          // stripToolCall 内部已处理 [META] 切尾 + toolCall/tool_call/function_call/action/actions 多 key
+          // 2026-08-16:如果 meta 已包含 toolCall(已识别为跳转意图),直接折叠成简短提示
+          //   避免流式过程中显示协议性引导语("好的,跳转...")和潜在残留 JSON
+          const isToolCallReady = !!(meta && meta.toolCall && TOOL_ROUTES[meta.toolCall.action]);
+          const displayText = isToolCallReady
+            ? 'AI 已理解你的需求'
+            : stripToolCall(accumulated).clean;
           setMessages(prev => prev.map(m =>
             m.id === thinkingMsgId
-              ? { ...m, content: accumulated.replace(/\[META\].*$/, '') }
+              ? { ...m, content: displayText, _folded: isToolCallReady }
               : m
           ));
         }
       } finally {
         clearInterval(watchdog);
+        // 流结束:打印完整 accumulated,用于诊断"无关内容"来源
+        console.log('[agent] stream ended. FINAL accumulated raw =', JSON.stringify(accumulated));
+        console.log('[agent] stream ended. FINAL clean =', JSON.stringify(stripToolCall(accumulated).clean));
+        console.log('[agent] stream ended. FINAL meta =', JSON.stringify(meta));
       }
 
       // 6) 流结束,处理元数据
@@ -330,6 +359,13 @@ export default function AgentPage() {
           setActiveId(meta.sessionId);
         }
         if (meta.toolCall && TOOL_ROUTES[meta.toolCall.action]) {
+          // 2026-08-16 关键修复:触发跳转弹窗时,把对应的 AI 气泡内容折叠成"AI 已理解"
+          // 避免流式累积中的协议性引导语("好的,跳转...")和潜在残留 JSON 显示给用户
+          setMessages(prev => prev.map(m =>
+            m.id === thinkingMsgId
+              ? { ...m, content: 'AI 已理解你的需求', _folded: true }
+              : m
+          ));
           setPendingToolCall({
             action: meta.toolCall.action,
             prompt: meta.toolCall.prompt,
@@ -409,7 +445,7 @@ export default function AgentPage() {
         <main className="relative flex flex-1 flex-col">
           {/* 消息流 */}
           <div className="flex-1 overflow-auto px-6 py-6">
-            {(messages ?? []).length === 0 ? (
+            {(safeMessages ?? []).length === 0 ? (
               <div className="grid h-full place-items-center text-center text-fg-subtle">
                 <div>
                   <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-brand-50 text-2xl">🤖</div>
@@ -419,7 +455,7 @@ export default function AgentPage() {
               </div>
             ) : (
               <div className="mx-auto max-w-3xl space-y-4">
-                {(messages ?? []).map((m) => (
+                {(safeMessages ?? []).map((m) => (
                   <div
                     key={m.id}
                     className={
@@ -459,7 +495,7 @@ export default function AgentPage() {
                         ))}
                       </div>
                     )}
-                    {m.content}
+                    {m.role === 'assistant' ? stripToolCall(m.content || '').clean : m.content}
                   </div>
                 ))}
               </div>
