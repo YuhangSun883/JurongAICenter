@@ -118,3 +118,21 @@ export interface ProductImageAnalysisTask {
   createdAt: number;
   failReason?: string;
 }
+
+/** 单条分析文案重写请求（POST /analysis/refine）：按新定位与画布比例重写设计分析 */
+export interface RefineAnalysisItemRequest {
+  /** 商品图内容（单张）：base64 data URI 或 http(s) URL */
+  image: string;
+  /** 引用图标签：@图片1 */
+  refLabel: string;
+  /** 新定位（套图类型）：主视图 / 卖点图 / 收尾图 … */
+  role: string;
+  /** 画布比例：1:1 / 4:5 */
+  ratio: string;
+  /** 输出语言 */
+  lang: string;
+  /** 分辨率：1K / 2K / 4K */
+  resolution: string;
+  /** 补充说明（选填） */
+  brief?: string;
+}

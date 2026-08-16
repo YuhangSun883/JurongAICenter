@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { ChevronLeft, Plus, ChevronDown, ChevronLeft as L, ChevronRight as R, ChevronRight, Loader2, Trash2, Download, Maximize2, Copy, Sparkles, Image as ImageIcon } from 'lucide-react';
+import { ChevronLeft, Plus, ChevronDown, ChevronLeft as L, ChevronRight as R, ChevronRight, Loader2, Trash2, Download, Maximize2, Copy, Sparkles, RotateCw, Image as ImageIcon } from 'lucide-react';
 import { Sidebar } from '@/components/home/Sidebar';
 import { AddMaterialCard } from '@/components/common/AddMaterialCard';
 import { MediaPickerDialog, type PickedMedia } from '@/components/common/MediaPickerDialog';
@@ -26,6 +26,13 @@ import type {
 
 const LANGS = ['中文', 'English'] as const;
 const COUNTS = ['4 张', '8 张', '12 张'] as const;
+
+/** 分析结果 sessionStorage 恢复键（切去其他功能再回来不丢分析卡片） */
+const ANALYSIS_RESTORE_KEY = 'product-image.analysisRestore.v1';
+/** 进行中的分析任务快照（提交时写入，完成/失败后清除）：等待期间切去其它功能，返回后续接轮询恢复进度环 */
+const ANALYSIS_PENDING_KEY = 'product-image.analysisPending.v1';
+/** 页面配置状态快照（上传图片/补充说明/语言张数/模型分辨率格式/进度环）：切去其它功能再回来原样恢复 */
+const PAGE_STATE_KEY = 'product-image.pageState.v1';
 
 /** 分析等待的阶段文案（进度环下方滚动展示） */
 const ANALYSIS_STEPS = [
@@ -91,7 +98,6 @@ export default function ProductImageWorkbench() {
 
   // ===== 任务队列 =====
   const [tasks, setTasks] = useState<ProductImageTask[]>([]);
-  const [submitting, setSubmitting] = useState(false);
 
   // ===== 弹窗 =====
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -100,15 +106,57 @@ export default function ProductImageWorkbench() {
   // ===== 分析结果（商品详解，LLM 多模态生成） =====
   const [roleOptions, setRoleOptions] = useState<string[]>([]);
   const [analysisTask, setAnalysisTask] = useState<ProductImageAnalysisTask | null>(null);
-  /** 放大视图：分析卡片点放大后全文大字展示 */
+  /** 放大视图：分析卡片点放大后全文大字展示（文字可编辑） */
   const [enlargedItem, setEnlargedItem] = useState<ProductImageAnalysisItem | null>(null);
+  /** 放大视图对应的分析条目下标（保存时定位要更新的 item） */
+  const [enlargedIdx, setEnlargedIdx] = useState(-1);
+  /** 放大视图编辑草稿：各 section 的 value（未改动过时为 null） */
+  const [enlargedDraft, setEnlargedDraft] = useState<string[] | null>(null);
+  /** 打开放大视图：同时初始化编辑草稿 */
+  function openEnlarged(item: ProductImageAnalysisItem, idx: number) {
+    setEnlargedItem(item);
+    setEnlargedIdx(idx);
+    setEnlargedDraft(item.sections.map((s) => cleanSectionValue(s.value)));
+  }
+  /** 取消编辑：丢弃草稿直接关闭 */
+  function cancelEnlarged() {
+    setEnlargedItem(null);
+    setEnlargedIdx(-1);
+    setEnlargedDraft(null);
+  }
+  /** 保存编辑：写回分析任务（卡片展示/复制/重新生成均用新文案），并同步恢复快照 */
+  function saveEnlarged() {
+    if (!enlargedItem || !analysisTask || enlargedIdx < 0) { cancelEnlarged(); return; }
+    const draft = enlargedDraft ?? [];
+    const items = (analysisTask.items ?? []).map((it, i) => (i === enlargedIdx
+      ? { ...it, sections: it.sections.map((s, si) => ({ key: s.key, value: draft[si] ?? cleanSectionValue(s.value) })) }
+      : it));
+    const next = { ...analysisTask, items };
+    setAnalysisTask(next);
+    // 同步更新 sessionStorage 恢复快照，避免切走再回来后编辑被旧文案覆盖
+    try {
+      sessionStorage.setItem(ANALYSIS_RESTORE_KEY, JSON.stringify({ task: next, refAssets: analysisRefSnapshotsRef.current[analysisTask.taskId] ?? [] }));
+    } catch { /* 忽略 */ }
+    showToast('分析文案已保存');
+    cancelEnlarged();
+  }
   /** 分析卡片类型下拉的本地覆盖（taskId-index → role） */
   const [roleSel, setRoleSel] = useState<Record<string, string>>({});
+  /** 分析卡片比例下拉的本地覆盖（taskId-index → ratio） */
+  const [ratioSel, setRatioSel] = useState<Record<string, string>>({});
+  /** 每个分析任务提交时的商品图快照（taskId → 提交时上传列表）：删除上传图片后，分析卡引用图与重新生成仍可用 */
+  const [analysisRefSnapshots, setAnalysisRefSnapshots] = useState<Record<string, PickedAsset[]>>({});
+  /** 快照的 ref 镜像：轮询闭包是提交时的旧闭包，读不到后续更新的 state，持久化时改读这里 */
+  const analysisRefSnapshotsRef = useRef<Record<string, PickedAsset[]>>({});
   // ===== 分析等待动效：模拟进度环 + 阶段文案 =====
   const [analysisPercent, setAnalysisPercent] = useState(0);
   const [analysisStepIdx, setAnalysisStepIdx] = useState(0);
-  /** 分析卡片「立即生成」加载态（selKey → loading） */
+  /** 分析卡片「重新生成」加载态（selKey → loading） */
   const [genLoading, setGenLoading] = useState<Record<string, boolean>>({});
+  /** 全部生成：并发提交全部分析条目的整体加载态 */
+  const [bulkGenerating, setBulkGenerating] = useState(false);
+  /** 已自动触发过并发生成的分析任务 id（防止轮询重复触发） */
+  const autoGenDoneRef = useRef<Set<string>>(new Set());
   // ===== 图片预览 =====
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   // ===== Toast 提示 =====
@@ -119,11 +167,46 @@ export default function ProductImageWorkbench() {
   }
   // ===== 待删除确认 =====
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  // ===== 任务队列批量删除 =====
+  /** 是否处于批量删除选择模式 */
+  const [selectMode, setSelectMode] = useState(false);
+  /** 已勾选待删除的任务 id */
+  const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([]);
+  /** 批量删除整体加载态 */
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  /** 已删除的任务 id（对应轮询检测到后自行停止） */
+  const deletedTaskIdsRef = useRef<Set<string>>(new Set());
 
   // ===== 拉数据 =====
   useEffect(() => {
+    // 恢复页面配置状态（上传图片/补充说明/语言张数/模型分辨率格式/进度环）：切去其它功能再回来原样继续
+    let restoredModelKey: string | null = null;
+    try {
+      const rawState = sessionStorage.getItem(PAGE_STATE_KEY);
+      if (rawState) {
+        const s = JSON.parse(rawState) as {
+          assets?: PickedAsset[]; brief?: string; lang?: string; count?: string;
+          modelKey?: string; resolution?: string; format?: string;
+          analysisPercent?: number; analysisStepIdx?: number;
+        };
+        if (Array.isArray(s.assets)) setAssets(s.assets);
+        if (typeof s.brief === 'string') setBrief(s.brief);
+        if (s.lang && (LANGS as readonly string[]).includes(s.lang)) setLang(s.lang as (typeof LANGS)[number]);
+        if (s.count && (COUNTS as readonly string[]).includes(s.count)) setCount(s.count as (typeof COUNTS)[number]);
+        if (s.modelKey) { setModelKey(s.modelKey); restoredModelKey = s.modelKey; }
+        if (s.resolution) setResolution(s.resolution as ProductImageResolution);
+        if (s.format) setFormat(s.format as ProductImageFormat);
+        // 进度环：仅在有进行中分析时生效（analyzing 的动效 effect 会在非分析态自动归零）
+        if (typeof s.analysisPercent === 'number') setAnalysisPercent(s.analysisPercent);
+        if (typeof s.analysisStepIdx === 'number') setAnalysisStepIdx(s.analysisStepIdx);
+      }
+    } catch (e) {
+      console.warn('[product-image] restore page state failed', e);
+    }
     productImageApi.listModels().then((arr) => {
       setModels(arr);
+      // 优先沿用恢复的模型，没有恢复值才回退默认 premium
+      if (restoredModelKey && arr.some((m) => m.key === restoredModelKey)) return;
       const def = arr.find((m) => m.key === 'premium') ?? arr[0];
       if (def) setModelKey(def.key);
     });
@@ -131,10 +214,83 @@ export default function ProductImageWorkbench() {
     productImageApi.listFormats().then(setFormats);
     productImageApi.listExamples().then(setExamples);
     productImageApi.listRoles().then(setRoleOptions);
+    // 恢复分析结果（sessionStorage 快照）；标记已自动生成过，避免恢复后重复触发并发生成消耗积分
+    let restoredTaskId: string | null = null;
+    try {
+      const raw = sessionStorage.getItem(ANALYSIS_RESTORE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw) as { task?: ProductImageAnalysisTask; refAssets?: PickedAsset[] };
+        if (saved.task && saved.task.status === 'success' && (saved.task.items?.length ?? 0) > 0) {
+          setAnalysisTask(saved.task);
+          setAnalysisRefSnapshots((prev) => ({ ...prev, [saved.task!.taskId]: saved.refAssets ?? [] }));
+          analysisRefSnapshotsRef.current[saved.task.taskId] = saved.refAssets ?? [];
+          autoGenDoneRef.current.add(saved.task.taskId);
+          restoredTaskId = saved.task.taskId;
+        }
+      }
+    } catch (e) {
+      console.warn('[product-image] restore analysis failed', e);
+    }
+    // 恢复进行中的分析：等待期间切去其它功能再回来时，向后端查最新状态——
+    // 仍在分析则续接轮询（重新展示进度环）；离开期间已完成则恢复卡片并补触发自动并发生成
+    try {
+      const rawPending = sessionStorage.getItem(ANALYSIS_PENDING_KEY);
+      if (rawPending) {
+        const pending = JSON.parse(rawPending) as { taskId?: string; refAssets?: PickedAsset[] };
+        if (pending.taskId && pending.taskId !== restoredTaskId) {
+          const refAssets = pending.refAssets ?? [];
+          productImageApi.getAnalysis(pending.taskId).then((t) => {
+            if (t.status === 'running') {
+              setAnalysisTask(t);
+              setAnalysisRefSnapshots((prev) => ({ ...prev, [t.taskId]: refAssets }));
+              analysisRefSnapshotsRef.current[t.taskId] = refAssets;
+              pollAnalysis(t.taskId);
+            } else if (t.status === 'success' && (t.items?.length ?? 0) > 0) {
+              setAnalysisTask(t);
+              setAnalysisRefSnapshots((prev) => ({ ...prev, [t.taskId]: refAssets }));
+              analysisRefSnapshotsRef.current[t.taskId] = refAssets;
+              // 与页面停留时完成同行为：写完成快照，并自动并发提交全部条目的生成（只触发一次）
+              try {
+                sessionStorage.setItem(ANALYSIS_RESTORE_KEY, JSON.stringify({ task: t, refAssets }));
+                sessionStorage.removeItem(ANALYSIS_PENDING_KEY);
+              } catch (err) {
+                console.warn('[product-image] persist restored analysis failed', err);
+              }
+              if (!autoGenDoneRef.current.has(t.taskId)) {
+                autoGenDoneRef.current.add(t.taskId);
+                generateAllFromAnalysis(t.items ?? [], t.taskId);
+              }
+            } else {
+              // 失败 / 空结果 / 任务已不存在：清理进行中快照
+              sessionStorage.removeItem(ANALYSIS_PENDING_KEY);
+            }
+          }).catch(() => {
+            try { sessionStorage.removeItem(ANALYSIS_PENDING_KEY); } catch { /* 忽略 */ }
+          });
+        }
+      }
+    } catch (e) {
+      console.warn('[product-image] restore pending analysis failed', e);
+    }
+    // 恢复任务队列：拉后端任务列表（含已出图的结果），仍在生成中的任务续接轮询
+    productImageApi.listTasks().then((list) => {
+      if (list.length === 0) return;
+      setTasks((prev) => {
+        const exist = new Set(prev.map((t) => t.taskId));
+        return [...list.filter((t) => !exist.has(t.taskId)), ...prev];
+      });
+      list.filter((t) => t.status === 'running').forEach((t) => pollTask(t.taskId));
+    }).catch((e) => console.error('[product-image] listTasks failed', e));
   }, []);
 
-  const model = models.find((m) => m.key === modelKey) ?? models[0];
-  const creditsCost = model?.creditsCost ?? 0;
+  // ===== 持久化页面配置状态：切去其它功能再回来时原样恢复（进行中分析的进度环也一并保留） =====
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(PAGE_STATE_KEY, JSON.stringify({
+        assets, brief, lang, count, modelKey, resolution, format, analysisPercent, analysisStepIdx,
+      }));
+    } catch { /* 超出容量等异常忽略，不影响主流程 */ }
+  }, [assets, brief, lang, count, modelKey, resolution, format, analysisPercent, analysisStepIdx]);
 
   // ===== 轮播 =====
   function prevEx() {
@@ -178,49 +334,54 @@ export default function ProductImageWorkbench() {
     }
   }
 
-  /** 批量下载整套图（逐张间隔 300ms，避免浏览器拦截） */
-  async function batchDownload(task: ProductImageTask) {
-    const urls = task.imageUrls ?? [];
-    if (urls.length === 0) return;
-    showToast(`正在下载 ${urls.length} 张图片…`);
-    for (let i = 0; i < urls.length; i++) {
-      const role = task.imageRoles?.[i];
-      await downloadImage(urls[i], `商详套图-${String(i + 1).padStart(2, '0')}${role ? '-' + role : ''}.png`);
+  /** 批量下载当前展示的全部结果图（跨任务合并后，逐张间隔 300ms，避免浏览器拦截） */
+  async function batchDownloadAll() {
+    if (resultImages.length === 0) return;
+    showToast(`正在下载 ${resultImages.length} 张图片…`);
+    for (let i = 0; i < resultImages.length; i++) {
+      const { url, role } = resultImages[i];
+      await downloadImage(url, `商详套图-${String(i + 1).padStart(2, '0')}-${role}.png`);
       await new Promise((r) => setTimeout(r, 300));
-    }
-  }
-  
-  async function submit() {
-    if (assets.length === 0 || submitting) return;
-    setSubmitting(true);
-    try {
-      showToast('正在提交套图任务…');
-      // 商品图转 base64 data URI 后提交（后端图生图链路需要）
-      const images = await Promise.all(assets.map((a) => urlToBase64(a.url)));
-      const created = await productImageApi.createTask({
-        assetIds: assets.map((a) => a.id),
-        images,
-        lang,
-        count,
-        brief: brief.trim() || undefined,
-        modelKey,
-        settingKey: `${resolution}-${format}`,
-        resolution,
-        format,
-      });
-      // 提交成功：用后端返回的任务替换本地“编辑中”任务，进入轮询
-      setTasks((prev) => [created, ...prev.filter((t) => t.status !== 'editing')]);
-      pollTask(created.taskId);
-    } catch (e) {
-      console.error('[product-image] createTask failed', e);
-      showToast('提交失败，请稍后重试');
-    } finally {
-      setSubmitting(false);
     }
   }
 
   function removeTask(taskId: string) {
+    deletedTaskIdsRef.current.add(taskId);
     setTasks((prev) => prev.filter((t) => t.taskId !== taskId));
+    // 后端任务同步调删除接口（与资产删除 API 同语义：直接删数据库数据）；本地「编辑中」任务只删本地
+    if (!taskId.startsWith('task_')) {
+      productImageApi.batchDeleteTasks([taskId]).catch((e) => console.error('[product-image] deleteTask failed', e));
+    }
+  }
+
+  /** 勾选/取消勾选某个任务 */
+  function toggleTaskSelect(taskId: string) {
+    setSelectedTaskIds((prev) => (prev.includes(taskId) ? prev.filter((x) => x !== taskId) : [...prev, taskId]));
+  }
+
+  /** 批量删除所选任务：与资产批量删除 API 同语义，直接删除数据库数据（含生成结果图），确认后不可恢复 */
+  async function batchDeleteSelected() {
+    if (selectedTaskIds.length === 0 || bulkDeleting) return;
+    if (!window.confirm(`确认删除所选 ${selectedTaskIds.length} 个任务？其生成的结果图将一并从数据库中删除，无法恢复。`)) return;
+    const ids = [...selectedTaskIds];
+    setBulkDeleting(true);
+    try {
+      ids.forEach((id) => deletedTaskIdsRef.current.add(id));
+      // 本地「编辑中」任务未进后端，只删本地；后端任务走批量删除接口
+      const backendIds = ids.filter((id) => !id.startsWith('task_'));
+      if (backendIds.length > 0) {
+        await productImageApi.batchDeleteTasks(backendIds);
+      }
+      setTasks((prev) => prev.filter((t) => !ids.includes(t.taskId)));
+      setSelectedTaskIds([]);
+      setSelectMode(false);
+      showToast(`已删除 ${ids.length} 个任务`);
+    } catch (e) {
+      console.error('[product-image] batchDeleteTasks failed', e);
+      showToast('删除失败，请稍后重试');
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   /** 点"新建"按钮：检查是否有正在编辑的任务或已有资产，有则弹确认，无则直接创建 */
@@ -253,6 +414,7 @@ export default function ProductImageWorkbench() {
   function pollTask(id: string) {
     let n = 0;
     const tick = async () => {
+      if (deletedTaskIdsRef.current.has(id)) return; // 任务已删除，停止轮询
       try {
         const t = await productImageApi.getTask(id);
         setTasks((prev) => prev.map((x) => (x.taskId === id ? t : x)));
@@ -267,14 +429,25 @@ export default function ProductImageWorkbench() {
     setTimeout(tick, 1200);
   }
 
-  /** 生成商品详解（「分析结果」标签）：提交多模态 LLM 分析任务并轮询 */
+  /** 生成商品详解（「分析结果」标签）：提交多模态 LLM 分析任务并轮询；
+   *  无论当前停留在「分析结果」还是「生成结果」页，点击都会刷新页面状态并开始新的分析任务 */
   async function generateAnalysis() {
     if (assets.length === 0 || analyzing) return;
     try {
       showToast('正在提交分析任务…');
+      // 刷新为新任务：回到「分析结果」页、清除上一轮分析结果与恢复快照（避免旧卡片残留）
+      setResultTab('examples');
+      setAnalysisTask(null);
+      try {
+        sessionStorage.removeItem(ANALYSIS_RESTORE_KEY);
+      } catch (err) {
+        console.warn('[product-image] clear analysis restore failed', err);
+      }
       // 重置等待动效（进度归零，阶段文案从头播）
       setAnalysisPercent(0);
       setAnalysisStepIdx(0);
+      // 先快照当前上传的商品图：之后即使用户删除上传图片，分析卡引用图仍按分析时的图展示
+      const snapshot = [...assets];
       const images = await Promise.all(assets.map((a) => urlToBase64(a.url)));
       const created = await productImageApi.createAnalysis({
         assetIds: assets.map((a) => a.id),
@@ -288,6 +461,14 @@ export default function ProductImageWorkbench() {
         format,
       });
       setAnalysisTask(created);
+      setAnalysisRefSnapshots((prev) => ({ ...prev, [created.taskId]: snapshot }));
+      analysisRefSnapshotsRef.current[created.taskId] = snapshot;
+      // 持久化进行中快照：等待期间切去其它功能再回来时可续接轮询恢复（完成/失败后由轮询清理）
+      try {
+        sessionStorage.setItem(ANALYSIS_PENDING_KEY, JSON.stringify({ taskId: created.taskId, refAssets: snapshot }));
+      } catch (err) {
+        console.warn('[product-image] persist pending analysis failed', err);
+      }
       pollAnalysis(created.taskId);
     } catch (e) {
       console.error('[product-image] createAnalysis failed', e);
@@ -295,43 +476,144 @@ export default function ProductImageWorkbench() {
     }
   }
 
-  /** 分析卡片「立即生成」：把该条分析文案 + 对应引用图 + 类型传入图生图链路（与 AI 图片生成同一接口），结果进「生成结果」 */
-  async function generateFromAnalysis(item: ProductImageAnalysisItem, selKey: string) {
-    if (genLoading[selKey]) return;
+  /** 解析分析条目对应的引用图：优先提交分析时的快照（与分析文案绑定），没有再退回当前上传列表；
+   *  保证删除上传的商品图后，分析卡预览图与「重新生成」仍可用 */
+  function resolveRefAsset(refIdx: number): PickedAsset | undefined {
+    const snap = analysisRefSnapshots[analysisTask?.taskId ?? ''] ?? [];
+    return snap[refIdx] ?? assets[refIdx] ?? snap[0] ?? assets[0];
+  }
+
+  /** 提交单条分析条目的生成任务（纯提交，不管 loading/toast）：分析文案 + 引用图 + 类型走单张生成模式 */
+  async function submitGenerateItem(item: ProductImageAnalysisItem, selKey: string): Promise<ProductImageTask> {
     const refIdx = parseInt(item.refLabel.replace(/[^0-9]/g, '') || '1', 10) - 1;
-    const refAsset = assets[refIdx] ?? assets[0];
+    const refAsset = resolveRefAsset(refIdx);
     if (!refAsset) {
-      showToast('缺少引用图，请先上传商品图');
-      return;
+      throw new Error('缺少引用图');
     }
     const role = roleSel[selKey] ?? item.role;
+    const image = await urlToBase64(refAsset.url);
+    const prompt = item.sections
+      .map((s) => `${s.key}: ${cleanSectionValue(s.value)}`)
+      .join('\n');
+    return productImageApi.createTask({
+      assetIds: [refAsset.id],
+      images: [image],
+      lang,
+      count: '4 张', // 后端单张生成模式会忽略此值
+      brief: brief.trim() || undefined,
+      modelKey,
+      settingKey: `${resolution}-${format}`,
+      resolution,
+      format,
+      prompt,
+      role,
+    });
+  }
+
+  /** 把更新后的分析条目写回：卡片同步刷新，并同步 sessionStorage 恢复快照（避免切走再回来被旧文案覆盖） */
+  function updateAnalysisItem(idx: number, updated: ProductImageAnalysisItem) {
+    setAnalysisTask((prev) => {
+      if (!prev) return prev;
+      const items = (prev.items ?? []).map((it, i) => (i === idx ? updated : it));
+      const next = { ...prev, items };
+      try {
+        sessionStorage.setItem(ANALYSIS_RESTORE_KEY, JSON.stringify({ task: next, refAssets: analysisRefSnapshotsRef.current[prev.taskId] ?? [] }));
+      } catch { /* 忽略 */ }
+      return next;
+    });
+  }
+
+  /** 分析卡片「重新生成」：定位/比例有变动时先调多模态 LLM 按新定位与比例重写分析文案（卡片同步更新），
+   *  再用新文案 + 引用图 + 类型走图生图链路，新结果追加进「生成结果」 */
+  async function generateFromAnalysis(item: ProductImageAnalysisItem, selKey: string, idx: number) {
+    if (genLoading[selKey] || bulkGenerating) return;
     setGenLoading((prev) => ({ ...prev, [selKey]: true }));
     try {
-      const image = await urlToBase64(refAsset.url);
-      const prompt = item.sections
-        .map((s) => `${s.key}: ${cleanSectionValue(s.value)}`)
-        .join('\n');
-      const created = await productImageApi.createTask({
-        assetIds: [refAsset.id],
-        images: [image],
-        lang,
-        count: '4 张', // 后端单张生成模式会忽略此值
-        brief: brief.trim() || undefined,
-        modelKey,
-        settingKey: `${resolution}-${format}`,
-        resolution,
-        format,
-        prompt,
-        role,
-      });
+      const role = roleSel[selKey] ?? item.role;
+      const ratio = ratioSel[selKey] ?? item.ratio;
+      const refIdx = parseInt(item.refLabel.replace(/[^0-9]/g, '') || '1', 10) - 1;
+      const refAsset = resolveRefAsset(refIdx);
+      if (!refAsset) {
+        showToast('缺少引用图，请先上传商品图');
+        return;
+      }
+      // 1) 定位或比例有变动：先按新定位 + 比例重写分析文案，并同步刷新卡片（未变动则跳过，省一次 LLM 调用）
+      let nextItem = item;
+      if (role !== item.role || ratio !== item.ratio) {
+        showToast(`正在按「${role} ${ratio}」重写分析文案…`);
+        const image = await urlToBase64(refAsset.url);
+        const refined = await productImageApi.refineAnalysisItem({
+          image,
+          refLabel: item.refLabel,
+          role,
+          ratio,
+          lang,
+          resolution,
+          brief: brief.trim() || undefined,
+        });
+        nextItem = {
+          ...item,
+          role,
+          ratio,
+          sections: (refined.sections?.length ?? 0) > 0 ? refined.sections : item.sections,
+        };
+        updateAnalysisItem(idx, nextItem);
+      }
+      // 2) 用新文案提交图生图
+      const created = await submitGenerateItem(nextItem, selKey);
       setTasks((prev) => [created, ...prev.filter((t) => t.status !== 'editing')]);
       pollTask(created.taskId);
-      showToast(`正在生成「${role}」，完成后可在生成结果查看`);
+      showToast(`正在重新生成「${role}」，完成后可在生成结果查看`);
     } catch (e) {
       console.error('[product-image] generateFromAnalysis failed', e);
-      showToast('生成提交失败，请稍后重试');
+      showToast(e instanceof Error && e.message === '缺少引用图' ? '缺少引用图，请先上传商品图' : '重新生成失败，请稍后重试');
     } finally {
       setGenLoading((prev) => ({ ...prev, [selKey]: false }));
+    }
+  }
+
+  /** 全部生成：并发提交所有分析条目的单张生成任务（后端任务池自动排队限流），结果逐条进「生成结果」 */
+  async function generateAllFromAnalysis(items?: ProductImageAnalysisItem[], taskIdOverride?: string) {
+    const list = items ?? analysisItems;
+    if (list.length === 0 || bulkGenerating) return;
+    // 轮询回调闭包里的 analysisTask 可能是旧值，优先用显式传入的 taskId
+    const taskIdPrefix = taskIdOverride ?? analysisTask?.taskId ?? 'local';
+    setBulkGenerating(true);
+    // 所有卡片进入「提交中」态，禁止单条重复点击
+    setGenLoading((prev) => {
+      const next = { ...prev };
+      list.forEach((_, i) => { next[`${taskIdPrefix}-${i}`] = true; });
+      return next;
+    });
+    showToast(`分析完成，正在并发提交 ${list.length} 个生成任务…`);
+    try {
+      const results = await Promise.allSettled(list.map((item, i) => submitGenerateItem(item, `${taskIdPrefix}-${i}`)));
+      const created: ProductImageTask[] = [];
+      let failed = 0;
+      results.forEach((r) => {
+        if (r.status === 'fulfilled') created.push(r.value);
+        else failed++;
+      });
+      if (created.length > 0) {
+        // 后提交的排前面，与单条生成的展示顺序一致
+        setTasks((prev) => [[...created].reverse(), ...prev.filter((t) => t.status !== 'editing')].flat());
+        created.forEach((t) => pollTask(t.taskId));
+      }
+      if (failed === 0) {
+        showToast(`${created.length} 个任务已提交，生成中，可在生成结果查看`);
+      } else {
+        showToast(`已提交 ${created.length} 个任务，${failed} 个提交失败`);
+      }
+    } catch (e) {
+      console.error('[product-image] generateAllFromAnalysis failed', e);
+      showToast('生成提交失败，请稍后重试');
+    } finally {
+      setGenLoading((prev) => {
+        const next = { ...prev };
+        list.forEach((_, i) => { next[`${taskIdPrefix}-${i}`] = false; });
+        return next;
+      });
+      setBulkGenerating(false);
     }
   }
 
@@ -341,8 +623,24 @@ export default function ProductImageWorkbench() {
       try {
         const t = await productImageApi.getAnalysis(id);
         setAnalysisTask(t);
-        // LLM 多模态分析（~4 分钟窗口）
-        if (t.status === 'running' && n++ < 120) setTimeout(tick, 2000);
+        // 分析到达终态（成功/失败）：清理进行中快照（成功分支会另写入完成恢复快照）
+        if (t.status !== 'running') {
+          try { sessionStorage.removeItem(ANALYSIS_PENDING_KEY); } catch { /* 忽略 */ }
+        }
+        // LLM 多模态分析：后端超时 10 分钟 + 自动重试 1 次，轮询窗口放大到 ~22 分钟
+        if (t.status === 'running' && n++ < 660) {
+          setTimeout(tick, 2000);
+        } else if (t.status === 'success' && (t.items?.length ?? 0) > 0 && !autoGenDoneRef.current.has(id)) {
+          // 分析完成：持久化到 sessionStorage，切去其他功能再回来时可恢复分析卡片（快照从 ref 读，轮询闭包里的 state 是旧值）
+          try {
+            sessionStorage.setItem(ANALYSIS_RESTORE_KEY, JSON.stringify({ task: t, refAssets: analysisRefSnapshotsRef.current[t.taskId] ?? [] }));
+          } catch (err) {
+            console.warn('[product-image] persist analysis failed', err);
+          }
+          // 分析完成后立即并发提交全部条目的图片生成（每个分析任务只自动触发一次）
+          autoGenDoneRef.current.add(id);
+          generateAllFromAnalysis(t.items ?? [], t.taskId);
+        }
       } catch (e) {
         console.error('poll analysis failed', e);
       }
@@ -362,18 +660,68 @@ export default function ProductImageWorkbench() {
   const currentEx = examples[exIdx];
   const editing = tasks.filter((t) => t.status === 'editing').length;
   const running = tasks.filter((t) => t.status === 'running').length;
-  /** 最近一个已出图的完成任务（中间区域展示生成结果） */
-  const resultTask = tasks.find((t) => t.status === 'success' && (t.imageUrls?.length ?? 0) > 0);
-  /** 新任务出图后自动切到“生成结果”标签；无结果时强制回示例页 */
+  /** 生成结果合并列表：同一类型（role）只保留最新一次生成的图，「重新生成」后旧图不再展示 */
+  const resultImages = (() => {
+    // tasks 新任务在前：逐任务扫描，记录每个类型最新由哪个任务产出，旧任务的同类型图被替换
+    const ownerByRole = new Map<string, string>();
+    const out: { taskId: string; url: string; role: string }[] = [];
+    for (const t of tasks) {
+      if (t.status !== 'success' || (t.imageUrls?.length ?? 0) === 0) continue;
+      (t.imageUrls ?? []).forEach((url, i) => {
+        const role = t.imageRoles?.[i] ?? `图 ${i + 1}`;
+        const owner = ownerByRole.get(role);
+        // 还没有更新的任务产出过该类型；或同一任务内的多张同类型图（套图任务）完整保留
+        if (!owner || owner === t.taskId) {
+          ownerByRole.set(role, t.taskId);
+          out.push({ taskId: t.taskId, url, role });
+        }
+      });
+    }
+    return out.reverse(); // 反转为提交顺序（先生成的排前面）
+  })();
+  const hasResults = resultImages.length > 0;
+  /** 新任务出图后自动切到“生成结果”标签 */
   useEffect(() => {
-    if (resultTask) setResultTab('results');
-  }, [resultTask]);
+    if (hasResults) setResultTab('results');
+  }, [hasResults]);
+  /** 任务队列点击定位：当前闪烁高亮的图片（优先按 taskId，被同类型更新任务替换后回退按类型定位） */
+  const [flashSel, setFlashSel] = useState<{ taskId: string; roles: string[]; nonce: number } | null>(null);
+  const resultGridRef = useRef<HTMLDivElement | null>(null);
+  /** 闪烁触发后：等标签切换渲染完成再滚动到对应图片，动画播完自动清除高亮 */
+  useEffect(() => {
+    if (!flashSel) return;
+    const scrollTimer = setTimeout(() => {
+      const grid = resultGridRef.current;
+      if (!grid) return;
+      const el = grid.querySelector<HTMLElement>(`[data-task-id="${flashSel.taskId}"]`)
+        ?? (flashSel.roles.length > 0
+          ? grid.querySelector<HTMLElement>(flashSel.roles.map((r) => `[data-role="${CSS.escape(r)}"]`).join(','))
+          : null);
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 80);
+    const clearTimer = setTimeout(() => setFlashSel(null), 2400);
+    return () => { clearTimeout(scrollTimer); clearTimeout(clearTimer); };
+  }, [flashSel]);
+  /** 判断结果图是否处于当前闪烁高亮中：本任务产出，或任务图已被替换时同类型的最新图 */
+  function isFlashing(img: { taskId: string; role: string }): boolean {
+    return !!flashSel && (img.taskId === flashSel.taskId || flashSel.roles.includes(img.role));
+  }
+  /** 任务队列点击已完成任务：切到生成结果，滚动定位到该任务产出的图片并闪烁高亮 */
+  function locateResultTask(t: ProductImageTask) {
+    setResultTab('results');
+    setFlashSel({ taskId: t.taskId, roles: [...new Set(t.imageRoles ?? [])], nonce: Date.now() });
+  }
   const analyzing = analysisTask?.status === 'running';
   const analysisItems = analysisTask?.status === 'success' ? analysisTask.items ?? [] : [];
 
   // ===== 分析中动效：进度环每 300ms 微增（越接近 92% 越慢），阶段文案每 3.5s 滚动 =====
+  /** 只在「从分析态退出」时归零：首次挂载不清零，保留从快照恢复的进度 */
+  const prevAnalyzingRef = useRef(false);
   useEffect(() => {
+    const wasAnalyzing = prevAnalyzingRef.current;
+    prevAnalyzingRef.current = analyzing;
     if (!analyzing) {
+      if (!wasAnalyzing) return;
       setAnalysisPercent(0);
       setAnalysisStepIdx(0);
       return;
@@ -393,7 +741,7 @@ export default function ProductImageWorkbench() {
   useEffect(() => {
     if (analysisItems.length > 0) setResultTab('examples');
   }, [analysisTask?.taskId]);
-  const viewTab = resultTab === 'results' && resultTask ? 'results' : 'examples';
+  const viewTab = resultTab === 'results' && hasResults ? 'results' : 'examples';
 
   return (
     <div className="min-h-screen pl-[72px]">
@@ -558,19 +906,15 @@ export default function ProductImageWorkbench() {
               </div>
             </section>
 
-            {/* 提交按钮（贴在底部）：动作随展示区当前标签变化 —— 分析结果→生成商品详解，生成结果→提交套图生成 */}
+            {/* 提交按钮（贴在底部）：始终为「生成商品详解」——点击刷新页面状态并开启新的分析任务（分析完成后自动并发生成） */}
             <button
-              onClick={viewTab === 'results' ? submit : generateAnalysis}
-              disabled={assets.length === 0 || submitting || analyzing}
+              onClick={generateAnalysis}
+              disabled={assets.length === 0 || analyzing}
               className="mt-auto inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-fg text-sm font-medium text-white transition hover:brightness-110 disabled:opacity-50"
             >
-              {(submitting || analyzing) && <Loader2 className="h-4 w-4 animate-spin" />}
-              <span>{viewTab === 'results' ? '立即分析商品图' : '生成商品详解'}</span>
-              {viewTab === 'results' ? (
-                <span className="text-white/60 text-xs">预计 -{creditsCost} 积分</span>
-              ) : (
-                <span className="text-white/60 text-xs">详解语言：{lang}</span>
-              )}
+              {analyzing && <Loader2 className="h-4 w-4 animate-spin" />}
+              <span>生成商品详解</span>
+              <span className="text-white/60 text-xs">详解语言：{lang}</span>
             </button>
           </aside>
 
@@ -593,54 +937,74 @@ export default function ProductImageWorkbench() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => resultTask && setResultTab('results')}
-                  disabled={!resultTask}
+                  onClick={() => hasResults && setResultTab('results')}
+                  disabled={!hasResults}
                   className={cn(
                     'border-b-2 pb-2 font-medium transition',
                     viewTab === 'results'
                       ? 'border-fg text-fg'
                       : 'border-transparent text-fg-muted hover:text-fg',
-                    !resultTask && 'cursor-not-allowed opacity-40 hover:text-fg-muted'
+                    !hasResults && 'cursor-not-allowed opacity-40 hover:text-fg-muted'
                   )}
                 >
                   生成结果
                 </button>
               </div>
-              {viewTab === 'results' && resultTask && (
+              {viewTab === 'results' && hasResults && (
                 <button
                   type="button"
-                  onClick={() => batchDownload(resultTask)}
+                  onClick={() => batchDownloadAll()}
                   className="mb-2 inline-flex items-center gap-1.5 rounded-lg bg-fg px-3 py-1.5 text-xs font-medium text-white transition hover:brightness-110"
                 >
                   <Download className="h-3.5 w-3.5" />
-                  批量下载
+                  批量下载（{resultImages.length}）
+                </button>
+              )}
+              {/* 全部生成：分析完成后一键并发提交所有条目（也会在分析完成时自动触发） */}
+              {viewTab !== 'results' && analysisItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => generateAllFromAnalysis()}
+                  disabled={bulkGenerating}
+                  className="mb-2 inline-flex items-center gap-1.5 rounded-lg bg-fg px-3 py-1.5 text-xs font-medium text-white transition hover:brightness-110 disabled:opacity-60"
+                >
+                  {bulkGenerating ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="h-3.5 w-3.5" />
+                  )}
+                  {bulkGenerating ? '提交中…' : `全部生成（${analysisItems.length}）`}
                 </button>
               )}
             </div>
 
-            {viewTab === 'results' && resultTask ? (
-              <div className="mt-4 grid min-h-0 flex-1 auto-rows-min grid-cols-2 gap-4 overflow-y-auto scrollbar-slim">
-                {resultTask.imageUrls!.map((u, i) => {
-                  const role = resultTask.imageRoles?.[i] ?? `图 ${i + 1}`;
-                  const sub = examples.find((e) => e.title === role)?.subtitle;
+            {viewTab === 'results' && hasResults ? (
+              <div ref={resultGridRef} className="mt-4 grid min-h-0 flex-1 auto-rows-min grid-cols-2 gap-4 overflow-y-auto scrollbar-slim">
+                {resultImages.map((img, i) => {
+                  const sub = examples.find((e) => e.title === img.role)?.subtitle;
                   return (
                     <div
-                      key={`${resultTask.taskId}-${i}`}
-                      className="group relative aspect-square cursor-zoom-in overflow-hidden rounded-xl border border-bg-line bg-bg-soft"
-                      onClick={() => setPreviewUrl(u)}
+                      key={`${img.taskId}-${i}`}
+                      data-task-id={img.taskId}
+                      data-role={img.role}
+                      className={cn(
+                        'group relative aspect-square cursor-zoom-in overflow-hidden rounded-xl border border-bg-line bg-bg-soft',
+                        isFlashing(img) && 'animate-[flash-highlight_.6s_ease-in-out_3] ring-2 ring-[#4f7cff]'
+                      )}
+                      onClick={() => setPreviewUrl(img.url)}
                     >
                       {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={u} alt={`${role} ${i + 1}`} className="h-full w-full object-cover transition group-hover:scale-[1.02]" />
-                      {/* 序号 + 类型标签 */}
+                      <img src={img.url} alt={`${img.role} ${i + 1}`} className="h-full w-full object-cover transition group-hover:scale-[1.02]" />
+                      {/* 序号 + 类型标签（跨任务连续编号） */}
                       <span className="absolute left-3 top-3 rounded-md bg-white/90 px-2 py-1 text-xs font-medium text-fg shadow-soft backdrop-blur">
-                        {String(i + 1).padStart(2, '0')} {role}{sub ? ` / ${sub}` : ''}
+                        {String(i + 1).padStart(2, '0')} {img.role}{sub ? ` / ${sub}` : ''}
                       </span>
                       {/* 单张下载 */}
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          downloadImage(u, `商详套图-${String(i + 1).padStart(2, '0')}-${role}.png`);
+                          downloadImage(img.url, `商详套图-${String(i + 1).padStart(2, '0')}-${img.role}.png`);
                         }}
                         className="absolute right-3 top-3 grid h-8 w-8 place-items-center rounded-lg bg-fg text-white transition hover:brightness-110"
                         aria-label="下载"
@@ -694,11 +1058,12 @@ export default function ProductImageWorkbench() {
                 {analysisItems.map((item, i) => {
                   const selKey = `${analysisTask?.taskId ?? 'local'}-${i}`;
                   const refIdx = parseInt(item.refLabel.replace(/[^0-9]/g, '') || '1', 10) - 1;
-                  const refAsset = assets[refIdx];
+                  // 优先用提交分析时的快照：删除上传的商品图后引用图仍正常显示
+                  const refAsset = resolveRefAsset(refIdx);
                   return (
                     <div key={selKey} className="rounded-xl border border-bg-line bg-white p-4 shadow-soft">
                       <div className="flex items-start gap-3">
-                        {/* 引用图缩略 @图片N */}
+                        {/* 引用图缩略（不再叠加 @图片N 标签） */}
                         {refAsset ? (
                           <div
                             className="relative h-14 w-14 flex-none cursor-zoom-in overflow-hidden rounded-lg border border-bg-line"
@@ -706,15 +1071,16 @@ export default function ProductImageWorkbench() {
                           >
                             {/* eslint-disable-next-line @next/next/no-img-element */}
                             <img src={refAsset.url} alt={item.refLabel} className="h-full w-full object-cover" />
-                            <span className="absolute inset-x-0 bottom-0 bg-black/55 px-1 text-center text-[9px] leading-4 text-white">{item.refLabel}</span>
                           </div>
                         ) : (
-                          <div className="grid h-14 w-14 flex-none place-items-center rounded-lg border border-bg-line bg-bg-soft text-[10px] text-fg-muted">{item.refLabel}</div>
+                          <div className="grid h-14 w-14 flex-none place-items-center rounded-lg border border-bg-line bg-bg-soft">
+                            <ImageIcon className="h-4 w-4 text-[#a4aab5]" />
+                          </div>
                         )}
                         {/* 分析要点列表（点击整卡可放大） */}
                         <ul
                           className="min-w-0 flex-1 cursor-zoom-in space-y-1.5 text-xs leading-relaxed text-fg"
-                          onClick={() => setEnlargedItem(item)}
+                          onClick={() => openEnlarged(item, i)}
                         >
                           {item.sections.map((s, si) => (
                             <li key={si} className="flex gap-1">
@@ -726,7 +1092,7 @@ export default function ProductImageWorkbench() {
                         {/* 右上角操作：放大 */}
                         <button
                           type="button"
-                          onClick={() => setEnlargedItem(item)}
+                          onClick={() => openEnlarged(item, i)}
                           title="放大"
                           className="grid h-7 w-7 flex-none place-items-center rounded-md text-fg-muted transition hover:bg-bg-soft hover:text-fg"
                         >
@@ -749,7 +1115,8 @@ export default function ProductImageWorkbench() {
                         </div>
                         <div className="relative">
                           <select
-                            defaultValue={item.ratio}
+                            value={ratioSel[selKey] ?? item.ratio}
+                            onChange={(e) => setRatioSel((prev) => ({ ...prev, [selKey]: e.target.value }))}
                             className="h-8 appearance-none rounded-lg border border-bg-line bg-white pl-3 pr-8 text-xs text-fg outline-none hover:border-brand/40"
                           >
                             <option value="1:1">1:1</option>
@@ -765,19 +1132,19 @@ export default function ProductImageWorkbench() {
                         >
                           <Copy className="h-3.5 w-3.5" />
                         </button>
-                        {/* 立即生成：把本条分析文案 + 引用图 + 类型传入图生图链路，结果进「生成结果」 */}
+                        {/* 重新生成：先按新定位/比例重写分析文案，再用新文案 + 引用图 + 类型走图生图链路，新结果追加进「生成结果」 */}
                         <button
                           type="button"
-                          onClick={() => generateFromAnalysis(item, selKey)}
-                          disabled={genLoading[selKey]}
+                          onClick={() => generateFromAnalysis(item, selKey, i)}
+                          disabled={genLoading[selKey] || bulkGenerating}
                           className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-fg px-3 text-xs font-medium text-white transition hover:brightness-110 disabled:opacity-60"
                         >
                           {genLoading[selKey] ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
-                            <Sparkles className="h-3.5 w-3.5" />
+                            <RotateCw className="h-3.5 w-3.5" />
                           )}
-                          {genLoading[selKey] ? '提交中' : '立即生成'}
+                          {genLoading[selKey] ? '提交中' : '重新生成'}
                         </button>
                       </div>
                     </div>
@@ -836,8 +1203,9 @@ export default function ProductImageWorkbench() {
             </div>
             )}
 
-            {/* 左右切换箭头：仅示例页显示，垂直居中，离边框远一点 */}
-            {viewTab !== 'results' && examples.length > 1 && (
+            {/* 左右切换箭头：仅示例页实际展示时显示（分析中/分析卡片/生成结果页不显示），垂直居中，离边框远一点 */}
+            {viewTab !== 'results' && !analyzing && analysisItems.length === 0
+              && analysisTask?.status !== 'failed' && examples.length > 1 && (
               <>
                 <button
                   onClick={prevEx}
@@ -889,16 +1257,33 @@ export default function ProductImageWorkbench() {
               </div>
             ) : (
               <>
-                {/* 头部（标题 + 收起文字按钮，与参考图一致） */}
+                {/* 头部（标题 + 批量删除 + 收起文字按钮） */}
                 <div className="flex items-center justify-between px-1">
                   <h3 className="text-sm font-medium text-fg">任务队列</h3>
-                  <button
-                    type="button"
-                    onClick={() => setQueueCollapsed(true)}
-                    className="text-xs text-fg-muted hover:text-fg"
-                  >
-                    收起
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {tasks.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSelectMode((v) => !v);
+                          setSelectedTaskIds([]);
+                        }}
+                        className={cn(
+                          'text-xs transition',
+                          selectMode ? 'font-medium text-rose-600' : 'text-fg-muted hover:text-rose-600'
+                        )}
+                      >
+                        {selectMode ? '取消' : '批量删除'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setQueueCollapsed(true)}
+                      className="text-xs text-fg-muted hover:text-fg"
+                    >
+                      收起
+                    </button>
+                  </div>
                 </div>
                 {/* 统计条：与 AI 生成图片状态栏同款样式（小灰标签在上、大号数字在下） */}
                 <div className="flex gap-2 rounded-lg border border-[#eceef2] bg-white px-2.5 py-2.5 text-center shadow-sm">
@@ -912,6 +1297,29 @@ export default function ProductImageWorkbench() {
                     <div className="text-base font-semibold leading-5 text-fg">{running}</div>
                   </div>
                 </div>
+                {/* 批量删除操作栏：选择模式下显示（全选 + 删除按钮，红色危险风格） */}
+                {selectMode && (
+                  <div className="flex items-center justify-between rounded-lg border border-rose-100 bg-rose-50/60 px-2.5 py-1.5">
+                    <label className="flex cursor-pointer select-none items-center gap-1.5 text-[11px] text-fg-muted">
+                      <input
+                        type="checkbox"
+                        checked={tasks.length > 0 && selectedTaskIds.length === tasks.length}
+                        onChange={(e) => setSelectedTaskIds(e.target.checked ? tasks.map((t) => t.taskId) : [])}
+                        className="h-3.5 w-3.5 accent-rose-600"
+                      />
+                      全选 {selectedTaskIds.length}/{tasks.length}
+                    </label>
+                    <button
+                      type="button"
+                      onClick={batchDeleteSelected}
+                      disabled={selectedTaskIds.length === 0 || bulkDeleting}
+                      className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2 py-1 text-[11px] font-medium text-white transition hover:bg-rose-700 disabled:opacity-50"
+                    >
+                      {bulkDeleting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                      删除{selectedTaskIds.length > 0 ? `(${selectedTaskIds.length})` : ''}
+                    </button>
+                  </div>
+                )}
                 {/* 任务列表：紧凑条卡（小图标 + 状态 + 日期时间），失败原因悬停查看 */}
                 <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto scrollbar-slim">
                   {tasks.length === 0 && (
@@ -919,7 +1327,9 @@ export default function ProductImageWorkbench() {
                   )}
                   {tasks.map((t) => {
                     const done = t.status === 'success' && (t.imageUrls?.length ?? 0) > 0;
-                    const isCurrent = done && resultTask?.taskId === t.taskId && viewTab === 'results';
+                    // 已出图的任务都可点击切到生成结果（合并展示全部结果）；选择模式下点击 = 勾选/取消
+                    const isSelected = selectedTaskIds.includes(t.taskId);
+                    const isCurrent = done && viewTab === 'results';
                     const thumb = done
                       ? t.imageUrls![0]
                       : t.previewUrls && t.previewUrls.length > 0
@@ -930,13 +1340,25 @@ export default function ProductImageWorkbench() {
                         key={t.taskId}
                         className={cn(
                           'group relative flex w-full flex-none items-center gap-2 rounded-lg border bg-[#f6f7f9] p-2 transition',
-                          done ? 'cursor-pointer' : '',
-                          isCurrent
-                            ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
-                            : 'border-[#eef0f3] hover:border-[#cbd3e6]'
+                          done || selectMode ? 'cursor-pointer' : '',
+                          isSelected
+                            ? 'border-rose-500 ring-1 ring-rose-500/30'
+                            : isCurrent
+                              ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
+                              : 'border-[#eef0f3] hover:border-[#cbd3e6]'
                         )}
-                        onClick={done ? () => setResultTab('results') : undefined}
+                        onClick={selectMode ? () => toggleTaskSelect(t.taskId) : done ? () => locateResultTask(t) : undefined}
                       >
+                        {/* 批量删除选择框：选择模式下显示 */}
+                        {selectMode && (
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleTaskSelect(t.taskId)}
+                            onClick={(e) => e.stopPropagation()}
+                            className="h-3.5 w-3.5 flex-none accent-rose-600"
+                          />
+                        )}
                         {/* 小缩略图：完成图 / 商品图 / 占位图标；生成中叠加旋转图标 + 蓝色进度条 */}
                         <div className="relative h-10 w-10 flex-none overflow-hidden rounded-md bg-[#f4f5f7]">
                           {thumb ? (
@@ -972,13 +1394,21 @@ export default function ProductImageWorkbench() {
                           </div>
                           <div
                             className="truncate text-[10px] text-[#9ca2ad]"
-                            title={t.status === 'failed' && t.failReason ? t.failReason : undefined}
+                            title={t.status === 'failed' && t.failReason
+                              ? t.failReason
+                              : t.status === 'success' && (t.imageRoles?.length ?? 0) > 0
+                                ? [...new Set(t.imageRoles)].join(' · ')
+                                : undefined}
                           >
-                            {formatTaskDate(t.createdAt)}
+                            {/* 已完成任务显示生成图类型（主视图/卖点图…，去重）代替日期；无类型信息时回退显示日期 */}
+                            {t.status === 'success' && (t.imageRoles?.length ?? 0) > 0
+                              ? [...new Set(t.imageRoles)].join(' · ')
+                              : formatTaskDate(t.createdAt)}
                             {t.status === 'failed' && t.failReason ? ` · ${t.failReason}` : ''}
                           </div>
                         </div>
-                        {/* 删除按钮（悬停显示） */}
+                        {/* 删除按钮（悬停显示；选择模式下隐藏，改用勾选批量删） */}
+                        {!selectMode && (
                         <button
                           type="button"
                           onClick={(e) => {
@@ -990,6 +1420,7 @@ export default function ProductImageWorkbench() {
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
+                        )}
                       </div>
                     );
                   })}
@@ -1227,17 +1658,17 @@ export default function ProductImageWorkbench() {
         </div>
       )}
 
-      {/* 分析结果放大视图：点分析卡片的放大按钮/文字区域，全文大字展示 */}
+      {/* 分析结果放大视图：点分析卡片的放大按钮/文字区域，全文大字展示；引用图显示缩略图，文字可编辑，底部保存/取消 */}
       {enlargedItem && (
         <div
           className="fixed inset-0 z-[1100] grid place-items-center bg-black/80 p-8 backdrop-blur-sm"
-          onClick={() => setEnlargedItem(null)}
+          onClick={cancelEnlarged}
           role="dialog"
           aria-modal="true"
         >
           <button
             className="absolute right-6 top-6 grid h-10 w-10 place-items-center rounded-full bg-white/10 text-2xl text-white hover:bg-white/20"
-            onClick={(e) => { e.stopPropagation(); setEnlargedItem(null); }}
+            onClick={(e) => { e.stopPropagation(); cancelEnlarged(); }}
             aria-label="关闭"
           >×</button>
           <div
@@ -1245,17 +1676,61 @@ export default function ProductImageWorkbench() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-2 border-b border-bg-line pb-3">
-              <span className="rounded-md bg-bg-soft px-2 py-1 text-sm font-medium text-fg">{enlargedItem.refLabel}</span>
+              {/* 引用图：展示缩略图（代替原 @图片N 文字标签），点击可预览大图 */}
+              {(() => {
+                const refIdx = parseInt(enlargedItem.refLabel.replace(/[^0-9]/g, '') || '1', 10) - 1;
+                const refAsset = resolveRefAsset(refIdx);
+                return refAsset ? (
+                  <div
+                    className="h-12 w-12 flex-none cursor-zoom-in overflow-hidden rounded-lg border border-bg-line"
+                    onClick={() => setPreviewUrl(refAsset.url)}
+                    title={enlargedItem.refLabel}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={refAsset.url} alt={enlargedItem.refLabel} className="h-full w-full object-cover" />
+                  </div>
+                ) : (
+                  <span className="rounded-md bg-bg-soft px-2 py-1 text-sm font-medium text-fg">{enlargedItem.refLabel}</span>
+                );
+              })()}
               <span className="text-sm font-medium text-fg">{enlargedItem.role}</span>
               <span className="text-xs text-fg-muted">{enlargedItem.ratio}</span>
             </div>
-            <ul className="mt-4 space-y-3 text-base leading-relaxed text-fg">
+            {/* 文字区域：可编辑（每个要点一个文本框），保存后写回分析结果 */}
+            <ul className="mt-4 space-y-4 text-base leading-relaxed text-fg">
               {enlargedItem.sections.map((s, si) => (
                 <li key={si}>
-                  <b className="font-semibold">{s.key}</b>：{cleanSectionValue(s.value)}
+                  <b className="font-semibold">{s.key}</b>：
+                  <textarea
+                    value={enlargedDraft?.[si] ?? cleanSectionValue(s.value)}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setEnlargedDraft((prev) => {
+                        const base = prev ?? enlargedItem.sections.map((x) => cleanSectionValue(x.value));
+                        const next = [...base];
+                        next[si] = v;
+                        return next;
+                      });
+                    }}
+                    rows={Math.min(6, Math.max(2, Math.ceil((enlargedDraft?.[si] ?? cleanSectionValue(s.value)).length / 40)))}
+                    className="mt-1 w-full resize-y rounded-lg border border-bg-line bg-bg-soft/60 p-2.5 text-sm leading-relaxed text-fg outline-none transition focus:border-brand/50 focus:bg-white"
+                  />
                 </li>
               ))}
             </ul>
+            {/* 底部操作：保存（写回分析结果）/ 取消（丢弃编辑关闭） */}
+            <div className="mt-5 flex items-center justify-end gap-2 border-t border-bg-line pt-4">
+              <button
+                type="button"
+                onClick={cancelEnlarged}
+                className="h-9 rounded-lg border border-bg-line px-4 text-sm text-fg-muted transition hover:bg-bg-soft hover:text-fg"
+              >取消</button>
+              <button
+                type="button"
+                onClick={saveEnlarged}
+                className="h-9 rounded-lg bg-fg px-5 text-sm font-medium text-white transition hover:brightness-110"
+              >保存</button>
+            </div>
           </div>
         </div>
       )}

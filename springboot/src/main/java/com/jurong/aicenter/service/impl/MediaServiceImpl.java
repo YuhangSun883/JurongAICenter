@@ -383,7 +383,7 @@ public class MediaServiceImpl implements MediaService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public MediaAssetResponse saveFavoriteAsAsset(Long userId, byte[] imageBytes, String mimeType, String displayName) {
-        return saveImageAsAsset(userId, imageBytes, mimeType, "favorite");
+        return saveImageAsAsset(userId, imageBytes, mimeType, "favorite", libraryService.getAiLibrary(userId).getId());
     }
 
     /**
@@ -392,7 +392,34 @@ public class MediaServiceImpl implements MediaService {
     @Override
     @Transactional(rollbackFor = Exception.class)
     public MediaAssetResponse recordGeneratedImage(Long userId, byte[] imageBytes, String mimeType) {
-        return saveImageAsAsset(userId, imageBytes, mimeType, "image");
+        return saveImageAsAsset(userId, imageBytes, mimeType, "image", libraryService.getAiLibrary(userId).getId());
+    }
+
+    /**
+     * 商详套图生成结果入「个人资产」：libraryId 指向「我的资产」系统库（不进「AI 生成结果」库），
+     * sourceTool=product-image（不会出现在 AI 工作台的预览/收藏 Tab）。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public MediaAssetResponse recordProductImageAsset(Long userId, byte[] imageBytes, String mimeType) {
+        return saveImageAsAsset(userId, imageBytes, mimeType, "product-image", libraryService.getUploadLibrary(userId).getId());
+    }
+
+    /**
+     * 按 objectKey 批量删除资产记录：商详套图删除任务时，生成图已物理删除，同步清掉对应资产记录。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void deleteAssetsByObjectKeys(Long userId, List<String> objectKeys) {
+        if (objectKeys == null || objectKeys.isEmpty()) {
+            return;
+        }
+        LambdaQueryWrapper<MediaAsset> wrapper = new LambdaQueryWrapper<>();
+        wrapper.eq(MediaAsset::getUserId, userId)
+               .in(MediaAsset::getObjectKey, objectKeys);
+        int deleted = assetRepository.delete(wrapper);
+        log.info("Deleted asset records by objectKeys: userId={}, requested={}, deleted={}",
+            userId, objectKeys.size(), deleted);
     }
 
     /**
@@ -454,9 +481,10 @@ public class MediaServiceImpl implements MediaService {
      * @param userId      用户 ID
      * @param imageBytes  图片字节
      * @param mimeType    MIME 类型
-     * @param sourceTool  写入 sourceTool 字段（"favorite" 用于收藏 Tab，"image" 用于预览 Tab）
+     * @param sourceTool  写入 sourceTool 字段（"favorite" 收藏 / "image" 预览 / "product-image" 商详套图）
+     * @param libraryId   资产所属库 ID（AI 库 / 「我的资产」库）
      */
-    private MediaAssetResponse saveImageAsAsset(Long userId, byte[] imageBytes, String mimeType, String sourceTool) {
+    private MediaAssetResponse saveImageAsAsset(Long userId, byte[] imageBytes, String mimeType, String sourceTool, Long libraryId) {
         if (imageBytes == null || imageBytes.length == 0) {
             throw new BusinessException(ErrorCode.MEDIA_FILE_EMPTY);
         }
@@ -475,7 +503,7 @@ public class MediaServiceImpl implements MediaService {
             throw new BusinessException(ErrorCode.MEDIA_UPLOAD_FAILED, e.getMessage());
         }
 
-        Long aiLibId = libraryService.getAiLibrary(userId).getId();
+        Long aiLibId = libraryId;
         // name 字段存储文件名，即 objectKey 的最后一部分 (e.g., 0f8d58d9e36e4721a5497e65f5000f71.png)
         String name = objectKey.substring(objectKey.lastIndexOf('/') + 1);
 

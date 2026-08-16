@@ -38,6 +38,11 @@ import type { UserPromptResult } from '@/api/prompt';
 /** 图片生成超时时间：5 分钟（300 秒） */
 const GENERATE_TIMEOUT_SECONDS = 300;
 
+/** 生成失败自动重试的最大尝试次数（含首次） */
+const GENERATE_MAX_ATTEMPTS = 3;
+/** 自动重试前的等待时间（毫秒） */
+const GENERATE_RETRY_DELAY_MS = 1500;
+
 const MAX_REFS = 9;
 const MAX_PROMPT = 2000;
 
@@ -331,6 +336,8 @@ export function ImageWorkbench() {
   const [generatedAt, setGeneratedAt] = useState<number | null>(null); // 当前预览图片的生成时间（毫秒）
   const [generatedObjectKey, setGeneratedObjectKey] = useState<string | null>(null); // 当前预览图片入库后的 MinIO objectKey（用于收藏时传给后端）
   const [generating, setGenerating] = useState(false);
+  /** 当前生成尝试次数（>1 表示正在自动重试） */
+  const [retryAttempt, setRetryAttempt] = useState(0);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   // 当前正在生成任务的元信息（用于切走后再回来仍显示"生成中"占位卡）
@@ -519,6 +526,80 @@ export function ImageWorkbench() {
   useEffect(() => {
     refreshHistory();
   }, [refreshHistory]);
+
+  // ===== 任务队列删除/批量删除（与商品套图同语义：直接删除数据库记录与 MinIO 文件，不可恢复） =====
+  /** 从历史条目 id 提取数据库资产 id：远端条目为 server-{assetId} 形式；本地条目返回 null（无数据库数据，只删本地） */
+  function assetIdOfHistoryId(id: string): number | null {
+    if (!id.startsWith('server-')) return null;
+    const n = Number(id.slice('server-'.length));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  /** 清空当前预览区（预览中的图片被删除时调用） */
+  function clearCurrentPreview() {
+    setGeneratedUrl(null);
+    setGeneratedAt(null);
+    setGeneratedObjectKey(null);
+    setIsFavorited(false);
+    setCurrentFavoriteId(null);
+  }
+
+  /** 单删任务队列条目：与商品套图删除一致——直接删数据库数据与 MinIO 文件；本地条目只删本地 */
+  async function deleteHistoryItem(item: (typeof generationHistory)[number]) {
+    if (deletingHistoryId || bulkDeletingHistory) return;
+    setDeletingHistoryId(item.id);
+    // 乐观更新：先从队列移除；若涉及当前预览/收藏则同步移除
+    setGenerationHistory((prev) => prev.filter((h) => h.id !== item.id));
+    setSelectedHistoryIds((prev) => prev.filter((x) => x !== item.id));
+    if (generatedUrl === item.url) clearCurrentPreview();
+    if (item.objectKey) setFavorites((prev) => prev.filter((f) => f.objectKey !== item.objectKey));
+    const assetId = assetIdOfHistoryId(item.id);
+    if (assetId != null) {
+      try {
+        await mediaApi.batchDeleteAssets([assetId]);
+      } catch (err) {
+        console.error('[ImageWorkbench] deleteHistoryItem failed', err);
+        // 失败回滚
+        setGenerationHistory((prev) => dedupeHistory([item, ...prev]));
+        window.alert('删除失败，请稍后重试');
+      }
+    }
+    setDeletingHistoryId(null);
+  }
+
+  /** 勾选/取消勾选历史条目 */
+  function toggleHistorySelect(id: string) {
+    setSelectedHistoryIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  /** 批量删除所选条目：与商品套图批量删除同语义——直接删数据库数据（含 MinIO 文件），确认后不可恢复 */
+  async function batchDeleteSelectedHistory() {
+    if (selectedHistoryIds.length === 0 || bulkDeletingHistory) return;
+    if (!window.confirm(`确认删除所选 ${selectedHistoryIds.length} 张生成图？将一并从数据库中删除，无法恢复。`)) return;
+    const ids = [...selectedHistoryIds];
+    setBulkDeletingHistory(true);
+    const removed = generationHistory.filter((h) => ids.includes(h.id));
+    // 乐观更新：队列、预览区、收藏列表同步移除
+    setGenerationHistory((prev) => prev.filter((h) => !ids.includes(h.id)));
+    if (removed.some((h) => h.url === generatedUrl)) clearCurrentPreview();
+    const removedKeys = removed.map((h) => h.objectKey).filter((k): k is string => !!k);
+    if (removedKeys.length > 0) setFavorites((prev) => prev.filter((f) => !removedKeys.includes(f.objectKey)));
+    try {
+      // 本地条目（无 server- 前缀）未进数据库，只删本地；远端条目走资产批量删除接口
+      const assetIds = ids.map(assetIdOfHistoryId).filter((n): n is number => n != null);
+      if (assetIds.length > 0) await mediaApi.batchDeleteAssets(assetIds);
+      setSelectedHistoryIds([]);
+      setQueueSelectMode(false);
+    } catch (err) {
+      console.error('[ImageWorkbench] batchDeleteSelectedHistory failed', err);
+      // 失败回滚
+      setGenerationHistory((prev) => dedupeHistory([...removed, ...prev]));
+      window.alert('删除失败，请稍后重试');
+    } finally {
+      setBulkDeletingHistory(false);
+    }
+  }
+
   const [isFavorited, setIsFavorited] = useState(false); // 当前生成图片是否已收藏
   const [currentFavoriteId, setCurrentFavoriteId] = useState<string | null>(null); // 当前生成图片对应的收藏 ID（MinIO objectKey）
   const [showNewConfirm, setShowNewConfirm] = useState(false); // 新建确认弹窗
@@ -528,7 +609,14 @@ export function ImageWorkbench() {
   const [favoriting, setFavoriting] = useState(false); // 收藏操作进行中
   const [loadingFavorites, setLoadingFavorites] = useState(false); // 加载收藏列表中
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set()); // 正在删除的图片ID集合
+  // ===== 任务队列批量删除（与商品套图一致） =====
+  const [queueSelectMode, setQueueSelectMode] = useState(false); // 是否处于批量删除选择模式
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<string[]>([]); // 已勾选的历史条目 id
+  const [bulkDeletingHistory, setBulkDeletingHistory] = useState(false); // 批量删除整体加载态
+  const [deletingHistoryId, setDeletingHistoryId] = useState<string | null>(null); // 正在单删的历史条目 id
   const abortRef = useRef<AbortController | null>(null);
+  /** 用户是否主动取消了生成（区分主动取消与超时：主动取消不自动重试） */
+  const userCancelledRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 提示词相关状态
@@ -1034,6 +1122,8 @@ export function ImageWorkbench() {
   const displayCompletedCount = useMemo(() => {
     return generatedUrl && !generating ? 1 : 0;
   }, [generatedUrl, generating]);
+  /** 任务队列渲染用的去重历史列表（头部批量删除按钮、全选统计、卡片列表共用） */
+  const historyList = dedupeHistory(generationHistory);
   // 积分估算：根据提示词字数、模型、清晰度综合计算
   // 输入为空时返回 null，表示显示 "--"
   const estimatedCredits = useMemo(() => {
@@ -1107,6 +1197,7 @@ export function ImageWorkbench() {
    * 取消正在进行的图片生成
    */
   function cancelGeneration() {
+    userCancelledRef.current = true; // 标记主动取消：重试循环检测到后不再自动重试
     abortRef.current?.abort();
     abortRef.current = null;
     setGenerating(false);
@@ -1180,6 +1271,7 @@ export function ImageWorkbench() {
     setGeneratedUrl(null);
     setSubmitting(true);
     setGenerating(true);
+    userCancelledRef.current = false;
     // 记录当前正在生成的任务（切走后再回来能恢复"生成中"占位卡）
     setActiveGeneration({
       prompt: finalPrompt || '(空提示词)',
@@ -1187,73 +1279,92 @@ export function ImageWorkbench() {
       startedAt: Date.now(),
     });
 
-    // 创建 AbortController 用于超时取消
-    const controller = new AbortController();
-    abortRef.current = controller;
+    // ===== 失败自动重试：最多尝试 GENERATE_MAX_ATTEMPTS 次（用户主动取消除外） =====
+    let attempt = 0;
+    let success = false;
+    let lastErrorMsg = '图片生成失败，请稍后重试';
 
-    // 设置 5 分钟超时
-    const timeoutId = setTimeout(() => {
-      console.warn('[ImageWorkbench] timeout triggered');
-      controller.abort();
-      setGenerateError('图片生成超时（已超过 5 分钟），请重试');
-      setGenerating(false);
-      setSubmitting(false);
-    }, GENERATE_TIMEOUT_SECONDS * 1000);
+    while (attempt < GENERATE_MAX_ATTEMPTS && !success && !userCancelledRef.current) {
+      attempt++;
+      setRetryAttempt(attempt);
 
-    try {
-      console.log('[ImageWorkbench] calling imageApi.generateImage...');
-      // 调用图片生成 API
-      // - 有引用图片时，后端调用 /v1/images/edits 接口
-      // - 无引用图片时，后端调用 /v1/images/generations 接口
-      const result = await imageApi.generateImage(
-        {
-          prompt: finalPrompt,
-          size: '1024x1024',
-          quality: 'standard',
-          style: 'vivid',
-          referenceImages: referenceImagesBase64.length > 0 ? referenceImagesBase64 : undefined,
-        },
-        controller.signal
-      );
+      // 每次尝试独立的超时控制（5 分钟）
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const timeoutId = setTimeout(() => {
+        console.warn('[ImageWorkbench] timeout triggered, attempt', attempt);
+        controller.abort();
+      }, GENERATE_TIMEOUT_SECONDS * 1000);
 
-      console.log('[ImageWorkbench] generateImage result:', result);
+      try {
+        console.log('[ImageWorkbench] calling imageApi.generateImage, attempt', attempt);
+        // 调用图片生成 API
+        // - 有引用图片时，后端调用 /v1/images/edits 接口
+        // - 无引用图片时，后端调用 /v1/images/generations 接口
+        const result = await imageApi.generateImage(
+          {
+            prompt: finalPrompt,
+            size: '1024x1024',
+            quality: 'standard',
+            style: 'vivid',
+            referenceImages: referenceImagesBase64.length > 0 ? referenceImagesBase64 : undefined,
+          },
+          controller.signal
+        );
 
-      if (result && result.imageUrl) {
-        // 生成成功，显示图片并自动切到预览 Tab
-        setGeneratedUrl(result.imageUrl);
-        setGeneratedAt(Date.now());
-        setGeneratedObjectKey(result.objectKey ?? null); // 收藏时使用
-        setActiveTab('preview');
-        // 不在本地 unshift（base64 data URI 与远端 MinIO URL 不同，dedupeHistory 失效）
-        // 而是完全依赖远端刷新：后端已入库，立即拉取一次（带 objectKey 的服务端条目）
-        refreshHistory();
-        console.log('[ImageWorkbench] image URL set:', result.imageUrl);
-      } else {
-        console.warn('[ImageWorkbench] result missing imageUrl:', result);
-        setGenerateError('图片生成失败：未获取到图片地址');
-      }
-    } catch (err: unknown) {
-      console.error('[ImageWorkbench] generateImage error:', err);
-      // 处理错误
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        // 超时或用户取消
-        if (!generateError) {
-          setGenerateError('图片生成已取消');
+        console.log('[ImageWorkbench] generateImage result:', result);
+
+        if (result && result.imageUrl) {
+          // 生成成功，显示图片并自动切到预览 Tab
+          setGeneratedUrl(result.imageUrl);
+          setGeneratedAt(Date.now());
+          setGeneratedObjectKey(result.objectKey ?? null); // 收藏时使用
+          setActiveTab('preview');
+          // 不在本地 unshift（base64 data URI 与远端 MinIO URL 不同，dedupeHistory 失效）
+          // 而是完全依赖远端刷新：后端已入库，立即拉取一次（带 objectKey 的服务端条目）
+          refreshHistory();
+          console.log('[ImageWorkbench] image URL set:', result.imageUrl);
+          success = true;
+        } else {
+          console.warn('[ImageWorkbench] result missing imageUrl:', result);
+          lastErrorMsg = '图片生成失败：未获取到图片地址';
         }
-      } else if (err instanceof Error) {
-        setGenerateError(`生成失败：${err.message}`);
-      } else {
-        setGenerateError('图片生成失败，请稍后重试');
+      } catch (err: unknown) {
+        console.error('[ImageWorkbench] generateImage error (attempt', attempt + '):', err);
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          if (userCancelledRef.current) {
+            // 用户主动取消：不重试，直接结束
+            lastErrorMsg = '图片生成已取消';
+          } else {
+            // 超时中断：纳入自动重试
+            lastErrorMsg = '图片生成超时（已超过 5 分钟）';
+          }
+        } else if (err instanceof Error) {
+          lastErrorMsg = `生成失败：${err.message}`;
+        } else {
+          lastErrorMsg = '图片生成失败，请稍后重试';
+        }
+      } finally {
+        clearTimeout(timeoutId);
+        abortRef.current = null;
       }
-    } finally {
-      clearTimeout(timeoutId);
-      abortRef.current = null;
-      setGenerating(false);
-      setSubmitting(false);
-      // 生成任务结束，清除"生成中"占位卡的持久化状态
-      setActiveGeneration(null);
-      console.log('[ImageWorkbench] submit finished');
+
+      // 失败且还有重试机会：提示后稍等再自动重新生成
+      if (!success && !userCancelledRef.current && attempt < GENERATE_MAX_ATTEMPTS) {
+        console.warn('[ImageWorkbench] generation failed, auto retry', attempt + 1, '/', GENERATE_MAX_ATTEMPTS);
+        await new Promise((r) => setTimeout(r, GENERATE_RETRY_DELAY_MS));
+      }
     }
+
+    if (!success) {
+      setGenerateError(lastErrorMsg);
+    }
+    setRetryAttempt(0);
+    setGenerating(false);
+    setSubmitting(false);
+    // 生成任务结束，清除"生成中"占位卡的持久化状态
+    setActiveGeneration(null);
+    console.log('[ImageWorkbench] submit finished');
   }
 
   return (
@@ -1262,7 +1373,7 @@ export function ImageWorkbench() {
         'grid h-full min-h-0 gap-3',
         sidebarCollapsed
           ? 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_36px]'
-          : 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_112px]'
+          : 'grid-cols-[minmax(420px,610px)_minmax(0,1fr)_168px]'
       )}>
         <section className="relative flex min-h-0 flex-col rounded-xl border border-[#e4e5e9] bg-white">
           <div className="flex h-14 items-center justify-between px-4">
@@ -1823,6 +1934,12 @@ export function ImageWorkbench() {
                 <div className="text-sm font-medium text-[#303642]">
                   AI 正在生成图片...
                 </div>
+                {/* 自动重试提示：上次失败后正在重新生成 */}
+                {retryAttempt > 1 && (
+                  <div className="mt-1 text-xs font-medium text-[#f5a524]">
+                    上次生成失败，正在自动重新生成（第 {retryAttempt}/{GENERATE_MAX_ATTEMPTS} 次）
+                  </div>
+                )}
                 <div className="mt-2 text-xs text-[#6f7682]">
                   已用时 {formatTime(elapsedSeconds)} / 05:00
                 </div>
@@ -2094,14 +2211,31 @@ export function ImageWorkbench() {
           ) : (
             <div className="flex items-center justify-between px-3">
               <span className="text-xs font-semibold text-[#3f4652]">任务队列</span>
-              <button
-                type="button"
-                onClick={() => setSidebarCollapsed(true)}
-                className="grid h-6 w-6 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
-                title="收起侧栏"
-              >
-                <PanelRightClose className="h-3.5 w-3.5" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                {historyList.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setQueueSelectMode((v) => !v);
+                      setSelectedHistoryIds([]);
+                    }}
+                    className={cn(
+                      'text-[11px] transition',
+                      queueSelectMode ? 'font-medium text-[#e5484d]' : 'text-[#a6abb4] hover:text-[#e5484d]'
+                    )}
+                  >
+                    {queueSelectMode ? '取消' : '批量删除'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setSidebarCollapsed(true)}
+                  className="grid h-6 w-6 place-items-center rounded-md text-[#a6abb4] hover:bg-[#e8ecf1] hover:text-[#3f4652]"
+                  title="收起侧栏"
+                >
+                  <PanelRightClose className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </div>
           )}
           {!sidebarCollapsed && (
@@ -2120,6 +2254,29 @@ export function ImageWorkbench() {
                   </div>
                 </div>
               </div>
+              {/* 批量删除操作栏：选择模式下显示（全选 + 删除按钮，红色危险风格，与商品套图一致） */}
+              {queueSelectMode && (
+                <div className="mx-1.5 mt-2 flex items-center justify-between rounded-lg border border-[#ffd7da] bg-[#fff1f2] px-2.5 py-1.5">
+                  <label className="flex cursor-pointer select-none items-center gap-1.5 text-[11px] text-[#68707c]">
+                    <input
+                      type="checkbox"
+                      checked={historyList.length > 0 && selectedHistoryIds.length === historyList.length}
+                      onChange={(e) => setSelectedHistoryIds(e.target.checked ? historyList.map((h) => h.id) : [])}
+                      className="h-3.5 w-3.5 accent-[#e5484d]"
+                    />
+                    全选 {selectedHistoryIds.length}/{historyList.length}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={batchDeleteSelectedHistory}
+                    disabled={selectedHistoryIds.length === 0 || bulkDeletingHistory}
+                    className="inline-flex items-center gap-1 rounded-md bg-[#e5484d] px-2 py-1 text-[11px] font-medium text-white transition hover:bg-[#d43d42] disabled:opacity-50"
+                  >
+                    {bulkDeletingHistory ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+                    删除{selectedHistoryIds.length > 0 ? `(${selectedHistoryIds.length})` : ''}
+                  </button>
+                </div>
+              )}
               <div className="mt-3 flex min-h-0 flex-1 flex-col items-center gap-2 overflow-auto px-1.5">
                 {/* 当前正在生成的任务（仿视频侧栏卡片样式：aspect-square） */}
                 {activeGeneration && !generationHistory.some((h) => h.url === generatedUrl) && (
@@ -2156,31 +2313,70 @@ export function ImageWorkbench() {
                 {generationHistory.length === 0 && !activeGeneration && (
                   <p className="pt-8 text-[10px] text-[#c2c6cf]">暂无任务</p>
                 )}
-                {dedupeHistory(generationHistory).map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => {
-                      setGeneratedUrl(item.url);
-                      setGeneratedAt(item.createdAt);
-                      setGeneratedObjectKey(item.objectKey ?? null); // 同步 objectKey（收藏时用）
-                      // 根据远端 sourceTool 字段同步收藏状态
-                      const isFav = item.sourceTool === 'favorite';
-                      setIsFavorited(isFav);
-                      setCurrentFavoriteId(isFav ? item.objectKey ?? null : null);
-                      setActiveTab('preview');
-                    }}
-                    title={item.prompt || '(空提示词)'}
-                    className={cn(
-                      'relative w-full flex-none overflow-hidden rounded-lg border shadow-sm transition',
-                      generatedUrl === item.url
-                        ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
-                        : 'border-[#e7e9ed] hover:border-[#cbd3e6]'
-                    )}
-                  >
-                    <img src={item.url} alt="" className="aspect-square w-full object-cover" />
-                  </button>
-                ))}
+                {historyList.map((item) => {
+                  const selected = selectedHistoryIds.includes(item.id);
+                  return (
+                    <div
+                      key={item.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        // 选择模式下点击 = 勾选/取消；否则切到该图的预览
+                        if (queueSelectMode) {
+                          toggleHistorySelect(item.id);
+                          return;
+                        }
+                        setGeneratedUrl(item.url);
+                        setGeneratedAt(item.createdAt);
+                        setGeneratedObjectKey(item.objectKey ?? null); // 同步 objectKey（收藏时用）
+                        // 根据远端 sourceTool 字段同步收藏状态
+                        const isFav = item.sourceTool === 'favorite';
+                        setIsFavorited(isFav);
+                        setCurrentFavoriteId(isFav ? item.objectKey ?? null : null);
+                        setActiveTab('preview');
+                      }}
+                      title={item.prompt || '(空提示词)'}
+                      className={cn(
+                        'group relative w-full flex-none cursor-pointer overflow-hidden rounded-lg border shadow-sm transition',
+                        selected
+                          ? 'border-[#e5484d] ring-1 ring-[#e5484d]/40'
+                          : generatedUrl === item.url
+                            ? 'border-[#4f7cff] ring-1 ring-[#4f7cff]/30'
+                            : 'border-[#e7e9ed] hover:border-[#cbd3e6]'
+                      )}
+                    >
+                      <img src={item.url} alt="" className="aspect-square w-full object-cover" />
+                      {/* 单删按钮（悬停显示；选择模式下隐藏，改用勾选批量删） */}
+                      {!queueSelectMode && (
+                        <button
+                          type="button"
+                          disabled={deletingHistoryId === item.id}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteHistoryItem(item);
+                          }}
+                          className="absolute right-1 top-1 grid h-6 w-6 place-items-center rounded-md bg-black/45 text-white opacity-0 transition hover:bg-[#e5484d] group-hover:opacity-100 disabled:opacity-100"
+                          aria-label="删除"
+                          title="删除（同时从数据库中移除）"
+                        >
+                          {deletingHistoryId === item.id
+                            ? <Loader2 className="h-3 w-3 animate-spin" />
+                            : <Trash2 className="h-3.5 w-3.5" />}
+                        </button>
+                      )}
+                      {/* 批量删除勾选框：选择模式下显示 */}
+                      {queueSelectMode && (
+                        <input
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => toggleHistorySelect(item.id)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute left-1 top-1 h-3.5 w-3.5 accent-[#e5484d]"
+                        />
+                      )}
+                    </div>
+                  );
+                })}
                 </div>
               <div className="mt-auto pb-2" />
             </>

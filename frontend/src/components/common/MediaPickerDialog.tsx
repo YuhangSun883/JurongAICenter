@@ -572,6 +572,8 @@ function AssetsView({
   const tabToType: Record<typeof tab, string> = { '图片': 'image', '视频': 'video', '音频': 'audio' };
   const showUploaded = source === '全部资产' || source === '我上传的';
   const PAGE_SIZE = 24;
+  // 已入库素材的 URL 集合：本地 blob 素材与 assets 重复时去重，避免同一张图展示两次
+  const assetUrls = useMemo(() => new Set(assets.map((a) => a.url)), [assets]);
 
   // 2026-08-15 V19：自定义下拉 popover
   const [libMenuOpen, setLibMenuOpen] = useState(false);

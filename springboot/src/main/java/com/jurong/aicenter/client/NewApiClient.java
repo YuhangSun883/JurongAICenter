@@ -595,7 +595,8 @@ public class NewApiClient {
                 .bodyValue(body)
                 .retrieve()
                 .bodyToMono(JsonNode.class)
-                .timeout(Duration.ofSeconds(180))
+                // 多图分析最多输出 ~20000 token（claude 逐字生成）可超 3 分钟，放宽到 10 分钟（与视频等长链路一致）
+                .timeout(Duration.ofSeconds(600))
                 .onErrorMap(WebClientResponseException.class, e -> {
                     log.error("NewAPI multimodal chat failed: {} {}", e.getStatusCode(), e.getResponseBodyAsString());
                     return new BusinessException(ErrorCode.NEWAPI_UNREACHABLE,

@@ -17,6 +17,7 @@ import com.jurong.aicenter.service.StorageService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
@@ -44,6 +45,14 @@ public class ImageController {
     private final StorageService storageService;
     private final MediaService mediaService;
     private final AicomingAssetsClient aicomingAssetsClient;
+
+    /**
+     * 后端实际可达的 NewAPI 地址（dev: http://192.140.163.161:3000）。
+     * 上游返回的图片 URL 可能带其它对外主机名（如 124.156.215.114:3000），
+     * 本机不可达时改写 host 后按原 path 重试。
+     */
+    @Value("${newapi.base-url:}")
+    private String newapiBaseUrl;
 
     /**
      * AI 图片生成接口
@@ -216,25 +225,84 @@ public class ImageController {
         // URL 格式：下载图片字节，编码为 base64 data URI
         try {
             log.info("开始下载中转站返回的图片 URL: {}", originalData);
-            HttpURLConnection conn = (HttpURLConnection) new URI(originalData).toURL().openConnection();
-            conn.setConnectTimeout(10_000);
-            conn.setReadTimeout(60_000);
-            try (InputStream is = conn.getInputStream()) {
-                byte[] imageBytes = is.readAllBytes();
-                String base64 = Base64.getEncoder().encodeToString(imageBytes);
-                String dataUri = "data:image/png;base64," + base64;
-                log.info("图片(URL)已转换为 base64 data URI: originalLen={}, base64Len={}",
-                    imageBytes.length, dataUri.length());
-                return dataUri;
-            } finally {
-                conn.disconnect();
-            }
+            return downloadUrlToDataUri(originalData);
         } catch (Exception e) {
-            // 下载失败（多为中转站返回了本机不可达的内网/未开放端口地址）：
-            // 不阻断整个请求，回退返回原始 URL 由前端直接加载
-            log.error("图片(URL)下载失败，回退返回原始 URL: url={}, err={}",
-                originalData, e.getMessage());
+            // 下载失败（多为中转站返回了本机不可达的主机/端口）：
+            // 先尝试把 host 改写为后端配置的 newapi.base-url 后按原 path 重试
+            log.warn("图片(URL)首次下载失败: url={}, err={}", originalData, e.getMessage());
+            String rewritten = rewriteToConfiguredNewApi(originalData);
+            if (rewritten != null) {
+                try {
+                    log.info("改写 NewAPI host 后重试下载: {}", rewritten);
+                    return downloadUrlToDataUri(rewritten);
+                } catch (Exception e2) {
+                    log.error("图片(URL)改写 host 后仍下载失败: url={}, err={}", rewritten, e2.getMessage());
+                }
+            }
+            // 两次都失败：不阻断整个请求，回退返回原始 URL 由前端直接加载
+            log.error("图片(URL)下载失败，回退返回原始 URL: url={}", originalData);
             return originalData;
+        }
+    }
+
+    /**
+     * 下载指定 URL 并编码为 base64 data URI（connect 10s / read 60s 超时）。
+     * 下载后校验图片魔数：上游偶发以 200 返回 HTML 兜底页，不校验会把网页当图片入库。
+     */
+    private String downloadUrlToDataUri(String url) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URI(url).toURL().openConnection();
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(60_000);
+        try (InputStream is = conn.getInputStream()) {
+            byte[] imageBytes = is.readAllBytes();
+            if (!looksLikeImage(imageBytes)) {
+                String preview = new String(imageBytes, 0, Math.min(64, imageBytes.length),
+                    java.nio.charset.StandardCharsets.UTF_8).replaceAll("\\s+", " ");
+                throw new BusinessException(ErrorCode.INTERNAL_ERROR,
+                    "图片 URL 返回非图片内容（" + imageBytes.length + " 字节，开头: " + preview + "）: " + url);
+            }
+            String base64 = Base64.getEncoder().encodeToString(imageBytes);
+            String dataUri = "data:image/png;base64," + base64;
+            log.info("图片(URL)已转换为 base64 data URI: originalLen={}, base64Len={}",
+                imageBytes.length, dataUri.length());
+            return dataUri;
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    /** 图片魔数校验（PNG/JPEG/GIF/WEBP）：拦住上游以 200 返回的 HTML 兜底页 */
+    private boolean looksLikeImage(byte[] b) {
+        boolean png = b.length > 8 && (b[0] & 0xFF) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G';
+        boolean jpeg = b.length > 3 && (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xD8 && (b[2] & 0xFF) == 0xFF;
+        boolean gif = b.length > 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F';
+        boolean webp = b.length > 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F'
+            && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P';
+        return png || jpeg || gif || webp;
+    }
+
+    /**
+     * 把上游返回 URL 的 host 改写为配置的 newapi.base-url（保留原 path/query）。
+     * 上游 image-proxy 路径由 NewAPI 自身提供，换用后端可达的地址即可下载。
+     * 无法改写（配置为空/同 host/解析失败）时返回 null。
+     */
+    private String rewriteToConfiguredNewApi(String url) {
+        if (newapiBaseUrl == null || newapiBaseUrl.isBlank()) return null;
+        try {
+            URI orig = new URI(url);
+            URI base = new URI(newapiBaseUrl.trim());
+            if (base.getHost() == null) return null;
+            // 已经是配置地址，无需改写
+            if (base.getHost().equalsIgnoreCase(orig.getHost()) && base.getPort() == orig.getPort()) {
+                return null;
+            }
+            String pathAndQuery = orig.getRawPath() == null ? "" : orig.getRawPath();
+            if (orig.getRawQuery() != null) pathAndQuery += "?" + orig.getRawQuery();
+            return base.getScheme() + "://" + base.getHost()
+                + (base.getPort() > 0 ? ":" + base.getPort() : "") + pathAndQuery;
+        } catch (Exception e) {
+            log.warn("改写 NewAPI host 失败: url={}, err={}", url, e.getMessage());
+            return null;
         }
     }
 

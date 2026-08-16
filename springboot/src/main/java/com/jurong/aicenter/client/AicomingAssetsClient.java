@@ -67,8 +67,14 @@ public class AicomingAssetsClient {
         this.restTemplate.getInterceptors().add((request, body, execution) -> {
             log.info("[ASSET-UP-REQ] {} {}", request.getMethod(), request.getURI());
             request.getHeaders().forEach((k, v) -> {
-                // 不记录 Authorization 的完整值
-                String val = "Authorization".equalsIgnoreCase(k) ? v.get(0).substring(0, 20) + "..." : v.toString();
+                // 不记录 Authorization 的完整值（短于 20 字符时全量显示，避免 substring 越界）
+                String val;
+                if ("Authorization".equalsIgnoreCase(k)) {
+                    String raw = v.get(0);
+                    val = raw.substring(0, Math.min(20, raw.length())) + "...";
+                } else {
+                    val = v.toString();
+                }
                 log.info("[ASSET-UP-REQ] Header: {} = {}", k, val);
             });
             log.info("[ASSET-UP-REQ] Body size: {} bytes, first 200: {}",
@@ -97,6 +103,11 @@ public class AicomingAssetsClient {
         }
         final String fname = (filename != null && !filename.isBlank()) ? filename : "upload.png";
         final String mime = (contentType != null && !contentType.isBlank()) ? contentType : "image/png";
+        // token 未配置时快速失败，避免带空 Authorization 请求上游后被重试循环吞掉真实原因
+        if (token == null || token.isBlank()) {
+            throw new BusinessException(ErrorCode.ASSET_UPLOAD_FAILED,
+                "aicoming.proxy.token 未配置（素材库上传需要 Bearer token，默认复用 NEWAPI_TOKEN）");
+        }
 
         log.info("[ASSET-UP] → POST {}/v1/assets (multipart via RestTemplate): filename={}, contentType={}, size={}B, name={}",
             baseUrl, fname, mime, fileBytes.length, name);

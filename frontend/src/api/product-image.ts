@@ -15,12 +15,18 @@ export const productImageApi = {
     USE_MOCK ? mock.createProductImageTask(req) : real.createProductImageTask(req),
   getTask: (id: string) =>
     USE_MOCK ? mock.getProductImageTask(id) : real.getProductImageTask(id),
+  listTasks: () =>
+    USE_MOCK ? mock.listTasks() : real.listTasks(),
+  batchDeleteTasks: (ids: string[]) =>
+    USE_MOCK ? mock.batchDeleteTasks(ids) : real.batchDeleteTasks(ids),
   listRoles: () =>
     USE_MOCK ? mock.listRoles() : real.listRoles(),
   createAnalysis: (req: Parameters<typeof real.createAnalysis>[0]) =>
     USE_MOCK ? mock.createAnalysis(req) : real.createAnalysis(req),
   getAnalysis: (id: string) =>
     USE_MOCK ? mock.getAnalysis(id) : real.getAnalysis(id),
+  refineAnalysisItem: (req: Parameters<typeof real.refineAnalysisItem>[0]) =>
+    USE_MOCK ? mock.refineAnalysisItem(req) : real.refineAnalysisItem(req),
 };
 
 export type {

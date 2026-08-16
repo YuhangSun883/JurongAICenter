@@ -65,6 +65,26 @@ public interface MediaService {
     MediaAssetResponse recordGeneratedImage(Long userId, byte[] imageBytes, String mimeType);
 
     /**
+     * 商详套图生成结果入「个人资产」：上传 MinIO + 写 media_assets。
+     * libraryId 指向「我的资产」系统库（不进「AI 生成结果」库），sourceTool=product-image：
+     * 在「我的资产」（个人资产）可见，但不会混入 AI 库/素材库相关筛选（预览/收藏 Tab 按 sourceTool 过滤）。
+     *
+     * @param userId      用户 ID
+     * @param imageBytes  图片字节
+     * @param mimeType    MIME 类型
+     * @return 资产响应（含 assetId、objectKey、签名 URL）
+     */
+    MediaAssetResponse recordProductImageAsset(Long userId, byte[] imageBytes, String mimeType);
+
+    /**
+     * 按 objectKey 批量删除资产记录（商详套图删除任务时同步清理生成图的资产记录）。
+     *
+     * @param userId     用户 ID（防止越权删除他人资产）
+     * @param objectKeys 要删除的 MinIO objectKey 列表
+     */
+    void deleteAssetsByObjectKeys(Long userId, List<String> objectKeys);
+
+    /**
      * 把已有 AI 生成图片标记为"已收藏"：UPDATE media_assets.source_tool = 'favorite' WHERE user_id=? AND object_key=?
      * 不上传、不复制图片（MinIO 中文件保持原样）。
      *

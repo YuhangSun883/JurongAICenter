@@ -1,9 +1,11 @@
 package com.jurong.aicenter.controller;
 
+import com.jurong.aicenter.dto.productimage.BatchDeleteProductImageTasksRequest;
 import com.jurong.aicenter.dto.productimage.CreateProductImageTaskRequest;
 import com.jurong.aicenter.dto.productimage.ProductImageAnalysisResponse;
 import com.jurong.aicenter.dto.productimage.ProductImageOptions;
 import com.jurong.aicenter.dto.productimage.ProductImageTaskResponse;
+import com.jurong.aicenter.dto.productimage.RefineAnalysisItemRequest;
 import com.jurong.aicenter.exception.BusinessException;
 import com.jurong.aicenter.exception.ErrorCode;
 import com.jurong.aicenter.security.JwtAuthenticationFilter.AuthenticatedUser;
@@ -15,6 +17,7 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 商详套图控制器（「一张图」生成一套商品详情图）
@@ -90,6 +93,31 @@ public class ProductImageController {
     }
 
     /**
+     * 批量删除任务（与资产批量删除 POST /api/assets/batch-delete 同构）：
+     * 直接删除数据库中的数据——任务生成的结果图资产记录与 MinIO 文件物理删除，不可恢复。
+     */
+    @PostMapping("/tasks/batch-delete")
+    public Map<String, Object> batchDeleteTasks(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @Valid @RequestBody BatchDeleteProductImageTasksRequest request) {
+        if (principal == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "请先登录");
+        }
+        log.info("商详套图任务批量删除: userId={}, ids={}", principal.id(), request.getIds());
+        int deleted = productImageSetService.batchDeleteTasks(principal.id(), request.getIds());
+        return Map.of("deleted", deleted, "requested", request.getIds().size());
+    }
+
+    /** 查询当前用户的套图任务列表（内存任务态，新任务在前）：页面重新进入时恢复任务队列与生成结果 */
+    @GetMapping("/tasks")
+    public List<ProductImageTaskResponse> listTasks(@AuthenticationPrincipal AuthenticatedUser principal) {
+        if (principal == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "请先登录");
+        }
+        return productImageSetService.listTasks(principal.id());
+    }
+
+    /**
      * 提交商品详解分析任务（「分析结果」标签页）。
      * 多模态 LLM 结合商品图逐张输出商详图设计分析，文案语言 = 用户选择的语种；前端轮询状态。
      */
@@ -115,5 +143,21 @@ public class ProductImageController {
             throw new BusinessException(ErrorCode.UNAUTHORIZED, "请先登录");
         }
         return productImageSetService.getAnalysis(taskId);
+    }
+
+    /**
+     * 单条分析文案重写（同步）：分析卡片修改「定位/比例」后点「重新生成」，
+     * 多模态 LLM 按新定位与画布比例重写该条设计分析；前端拿到新文案后再提交图片生成。
+     */
+    @PostMapping("/analysis/refine")
+    public ProductImageAnalysisResponse.AnalysisItem refineAnalysisItem(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @Valid @RequestBody RefineAnalysisItemRequest request) {
+        if (principal == null) {
+            throw new BusinessException(ErrorCode.UNAUTHORIZED, "请先登录");
+        }
+        log.info("商详套图单条分析重写: userId={}, role={}, ratio={}, lang={}",
+            principal.id(), request.getRole(), request.getRatio(), request.getLang());
+        return productImageSetService.refineAnalysisItem(principal.id(), request);
     }
 }

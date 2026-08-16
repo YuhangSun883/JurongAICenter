@@ -1,10 +1,12 @@
 import type {
   CreateProductImageRequest,
   FormatOption,
+  ProductImageAnalysisItem,
   ProductImageAnalysisTask,
   ProductImageExample,
   ProductImageModel,
   ProductImageTask,
+  RefineAnalysisItemRequest,
   ResolutionOption,
 } from '@/types/product-image';
 
@@ -136,6 +138,16 @@ export async function getProductImageTask(taskId: string): Promise<ProductImageT
   });
 }
 
+/** mock 任务列表：无持久化，返回空 */
+export async function listTasks(): Promise<ProductImageTask[]> {
+  return delay([] as ProductImageTask[]);
+}
+
+/** mock 批量删除任务：直接返回全部删除成功 */
+export async function batchDeleteTasks(ids: string[]): Promise<{ deleted: number; requested: number }> {
+  return delay({ deleted: ids.length, requested: ids.length });
+}
+
 /** mock 套图类型名称 */
 export async function listRoles(): Promise<string[]> {
   return delay(['主视图', '卖点图', '细节图', '成分图', '场景图', '结构图', '对比图', '包装图', '收尾图']);
@@ -167,4 +179,21 @@ export async function createAnalysis(req: CreateProductImageRequest): Promise<Pr
 
 export async function getAnalysis(taskId: string): Promise<ProductImageAnalysisTask> {
   return delay({ taskId, status: 'success', createdAt: Date.now(), items: [] });
+}
+
+/** mock 单条分析文案重写：返回按新定位/比例回显的示例文案 */
+export async function refineAnalysisItem(req: RefineAnalysisItemRequest): Promise<ProductImageAnalysisItem> {
+  return delay({
+    refLabel: req.refLabel,
+    role: req.role,
+    ratio: req.ratio,
+    sections: [
+      { key: '画布尺寸', value: `资产类型：高端电商商详图，${req.ratio} 画布，适配 ${req.role} 定位。` },
+      { key: '引用图', value: '参考商品外观、材质与品牌标识。' },
+      { key: '锁定主体', value: '严格保持参考图中商品外观一致。' },
+      { key: '画面环境', value: `按「${req.role}」定位设计的简洁专业商业摄影背景，柔和自然光。` },
+      { key: '画面文字', value: '左上角简洁标题文案。' },
+      { key: '负面约束', value: '避免杂乱背景、过度反光和低分辨率纹理。' },
+    ],
+  }, 400);
 }
